@@ -1,17 +1,14 @@
 services:
   ununknown:
-    build: .
+    image: ghcr.io/artamrj/ununknown:latest
     ports:
       - "7331:7331"
     environment:
-      UNUNKNOWN_CONFIG: /config/config.toml
-      UNUNKNOWN_DB: /cache/ununknown.sqlite
-      UNUNKNOWN_INPUT_DIR: /music/input
-      UNUNKNOWN_OUTPUT_DIR: /music/output
       RUST_LOG: info
+      UNUNKNOWN_ACOUSTID_API_KEY: ${UNUNKNOWN_ACOUSTID_API_KEY:-}
+      UNUNKNOWN_MUSICBRAINZ_USER_AGENT: ${UNUNKNOWN_MUSICBRAINZ_USER_AGENT:-Ununknown/0.2.0 (https://github.com/artamrj/ununknown)}
     volumes:
       - ./music/input:/music/input
       - ./music/output:/music/output
-      - ./config:/config
       - ./cache:/cache
     restart: unless-stopped
