@@ -1,0 +1,17 @@
+.git
+.github
+.cargo
+.local
+target
+web/node_modules
+web/dist
+bot
+docs
+config
+data
+music
+.env
+.env.*
+*.log
+*.md
+.DS_Store

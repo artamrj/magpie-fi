@@ -711,29 +711,41 @@ magpie-fi/                       ← this folder is still called navidrome-arta 
 Each phase ends with something that works. You can use magpie-fi after any of them.
 Every phase lists what it **deletes**, so the project gets smaller, not bigger.
 
-### Phase 0 — Bridge ✅ built · ⏳ not yet tested end to end
-The old bot and old ununknown glued together through `inbox/` (three containers), so you can
-listen while the real thing is built. Details are in the README.
-- Phase 0 is temporary. Test it only if you want to use it during the rebuild.
+### Phase 0 — Bridge ✅ built · superseded by Phase 1
+The old bot and old ununknown glued together through `inbox/`. Phase 1 replaced the ununknown
+half; the bot half stays as the optional `bot` profile until Phase 3.
 - ⛔ Deleted in Phase 3: `bot/`, the bot container, the `magpie-fi-bot` image.
 
-### Phase 1 — One home
-Turn ununknown into the magpie program and give it a real library.
-- Move `core/` to the root (`git mv`), crate `magpie-fi`, binary `magpie`, all settings `MAGPIE_*`
-  from the environment, `frontend/` → `web/`, module folders from §7.
-- **Library:** permanent index, §5 layout and tags, `.magpie/staging` and `.magpie/trash`,
-  `cover.jpg` + `artist.jpg`, lyrics (LRCLIB, `.lrc`/`.elrc`), track + album ReplayGain (rsgain),
-  `.m3u8` playlists.
-- **Inbox watcher:** files dropped into `inbox/` are filed automatically. Uncertain ones wait in review.
-- **Navidrome client:** scan after filing, find the song, share link.
-- **Re-file tool:** dry-run report → move your existing library into the §5 layout →
-  `navidrome missing fix` keeps play counts and stars.
-- **One image:** new Dockerfile (Debian slim + all tools), CI builds `ghcr.io/artamrj/magpie-fi`.
-- During Phase 1 the old Python bot keeps running and drops its downloads into `inbox/`.
-- ⛔ Deletes: input/output setup screen, settings-in-database, workspace reset, "remove input" switch,
-  the `core` image name.
-- ✅ Done when an old messy folder dropped into `inbox/` ends up as clean album folders with cover,
-  lyrics and gain, and Navidrome shows them.
+### Phase 1 — One home ✅ built and tested in Docker (2026-11-10)
+Turned ununknown into the magpie program and gave it a real library.
+- `core/` moved to the repo root with its history, crate `magpie-fi`, binary `magpie`,
+  `frontend/` → `web/`. All settings are `MAGPIE_*` environment variables; nothing is stored
+  in the database any more.
+- **Inbox:** checked every minute (or "Check inbox" in the web page). Files still being copied
+  wait (`MAGPIE_INBOX_SETTLE_SECONDS`). Automation no longer pauses while the web page is open.
+- **Library:** §5 layout and naming, permanent library index (`library_items`): a song you
+  already own is recognised by fingerprint, ISRC or MusicBrainz ID and its new copy goes to the
+  trash; a lossless copy replaces a lossy one. Existing library files are indexed at start.
+- **Trash:** originals and replaced files go to `MUSIC_ROOT/.magpie/trash/<date>/`, emptied after
+  `MAGPIE_TRASH_DAYS`.
+- **Extras:** `cover.jpg` per album, synced lyrics from LRCLIB (`.lrc`/`.txt`), track + album
+  ReplayGain (rsgain), `RELEASETYPE` tag, Navidrome scan after each batch.
+- **Fix:** singles keep their own title as album name (ununknown renamed them all to "Single",
+  which would merge every single of an artist into one Navidrome album).
+- **One image:** `ghcr.io/artamrj/magpie-fi`, Debian trixie + ffmpeg, fpcalc, SongRec, rsgain.
+  Release scan blocks on fixable findings. Navidrome image from `ghcr.io/navidrome/navidrome`.
+- ⛔ Deleted: input/output setup screen, settings in the database, workspace reset ("Scan"),
+  open-page pause and heartbeat, "remove input" switch, ununknown's release-archive scripts.
+- Simplified on the way: **no separate re-file tool** (move an old library into the inbox; the
+  same pipeline re-files it) and **no `artist.jpg`** (Navidrome fetches artist pictures from
+  Deezer itself). `.m3u8` playlists move to Phase 2, where playlist links are handled.
+- Tested end to end with real songs: 3 songs identified and filed with cover, synced lyrics and
+  album gain; an inbox duplicate and a re-sent song went to the trash; a half-downloaded file was
+  left alone; Navidrome listed all three, the single as `single`.
+- The old Python bot still runs as an optional bridge: `docker compose --profile bot up -d`.
+- Not done yet: the source still uses ununknown's folder names (`application/`, `infrastructure/`,
+  `domain/`, `http/`) instead of the §7 module folders. That reshuffle is mechanical and happens in
+  Phase 2, when `jobs/` and `acquire/` arrive.
 
 ### Phase 2 — Getting music, in Rust
 Port the bot's "get it" half, and make it usable from the web page first (easy to test without Telegram).

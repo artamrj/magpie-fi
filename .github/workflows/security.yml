@@ -24,10 +24,10 @@ jobs:
           node-version: 26
 
       - name: Audit frontend dependencies
-        working-directory: core/frontend
+        working-directory: web
         run: npm audit --package-lock-only --audit-level=high
 
-  core:
+  magpie:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -43,5 +43,4 @@ jobs:
         run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit Rust dependencies
-        working-directory: core
         run: cargo audit

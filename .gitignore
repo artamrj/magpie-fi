@@ -4,3 +4,8 @@
 /config/ytdlp/*
 !/config/ytdlp/.gitkeep
 .DS_Store
+/target
+/web/node_modules
+/web/dist
+*.tsbuildinfo
+/.local

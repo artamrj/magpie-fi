@@ -1,19 +1,73 @@
-# magpie-fi — Phase 0 "glue mode"
+# magpie-fi
 #
-#   Telegram ─► bot ─► MUSIC_ROOT/inbox ─► core (ununknown) ─► MUSIC_ROOT/library ─► navidrome
+#   your drops, the bot ─► MUSIC_ROOT/inbox ─► magpie ─► MUSIC_ROOT/library ─► navidrome ─► your apps
 #
-# The bot downloads into the inbox. The core identifies, tags and files every inbox
-# song into the library, then removes the inbox copy. Navidrome only reads the library.
-# See README.md for setup and BLUEPRINT.md §8 for what comes next.
+# magpie identifies every new song in the inbox, files it into the library
+# (BLUEPRINT.md §5) and moves the original to MUSIC_ROOT/.magpie/trash.
+# Settings: .env (see .env.example). Setup: README.md.
 
 name: magpie-fi
 
 services:
-  navidrome:
-    image: deluan/navidrome:${NAVIDROME_TAG:-0.64.2}
+  magpie:
+    build: .
+    image: ghcr.io/artamrj/magpie-fi:${MAGPIE_TAG:-latest}
     restart: unless-stopped
-    # Navidrome runs directly as the host user. If your NAS rejects `user:`, remove
-    # this line; Navidrome then runs as its image default (uid 1000).
+    # Web page (review, status). Keep it on loopback: it has no login yet.
+    # From another computer: ssh -L 7331:127.0.0.1:7331 <server>
+    ports:
+      - "127.0.0.1:${MAGPIE_PORT:-7331}:7331"
+    # Settings come from .env (see .env.example). Empty means "off" or default.
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # Paths inside the container; the host paths are set by the volumes below.
+      MAGPIE_MUSIC_ROOT: /music
+      MAGPIE_DATA_DIR: /data
+      MAGPIE_NAVIDROME_URL: "${MAGPIE_NAVIDROME_URL:-http://navidrome:4533}"
+      MAGPIE_NAVIDROME_USER: "${MAGPIE_NAVIDROME_USER:-}"
+      MAGPIE_NAVIDROME_PASSWORD: "${MAGPIE_NAVIDROME_PASSWORD:-}"
+      MAGPIE_INBOX_CHECK_SECONDS: "${MAGPIE_INBOX_CHECK_SECONDS:-}"
+      MAGPIE_INBOX_SETTLE_SECONDS: "${MAGPIE_INBOX_SETTLE_SECONDS:-}"
+      MAGPIE_TRASH_DAYS: "${MAGPIE_TRASH_DAYS:-}"
+      MAGPIE_LYRICS: "${MAGPIE_LYRICS:-}"
+      MAGPIE_ACOUSTID_KEY: "${MAGPIE_ACOUSTID_KEY:-}"
+      MAGPIE_AUDD_TOKEN: "${MAGPIE_AUDD_TOKEN:-}"
+      MAGPIE_SPOTIFY_CLIENT_ID: "${MAGPIE_SPOTIFY_CLIENT_ID:-}"
+      MAGPIE_SPOTIFY_CLIENT_SECRET: "${MAGPIE_SPOTIFY_CLIENT_SECRET:-}"
+      MAGPIE_SOUNDCLOUD_CLIENT_ID: "${MAGPIE_SOUNDCLOUD_CLIENT_ID:-}"
+      MAGPIE_SOUNDCLOUD_CLIENT_SECRET: "${MAGPIE_SOUNDCLOUD_CLIENT_SECRET:-}"
+      MAGPIE_YOUTUBE_API_KEY: "${MAGPIE_YOUTUBE_API_KEY:-}"
+      MAGPIE_DISCOGS_TOKEN: "${MAGPIE_DISCOGS_TOKEN:-}"
+      MAGPIE_LASTFM_KEY: "${MAGPIE_LASTFM_KEY:-}"
+      MAGPIE_THEAUDIODB_KEY: "${MAGPIE_THEAUDIODB_KEY:-}"
+    volumes:
+      # The whole music root as ONE mount, so moves between inbox, library and
+      # trash are instant renames.
+      - ${MUSIC_ROOT:-./music}:/music
+      - ${DATA_ROOT:-./data}/magpie:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 45s
+
+  navidrome:
+    image: ghcr.io/navidrome/navidrome:${NAVIDROME_TAG:-0.64.2}
+    restart: unless-stopped
+    # Navidrome runs directly as the host user. If your NAS rejects `user:`,
+    # remove this line; Navidrome then runs as its image default (uid 1000).
     user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "${NAVIDROME_PORT:-4533}:4533"
@@ -31,85 +85,27 @@ services:
       start_period: 20s
       retries: 3
 
-  core:
-    # Built from ./core (ununknown). The Phase 0 config switches below need this
-    # source; the old ghcr.io/artamrj/ununknown image does not have them.
-    build: ./core
-    image: ghcr.io/artamrj/magpie-fi-core:${MAGPIE_TAG:-latest}
-    restart: unless-stopped
-    # Review UI. Keep it on loopback: the API has no login yet (BLUEPRINT.md §4.5).
-    # From another computer use an SSH tunnel: ssh -L 7331:127.0.0.1:7331 <server>
-    ports:
-      - "127.0.0.1:${CORE_PORT:-7331}:7331"
-    environment:
-      PUID: "${PUID:-1000}"
-      PGID: "${PGID:-1000}"
-      HOME: /tmp
-      RUST_LOG: "${RUST_LOG:-info}"
-      UNUNKNOWN_BIND: 0.0.0.0:7331
-      UNUNKNOWN_ALLOW_NON_LOOPBACK: "true"
-      UNUNKNOWN_DB: /data/cache/ununknown.sqlite
-      UNUNKNOWN_STATIC_DIR: /usr/share/ununknown
-      UNUNKNOWN_INPUT_DIR: /data/input
-      UNUNKNOWN_INPUT_MODE: rw
-      UNUNKNOWN_OUTPUT_DIR: /data/output
-      # Glue mode: file strict matches automatically and empty the inbox behind them.
-      # Uncertain songs stay in the inbox and wait in the review UI.
-      UNUNKNOWN_AUTOMATIC_SCAN_ENABLED: "true"
-      UNUNKNOWN_AUTOMATIC_SCAN_INTERVAL_MINUTES: "${MAGPIE_FILING_INTERVAL_MINUTES:-2}"
-      UNUNKNOWN_DELETE_SOURCE_AFTER_WRITE: "${MAGPIE_REMOVE_INBOX_AFTER_FILING:-true}"
-      UNUNKNOWN_ACOUSTID_KEY: "${ACOUSTID_KEY:-}"
-      UNUNKNOWN_AUDD_TOKEN: "${AUDD_TOKEN:-}"
-      UNUNKNOWN_SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID:-}"
-      UNUNKNOWN_SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET:-}"
-      UNUNKNOWN_SOUNDCLOUD_CLIENT_ID: "${SOUNDCLOUD_CLIENT_ID:-}"
-      UNUNKNOWN_SOUNDCLOUD_CLIENT_SECRET: "${SOUNDCLOUD_CLIENT_SECRET:-}"
-      UNUNKNOWN_YOUTUBE_API_KEY: "${YOUTUBE_API_KEY:-}"
-      UNUNKNOWN_DISCOGS_TOKEN: "${DISCOGS_TOKEN:-}"
-      UNUNKNOWN_LASTFM_KEY: "${LASTFM_KEY:-}"
-      UNUNKNOWN_THEAUDIODB_KEY: "${THEAUDIODB_KEY:-}"
-    volumes:
-      - ${MUSIC_ROOT:-./music}/inbox:/data/input
-      - ${MUSIC_ROOT:-./music}/library:/data/output
-      - ${DATA_ROOT:-./data}/core:/data/cache
-    read_only: true
-    tmpfs:
-      - /tmp:size=256m,mode=1777
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 512
-    stop_grace_period: 45s
-
+  # Temporary bridge (BLUEPRINT.md §8): the old Python Telegram bot drops its
+  # downloads into the inbox until the bot is rewritten inside magpie (Phase 3).
+  # Start it with: docker compose --profile bot up -d
   bot:
-    # Built from ./bot (sync-me-maybe).
+    profiles: [bot]
     build: ./bot
     image: ghcr.io/artamrj/magpie-fi-bot:${MAGPIE_TAG:-latest}
     restart: unless-stopped
-    depends_on:
-      core:
-        condition: service_started
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
-      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}"
-      ALLOWED_TELEGRAM_USER_IDS: "${ALLOWED_TELEGRAM_USER_IDS:?Set ALLOWED_TELEGRAM_USER_IDS in .env}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      ALLOWED_TELEGRAM_USER_IDS: "${ALLOWED_TELEGRAM_USER_IDS:-}"
       # The bot's "music folder" is the inbox. Its temp folder sits inside the same
-      # mount so finished files appear with one atomic rename; the core skips dot-folders.
+      # mount so finished files appear with one rename; magpie skips dot-folders.
       MUSIC_DIR: /music
       DOWNLOAD_TMP_DIR: /music/.incoming
       DATA_DIR: /data
       AUDIO_FORMAT: "${AUDIO_FORMAT:-m4a}"
       METADATA_LOOKUP: "true"
-      # Off in Phase 0: .lrc sidecars would stay behind in the inbox when the core
-      # files the song. Lyrics move into the core in Phase 1.
+      # magpie fetches lyrics when it files the song.
       LYRICS: "false"
       MAX_PARALLEL_DOWNLOADS: "${MAX_PARALLEL_DOWNLOADS:-2}"
       DOWNLOAD_PAUSE_SECONDS: "${DOWNLOAD_PAUSE_SECONDS:-3}"
@@ -117,8 +113,6 @@ services:
       YTDLP_COOKIES_FILE: "${YTDLP_COOKIES_FILE:-}"
       RECEIVED_STICKER_ID: "${RECEIVED_STICKER_ID:-}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-      # No NAVIDROME_* here on purpose: the bot would trigger a scan before the core
-      # has filed the song. Navidrome's file watcher and schedule pick up new files.
     volumes:
       - ${MUSIC_ROOT:-./music}/inbox:/music
       - ${DATA_ROOT:-./data}/bot:/data
