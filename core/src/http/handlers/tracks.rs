@@ -1,0 +1,1704 @@
+use super::*;
+use crate::infrastructure::providers::ArtworkStatus;
+use crate::types::TrackStage;
+use axum::http::{HeaderMap, StatusCode, header};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+pub async fn list_tracks(State(s): State<Arc<AppState>>) -> ApiResult<Json<TrackPage>> {
+    let tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM tracks ORDER BY path LIMIT 10000",
+        queries::TRACK_FIELDS
+    )))
+    .fetch_all(&s.pool)
+    .await?;
+    let total = tracks.len() as i64;
+    let by_track = queries::candidates_by_track(&s.pool).await?;
+    let mut items = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let candidates = by_track
+            .get(&track.id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .map(CandidateRow::value)
+            .collect();
+        items.push(WorkspaceTrack { track, candidates });
+    }
+    Ok(Json(TrackPage { items, total }))
+}
+
+pub async fn remove_track(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if s.workflow_running().await {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+
+    let track = queries::track(&s.pool, id).await?;
+    if track.stage != TrackStage::Review || track.selected_candidate_id.is_some() {
+        return Err(ApiError::validation(
+            "Only unresolved tracks in Review can be removed",
+        ));
+    }
+
+    let input_dir = s.config.read().await.input_dir.clone();
+    let input_dir = tokio::fs::canonicalize(&input_dir)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not verify the music folder: {error}"))?;
+    let source = tokio::fs::canonicalize(&track.path)
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ApiError::not_found("music file no longer exists")
+            } else {
+                ApiError::Internal(error.into())
+            }
+        })?;
+    if source == input_dir || !source.starts_with(&input_dir) {
+        return Err(ApiError::validation(
+            "Refusing to remove a file outside the configured music folder",
+        ));
+    }
+    if !tokio::fs::metadata(&source).await?.is_file() {
+        return Err(ApiError::validation(
+            "The selected music path is not a regular file",
+        ));
+    }
+
+    tokio::fs::remove_file(&source).await.map_err(|error| {
+        ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}"))
+    })?;
+
+    let canonical_path = source.to_string_lossy().into_owned();
+    let mut transaction = s.pool.begin().await?;
+    for table in [
+        "fingerprint_cache",
+        "content_hash_cache",
+        "replaygain_cache",
+        "integrity_cache",
+        "artwork_overrides",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE path=? OR path=?"
+        )))
+        .bind(&track.path)
+        .bind(&canonical_path)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    if let Some(content_key) = track.content_fingerprint.as_deref() {
+        let duplicate_tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM tracks
+             WHERE id!=? AND status='duplicate' AND stage='skipped'
+               AND content_fingerprint=? AND is_missing=0
+               AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+            queries::TRACK_FIELDS
+        )))
+        .bind(track.id.0)
+        .bind(content_key)
+        .bind(content_key)
+        .bind(track.duration)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let evidence = duplicate_tracks
+            .iter()
+            .map(
+                |duplicate| crate::application::input_dedup::RecordingEvidence {
+                    path: duplicate.path.clone().into(),
+                    format: duplicate.format.clone().unwrap_or_default(),
+                    bitrate: duplicate
+                        .bitrate
+                        .and_then(|value| u32::try_from(value).ok()),
+                    duration: duplicate.duration,
+                    content_key: duplicate.content_fingerprint.clone(),
+                    isrc: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        if let Some(group) = crate::application::input_dedup::group_recordings(&evidence).first() {
+            let promoted = &duplicate_tracks[group.representative];
+            sqlx::query("DELETE FROM candidates WHERE track_id=?")
+                .bind(promoted.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE candidates SET track_id=? WHERE track_id=?")
+                .bind(promoted.id.0)
+                .bind(track.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=NULL,status='review',stage='review',
+                 selected_candidate_id=NULL,error=NULL,
+                 stage_message='Promoted after the previous duplicate representative was removed',
+                 updated_at=? WHERE id=?",
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=?,stage_message=?,updated_at=?
+                 WHERE id!=? AND status='duplicate' AND stage='skipped'
+                   AND content_fingerprint=?
+                   AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+            )
+            .bind(&promoted.path)
+            .bind(format!("Duplicate of input file: {}", promoted.path))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .bind(content_key)
+            .bind(content_key)
+            .bind(track.duration)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    sqlx::query("DELETE FROM tracks WHERE id=?")
+        .bind(id.0)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    s.log_entry(
+        crate::app::ActivityLogEntry::new("ok", "review", "Removed music file from Review")
+            .file(track.filename.clone())
+            .detail(format!("Removed source: {}", source.display())),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "removed": true,
+        "filename": track.filename,
+    })))
+}
+
+pub async fn auto_approve_review(
+    State(s): State<Arc<AppState>>,
+) -> ApiResult<Json<AutoApproveResult>> {
+    if s.workflow_running().await {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+
+    let tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM tracks WHERE stage='review' AND selected_candidate_id IS NULL ORDER BY id",
+        queries::TRACK_FIELDS
+    )))
+    .fetch_all(&s.pool)
+    .await?;
+    let candidate_rows: Vec<CandidateRow> = sqlx::query_as(
+        "SELECT candidates.* FROM candidates
+         JOIN tracks ON tracks.id=candidates.track_id
+         WHERE tracks.stage='review' AND tracks.selected_candidate_id IS NULL
+         ORDER BY candidates.track_id, candidates.id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let mut candidates_by_track = std::collections::HashMap::new();
+    for row in candidate_rows {
+        candidates_by_track
+            .entry(row.track_id.0)
+            .or_insert_with(Vec::new)
+            .push(row.value());
+    }
+
+    let mut decisions = Vec::new();
+    let mut low_confidence = 0_u64;
+    let mut unavailable = 0_u64;
+    for track in tracks {
+        if track.status == "corrupt" || track.is_missing {
+            unavailable += 1;
+            continue;
+        }
+        let candidates = candidates_by_track.remove(&track.id.0).unwrap_or_default();
+        if candidates.is_empty() {
+            unavailable += 1;
+            continue;
+        }
+        let evidence = crate::application::smart_approval::TrackEvidence {
+            filename: &track.filename,
+            title: track.current_title.as_deref(),
+            artist: track.current_artist.as_deref(),
+            album: track.current_album.as_deref(),
+        };
+        if let Some(decision) = crate::application::smart_approval::select(evidence, &candidates) {
+            let Some(mut selected) = candidates
+                .iter()
+                .find(|candidate| candidate.id == Some(decision.candidate_id))
+                .cloned()
+            else {
+                unavailable += 1;
+                continue;
+            };
+            let path = std::path::PathBuf::from(&track.path);
+            let embedded_cover = tokio::task::spawn_blocking(move || {
+                crate::infrastructure::media::tag_writer::read_artwork(&path)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .await
+            .unwrap_or(false);
+            crate::application::metadata_completion::complete(
+                &mut selected,
+                &candidates,
+                track.current_album.as_deref(),
+                embedded_cover,
+            );
+            crate::application::canonical_names::canonicalize_candidates(
+                &s.pool,
+                std::slice::from_mut(&mut selected),
+            )
+            .await?;
+            let limiter = s.artwork_downloads.read().await.clone();
+            let _permit = limiter.acquire_owned().await.map_err(anyhow::Error::from)?;
+            crate::application::artwork::ensure_usable_cover(
+                &s.pool,
+                &s.client,
+                &mut selected,
+                embedded_cover,
+            )
+            .await;
+            let completion =
+                crate::application::metadata_completion::reassess(&mut selected, embedded_cover);
+            if completion.core_complete {
+                decisions.push((track.id, decision, selected, completion));
+            } else {
+                low_confidence += 1;
+            }
+        } else {
+            low_confidence += 1;
+        }
+    }
+
+    let mut transaction = s.pool.begin().await?;
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    let mut approved = 0_u64;
+    for (track_id, decision, candidate, completion) in decisions {
+        let message = format!(
+            "Smart auto-approved ({:.0}%): {}; {}",
+            decision.confidence,
+            decision.explanation,
+            completion.summary()
+        );
+        persist_completed_candidate(&mut transaction, &candidate).await?;
+        approved += sqlx::query(
+            "UPDATE tracks
+             SET selected_candidate_id=?,status='selected',stage='ready',stage_message=?,updated_at=?
+             WHERE id=? AND stage='review' AND selected_candidate_id IS NULL",
+        )
+        .bind(decision.candidate_id)
+        .bind(message)
+        .bind(&updated_at)
+        .bind(track_id.0)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+    }
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tracks WHERE stage='review' AND selected_candidate_id IS NULL",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(Json(AutoApproveResult {
+        approved,
+        remaining,
+        low_confidence,
+        unavailable,
+    }))
+}
+
+pub async fn track_audio(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+    headers: HeaderMap,
+) -> ApiResult<axum::response::Response> {
+    let track = queries::track(&s.pool, id).await?;
+    let path = std::path::Path::new(&track.path);
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found("audio source file no longer exists")
+        } else {
+            ApiError::from(error)
+        }
+    })?;
+    let total = metadata.len();
+    if total == 0 {
+        return Err(ApiError::validation("audio source file is empty"));
+    }
+    let requested = match parse_byte_range(
+        headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+        total,
+    ) {
+        Ok(range) => range,
+        Err(()) => {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(axum::body::Body::empty())
+                .map_err(anyhow::Error::from)?);
+        }
+    };
+    let (start, end, status) = requested.map_or((0, total - 1, StatusCode::OK), |(start, end)| {
+        (start, end, StatusCode::PARTIAL_CONTENT)
+    });
+    let length = end - start + 1;
+    let file = tokio::fs::File::open(path).await?;
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file.take(length)));
+
+    let mut response = axum::response::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, audio_mime(&track))
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::CACHE_CONTROL, "private, no-store");
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        );
+    }
+    Ok(response.body(body).map_err(anyhow::Error::from)?)
+}
+
+fn parse_byte_range(
+    value: Option<&str>,
+    total: u64,
+) -> std::result::Result<Option<(u64, u64)>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        return Ok(Some((total.saturating_sub(suffix), total - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= total {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(total - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+fn audio_mime(track: &Track) -> &'static str {
+    match track.format.as_deref().unwrap_or_default() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" => "audio/mp4",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/ogg; codecs=opus",
+        "wav" => "audio/wav",
+        "aiff" | "aif" => "audio/aiff",
+        _ => "application/octet-stream",
+    }
+}
+
+pub async fn select_candidate(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+    Json(body): Json<SelectRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let candidate_id = body
+        .candidate_id
+        .ok_or_else(|| ApiError::validation("candidate is required"))?;
+    let track = queries::track(&s.pool, id).await?;
+    let rows = queries::candidates(&s.pool, id).await?;
+    let candidates = rows.iter().map(CandidateRow::value).collect::<Vec<_>>();
+    let Some(mut selected) = candidates
+        .iter()
+        .find(|candidate| candidate.id == Some(candidate_id.0))
+        .cloned()
+    else {
+        return Err(ApiError::not_found("candidate not found for this track"));
+    };
+    let source_path = std::path::PathBuf::from(&track.path);
+    let embedded_cover = tokio::task::spawn_blocking(move || {
+        crate::infrastructure::media::tag_writer::read_artwork(&source_path)
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await
+    .unwrap_or(false);
+    crate::application::metadata_completion::complete(
+        &mut selected,
+        &candidates,
+        track.current_album.as_deref(),
+        embedded_cover,
+    );
+    crate::application::canonical_names::canonicalize_candidates(
+        &s.pool,
+        std::slice::from_mut(&mut selected),
+    )
+    .await?;
+    let limiter = s.artwork_downloads.read().await.clone();
+    let _permit = limiter.acquire_owned().await.map_err(anyhow::Error::from)?;
+    crate::application::artwork::ensure_usable_cover(
+        &s.pool,
+        &s.client,
+        &mut selected,
+        embedded_cover,
+    )
+    .await;
+    let completion =
+        crate::application::metadata_completion::reassess(&mut selected, embedded_cover);
+    let mut transaction = s.pool.begin().await?;
+    persist_completed_candidate(&mut transaction, &selected).await?;
+    let (status, stage, message) = readiness_state(&selected, &completion, "Selected by you");
+    sqlx::query("UPDATE tracks SET selected_candidate_id=?,status=?,stage=?,stage_message=?,updated_at=? WHERE id=?")
+        .bind(candidate_id.0)
+        .bind(status)
+        .bind(stage)
+        .bind(message)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id.0)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    let cover_verified = selected.artwork_status == ArtworkStatus::Verified;
+    Ok(Json(
+        serde_json::json!({"selected": true, "ready": stage == "ready", "cover_verified": cover_verified}),
+    ))
+}
+
+/// A track becomes Ready only when the whole core set is complete, which
+/// includes a verified matching cover. Tracks without usable artwork stay in
+/// review so a file is never written missing, broken, or wrongly matched art.
+fn readiness_state(
+    candidate: &Candidate,
+    completion: &crate::application::metadata_completion::CompletionReport,
+    prefix: &str,
+) -> (&'static str, &'static str, String) {
+    if completion.core_complete {
+        return (
+            "selected",
+            "ready",
+            format!("{prefix}; {}", completion.summary()),
+        );
+    }
+    let detail = candidate
+        .artwork_message
+        .clone()
+        .unwrap_or_else(|| completion.summary());
+    ("needs_review", "review", format!("{prefix}; {detail}"))
+}
+
+async fn persist_completed_candidate(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    candidate: &Candidate,
+) -> Result<()> {
+    let id = candidate
+        .id
+        .ok_or_else(|| anyhow::anyhow!("completed candidate has no database ID"))?;
+    sqlx::query(
+        "UPDATE candidates SET title=?,artist=?,artist_credits_json=?,album=?,album_artist=?,
+         album_artist_credits_json=?,track_number=?,track_total=?,disc_number=?,disc_total=?,year=?,
+         genre=?,composer=?,label=?,isrc=?,cover_url=?,artwork_candidates_json=?,artwork_status=?,
+         artwork_message=?,release_country=?,release_date=?,release_type=?,release_secondary_types=?,
+         is_compilation=?,score_breakdown=? WHERE id=?",
+    )
+    .bind(&candidate.title)
+    .bind(&candidate.artist)
+    .bind(serde_json::to_string(&candidate.artist_credits)?)
+    .bind(&candidate.album)
+    .bind(&candidate.album_artist)
+    .bind(serde_json::to_string(&candidate.album_artist_credits)?)
+    .bind(candidate.track_number)
+    .bind(candidate.track_total)
+    .bind(candidate.disc_number)
+    .bind(candidate.disc_total)
+    .bind(&candidate.year)
+    .bind(&candidate.genre)
+    .bind(&candidate.composer)
+    .bind(&candidate.label)
+    .bind(&candidate.isrc)
+    .bind(&candidate.cover_url)
+    .bind(serde_json::to_string(&candidate.artwork_candidates)?)
+    .bind(serde_json::to_value(&candidate.artwork_status)?.as_str().unwrap_or("searching"))
+    .bind(&candidate.artwork_message)
+    .bind(&candidate.release_country)
+    .bind(&candidate.release_date)
+    .bind(&candidate.release_type)
+    .bind(&candidate.release_secondary_types)
+    .bind(candidate.is_compilation)
+    .bind(&candidate.score_breakdown)
+    .bind(id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+pub async fn return_to_review(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if s.workflow_running().await {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+    let track = queries::track(&s.pool, id).await?;
+    if track.selected_candidate_id.is_none() {
+        return Err(ApiError::validation(
+            "This track does not have an identification to undo",
+        ));
+    }
+    let message = if track.output_path.is_some() {
+        "Returned to review; the existing corrected output was not removed"
+    } else {
+        "Returned to review"
+    };
+    let changed = sqlx::query(
+        "UPDATE tracks
+         SET selected_candidate_id=NULL,status='needs_review',stage='review',stage_message=?,updated_at=?
+         WHERE id=? AND selected_candidate_id IS NOT NULL",
+    )
+    .bind(message)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id.0)
+    .execute(&s.pool)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::conflict(
+            "The track identification was already changed",
+        ));
+    }
+    Ok(Json(serde_json::json!({"returned_to_review": true})))
+}
+
+pub async fn manual_candidate(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+    Json(mut value): Json<CandidateEdit>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if value.title.trim().is_empty() || value.artist.trim().is_empty() {
+        return Err(ApiError::validation("Title and artist are required"));
+    }
+    value.artist = crate::domain::credits::prefer_latin_alias(&value.artist);
+    value.album_artist = value
+        .album_artist
+        .as_deref()
+        .map(crate::domain::credits::prefer_latin_alias);
+    let credits = crate::domain::credits::normalize_structured(
+        &value.artist,
+        &value.title,
+        std::mem::take(&mut value.artist_credits),
+    );
+    value.artist = credits.artist;
+    value.title = credits.title;
+    value.artist_credits = credits.artists;
+    if let Some(album_artist) = value.album_artist.as_deref() {
+        let credits = crate::domain::credits::normalize_structured(
+            album_artist,
+            "",
+            std::mem::take(&mut value.album_artist_credits),
+        );
+        value.album_artist = Some(credits.artist);
+        value.album_artist_credits = credits.artists;
+    }
+    let mut release_fields = Candidate {
+        provider: "manual".into(),
+        title: value.title.clone(),
+        artist: value.artist.clone(),
+        artist_credits: value.artist_credits.clone(),
+        album: value.album.take(),
+        album_artist: value.album_artist.take(),
+        album_artist_credits: value.album_artist_credits.clone(),
+        track_number: value.track_number,
+        track_total: value.track_total,
+        disc_number: value.disc_number,
+        disc_total: value.disc_total,
+        year: value.year.clone(),
+        genre: value.genre.clone(),
+        composer: value.composer.clone(),
+        label: value.label.clone(),
+        isrc: value.isrc.clone(),
+        release_date: value.release_date.clone(),
+        ..Default::default()
+    };
+    crate::application::metadata_completion::normalize_release_fields(&mut release_fields);
+    value.album = release_fields.album;
+    value.album_artist = release_fields.album_artist;
+    let track: Option<(String, String)> =
+        sqlx::query_as("SELECT status,path FROM tracks WHERE id=?")
+            .bind(id.0)
+            .fetch_optional(&s.pool)
+            .await?;
+    let Some((status, track_path)) = track else {
+        return Err(ApiError::not_found("track not found"));
+    };
+    if status == "corrupt" {
+        return Err(ApiError::validation(
+            "Damaged audio cannot be marked ready; repair or replace the source file first",
+        ));
+    }
+    let cover_url = value
+        .cover_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned);
+    release_fields.album = value.album.clone();
+    release_fields.album_artist = value.album_artist.clone();
+    if let Some(url) = cover_url.as_deref() {
+        release_fields.cover_url = Some(url.to_owned());
+        release_fields.artwork_candidates =
+            vec![crate::infrastructure::providers::ArtworkCandidate {
+                provider: "User verified".into(),
+                url: url.to_owned(),
+                user_confirmed: true,
+                isrc: release_fields.isrc.clone(),
+                album: release_fields.album.clone(),
+                artist: Some(release_fields.artist.clone()),
+                ..Default::default()
+            }];
+    }
+    crate::application::canonical_names::canonicalize_candidates(
+        &s.pool,
+        std::slice::from_mut(&mut release_fields),
+    )
+    .await?;
+    let limiter = s.artwork_downloads.read().await.clone();
+    let _permit = limiter.acquire_owned().await.map_err(anyhow::Error::from)?;
+    crate::application::artwork::ensure_usable_cover(
+        &s.pool,
+        &s.client,
+        &mut release_fields,
+        false,
+    )
+    .await;
+    let completion = crate::application::metadata_completion::reassess(&mut release_fields, false);
+    let result = sqlx::query("INSERT INTO candidates(track_id,provider,title,artist,album,album_artist,track_number,track_total,disc_number,disc_total,year,genre,composer,label,isrc,release_date,cover_url,score,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(id.0).bind("manual").bind(&release_fields.title).bind(&release_fields.artist)
+        .bind(&release_fields.album).bind(&release_fields.album_artist).bind(release_fields.track_number).bind(release_fields.track_total)
+        .bind(release_fields.disc_number).bind(release_fields.disc_total).bind(&release_fields.year).bind(&release_fields.genre)
+        .bind(&release_fields.composer).bind(&release_fields.label).bind(&release_fields.isrc).bind(&release_fields.release_date)
+        .bind(&release_fields.cover_url)
+        .bind(100.0).bind("{}")
+        .execute(&s.pool).await?;
+    let candidate_id = result.last_insert_rowid();
+    sqlx::query("UPDATE candidates SET artist_credits_json=?,album_artist_credits_json=?,artwork_candidates_json=?,artwork_status=?,artwork_message=? WHERE id=?")
+        .bind(serde_json::to_string(&release_fields.artist_credits)?)
+        .bind(serde_json::to_string(&release_fields.album_artist_credits)?)
+        .bind(serde_json::to_string(&release_fields.artwork_candidates)?)
+        .bind(serde_json::to_value(&release_fields.artwork_status)?.as_str().unwrap_or("searching"))
+        .bind(&release_fields.artwork_message)
+        .bind(candidate_id)
+        .execute(&s.pool).await?;
+    if completion.core_complete
+        && let Some(cover_url) = release_fields.cover_url.as_deref()
+    {
+        persist_artwork_override(
+            &s.pool,
+            &track_path,
+            &release_fields.title,
+            &release_fields.artist,
+            cover_url,
+        )
+        .await?;
+    }
+    let (status, stage, message) =
+        readiness_state(&release_fields, &completion, "Entered manually");
+    sqlx::query(
+        "UPDATE tracks SET selected_candidate_id=?,status=?,stage=?,stage_message=? WHERE id=?",
+    )
+    .bind(candidate_id)
+    .bind(status)
+    .bind(stage)
+    .bind(message)
+    .bind(id.0)
+    .execute(&s.pool)
+    .await?;
+    let cover_verified = release_fields.artwork_status == ArtworkStatus::Verified;
+    Ok(Json(
+        serde_json::json!({"selected": true, "ready": stage == "ready", "cover_verified": cover_verified, "candidate_id": candidate_id}),
+    ))
+}
+
+pub async fn update_artwork(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+    Json(value): Json<ArtworkEdit>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (track, selected) = queries::selected(&s.pool, id).await?;
+    let supplied = value.cover_url.trim();
+    let parsed = reqwest::Url::parse(supplied).map_err(|_| {
+        ApiError::validation(
+            "Enter a valid HTTPS image, Shazam, Spotify, SoundCloud, Audiomack, Navahang, Radio Javan, or Genius song URL",
+        )
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(ApiError::validation("Cover URLs must use HTTPS"));
+    }
+    let cover_url = if parsed.host_str() == Some("open.spotify.com") {
+        lookup_spotify_source(&s, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Spotify link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Spotify did not return cover artwork"))?
+    } else if is_shazam_host(parsed.host_str()) {
+        crate::infrastructure::providers::shazam::lookup_url(&s.pool, &s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Shazam link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Shazam did not return cover artwork"))?
+    } else if is_soundcloud_host(parsed.host_str()) {
+        crate::infrastructure::providers::soundcloud::lookup_url(&s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("SoundCloud link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("SoundCloud did not return cover artwork"))?
+    } else if is_audiomack_host(parsed.host_str()) {
+        crate::infrastructure::providers::audiomack::lookup_url(&s.pool, &s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Audiomack link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Audiomack did not return cover artwork"))?
+    } else if is_navahang_host(parsed.host_str()) {
+        crate::infrastructure::providers::navahang::lookup_url(&s.pool, &s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Navahang link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Navahang did not return cover artwork"))?
+    } else if is_radiojavan_host(parsed.host_str()) {
+        crate::infrastructure::providers::radiojavan::lookup_url(&s.pool, &s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Radio Javan link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Radio Javan did not return cover artwork"))?
+    } else if is_genius_host(parsed.host_str()) {
+        crate::infrastructure::providers::genius::lookup_url(&s.pool, &s.client, supplied)
+            .await
+            .map_err(|error| ApiError::validation(format!("Genius link failed: {error:#}")))?
+            .cover_url
+            .ok_or_else(|| ApiError::validation("Genius did not return cover artwork"))?
+    } else {
+        supplied.to_owned()
+    };
+    let (bytes, info) =
+        crate::infrastructure::providers::cover_art_archive::fetch_verified_url_cached(
+            &s.pool, &s.client, &cover_url, true,
+        )
+        .await
+        .map_err(|error| ApiError::validation(format!("Cover download failed: {error:#}")))?;
+    let _ = bytes;
+    let artwork_candidates = vec![crate::infrastructure::providers::ArtworkCandidate {
+        provider: "User verified".into(),
+        url: cover_url.clone(),
+        user_confirmed: true,
+        release_id: selected.release_id.clone(),
+        isrc: selected.isrc.clone(),
+        album: selected.album.clone(),
+        artist: Some(selected.artist.clone()),
+    }];
+    let changed = sqlx::query(
+        "UPDATE candidates SET cover_url=?,artwork_candidates_json=?,artwork_status='verified',
+         artwork_message=? WHERE id=(SELECT selected_candidate_id FROM tracks WHERE id=?)",
+    )
+    .bind(&cover_url)
+    .bind(serde_json::to_string(&artwork_candidates)?)
+    .bind(format!(
+        "Verified {}x{} {} cover supplied by you",
+        info.width, info.height, info.mime
+    ))
+    .bind(id.0)
+    .execute(&s.pool)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::not_found(
+            "Select metadata for this track before setting its cover",
+        ));
+    }
+    persist_artwork_override(
+        &s.pool,
+        &track.path,
+        &selected.title,
+        &selected.artist,
+        &cover_url,
+    )
+    .await?;
+    let mut selected = selected;
+    selected.cover_url = Some(cover_url.clone());
+    selected.artwork_candidates = artwork_candidates;
+    selected.artwork_status = crate::infrastructure::providers::ArtworkStatus::Verified;
+    selected.artwork_message = Some("Verified cover supplied by you".into());
+    let completion = crate::application::metadata_completion::reassess(&mut selected, false);
+    let (status, stage, message) = readiness_state(&selected, &completion, "Artwork updated");
+    sqlx::query("UPDATE tracks SET status=?,stage=?,stage_message=?,updated_at=? WHERE id=?")
+        .bind(status)
+        .bind(stage)
+        .bind(message)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id.0)
+        .execute(&s.pool)
+        .await?;
+    Ok(Json(serde_json::json!({"cover_url": cover_url})))
+}
+
+/// Re-run the cover-art worker for the selected candidate without rescanning
+/// audio. This is the on-demand "find cover art" action: it re-checks every
+/// catalog source plus artwork already verified for the same release, and
+/// either verifies a cover (making the track Ready) or keeps it in Review.
+pub async fn search_artwork(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (track, mut candidate) = queries::selected(&s.pool, id).await?;
+    let source_path = std::path::PathBuf::from(&track.path);
+    let embedded_cover = tokio::task::spawn_blocking(move || {
+        tag_writer::read_artwork(&source_path)
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await
+    .unwrap_or(false);
+    let limiter = s.artwork_downloads.read().await.clone();
+    let _permit = limiter.acquire_owned().await.map_err(anyhow::Error::from)?;
+    crate::application::artwork::ensure_usable_cover(
+        &s.pool,
+        &s.client,
+        &mut candidate,
+        embedded_cover,
+    )
+    .await;
+    let completion =
+        crate::application::metadata_completion::reassess(&mut candidate, embedded_cover);
+    let mut transaction = s.pool.begin().await?;
+    persist_completed_candidate(&mut transaction, &candidate).await?;
+    let (status, stage, message) =
+        readiness_state(&candidate, &completion, "Cover search complete");
+    sqlx::query("UPDATE tracks SET status=?,stage=?,stage_message=?,updated_at=? WHERE id=?")
+        .bind(status)
+        .bind(stage)
+        .bind(message)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id.0)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(Json(serde_json::json!({
+        "cover_verified": candidate.artwork_status == ArtworkStatus::Verified,
+        "ready": stage == "ready",
+        "artwork_status": serde_json::to_value(&candidate.artwork_status).ok(),
+        "artwork_message": candidate.artwork_message,
+        "cover_url": candidate.cover_url,
+    })))
+}
+
+async fn persist_artwork_override(
+    pool: &sqlx::SqlitePool,
+    path: &str,
+    title: &str,
+    artist: &str,
+    cover_url: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO artwork_overrides(path,title,artist,cover_url,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET title=excluded.title,artist=excluded.artist,cover_url=excluded.cover_url,updated_at=excluded.updated_at")
+        .bind(path)
+        .bind(title)
+        .bind(artist)
+        .bind(cover_url)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn artwork_preview(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<axum::response::Response> {
+    let (track, candidate) = queries::selected(&s.pool, id).await?;
+    let artwork = match super::apply::resolve_artwork(&s, &track.filename, &candidate).await {
+        Ok(bytes) => Some(bytes),
+        Err(_) => tokio::task::spawn_blocking(move || {
+            tag_writer::read_artwork(std::path::Path::new(&track.path))
+        })
+        .await
+        .map_err(anyhow::Error::from)??,
+    }
+    .ok_or_else(|| ApiError::not_found("No valid artwork is available for this track"))?;
+    artwork_response(artwork)
+}
+
+pub async fn original_artwork_preview(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<axum::response::Response> {
+    let track = queries::track(&s.pool, id).await?;
+    let artwork = tokio::task::spawn_blocking(move || {
+        tag_writer::read_artwork(std::path::Path::new(&track.path))
+    })
+    .await
+    .map_err(anyhow::Error::from)??
+    .ok_or_else(|| ApiError::not_found("No embedded artwork is available for this track"))?;
+    artwork_response(artwork)
+}
+
+pub async fn candidate_artwork_preview(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<CandidateId>,
+) -> ApiResult<axum::response::Response> {
+    let row: CandidateRow = sqlx::query_as("SELECT * FROM candidates WHERE id=?")
+        .bind(id.0)
+        .fetch_optional(&s.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("candidate not found"))?;
+    let candidate = row.value();
+    let mut urls = candidate.cover_url.into_iter().collect::<Vec<_>>();
+    if let Some(value) = candidate
+        .score_breakdown
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    {
+        for item in value["artwork_candidates"].as_array().into_iter().flatten() {
+            if let Some(url) = item["url"].as_str()
+                && !urls.iter().any(|existing| existing == url)
+            {
+                urls.push(url.to_owned());
+            }
+        }
+    }
+    for url in urls {
+        if let Ok(bytes) = crate::infrastructure::providers::cover_art_archive::fetch_url_cached(
+            &s.pool, &s.client, &url,
+        )
+        .await
+            && tag_writer::validate_artwork(&bytes).is_ok()
+        {
+            return artwork_response(bytes);
+        }
+    }
+    Err(ApiError::not_found(
+        "No valid catalog artwork is available for this candidate",
+    ))
+}
+
+fn artwork_response(artwork: Vec<u8>) -> ApiResult<axum::response::Response> {
+    let mime = artwork_mime(&artwork);
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, mime)
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=300")
+        .body(axum::body::Body::from(artwork))
+        .map_err(anyhow::Error::from)?)
+}
+
+fn artwork_mime(data: &[u8]) -> &'static str {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if data.starts_with(b"GIF8") {
+        "image/gif"
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+pub async fn resolve_source(
+    State(s): State<Arc<AppState>>,
+    Json(value): Json<SourceLookupRequest>,
+) -> ApiResult<Json<Candidate>> {
+    let url = value.url.trim();
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        ApiError::validation(
+            "Enter a valid Shazam, Spotify, SoundCloud, Audiomack, Navahang, Radio Javan, Genius, or YouTube URL",
+        )
+    })?;
+    let mut candidate = if parsed.host_str() == Some("open.spotify.com") {
+        lookup_spotify_source(&s, url).await
+    } else if is_shazam_host(parsed.host_str()) {
+        crate::infrastructure::providers::shazam::lookup_url(&s.pool, &s.client, url).await
+    } else if is_soundcloud_host(parsed.host_str()) {
+        crate::infrastructure::providers::soundcloud::lookup_url(&s.client, url).await
+    } else if is_audiomack_host(parsed.host_str()) {
+        crate::infrastructure::providers::audiomack::lookup_url(&s.pool, &s.client, url).await
+    } else if is_navahang_host(parsed.host_str()) {
+        crate::infrastructure::providers::navahang::lookup_url(&s.pool, &s.client, url).await
+    } else if is_radiojavan_host(parsed.host_str()) {
+        crate::infrastructure::providers::radiojavan::lookup_url(&s.pool, &s.client, url).await
+    } else if is_genius_host(parsed.host_str()) {
+        crate::infrastructure::providers::genius::lookup_url(&s.pool, &s.client, url).await
+    } else if is_youtube_host(parsed.host_str()) {
+        crate::infrastructure::providers::youtube::lookup_url(&s.client, url).await
+    } else {
+        Err(anyhow::anyhow!("this site is not a supported music source"))
+    }
+    .map_err(|error| ApiError::validation(format!("Source lookup failed: {error:#}")))?;
+    if candidate.provider == "shazam" {
+        enrich_shazam_with_spotify(&s, &mut candidate).await;
+    }
+    Ok(Json(candidate))
+}
+
+async fn lookup_spotify_source(s: &AppState, url: &str) -> Result<Candidate> {
+    let cfg = s.config.read().await.clone();
+    crate::infrastructure::providers::spotify::lookup_url(
+        &s.client,
+        &s.spotify_auth,
+        &cfg.spotify_client_id,
+        &cfg.spotify_client_secret,
+        url,
+    )
+    .await
+}
+
+async fn enrich_shazam_with_spotify(s: &AppState, candidate: &mut Candidate) {
+    let cfg = s.config.read().await.clone();
+    if cfg.spotify_client_id.trim().is_empty() || cfg.spotify_client_secret.trim().is_empty() {
+        return;
+    }
+    let isrcs = candidate.isrc.clone().into_iter().collect::<Vec<_>>();
+    let Ok(results) = crate::infrastructure::providers::spotify::search(
+        &s.client,
+        &s.spotify_auth,
+        &cfg.spotify_client_id,
+        &cfg.spotify_client_secret,
+        &candidate.title,
+        Some(&candidate.artist),
+        &isrcs,
+    )
+    .await
+    else {
+        return;
+    };
+    let spotify = results.iter().find(|result| {
+        candidate
+            .isrc
+            .as_deref()
+            .zip(result.isrc.as_deref())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+    });
+    let Some(spotify) = spotify.or_else(|| results.first()) else {
+        return;
+    };
+    fill_missing_source_fields(candidate, spotify);
+    candidate.score_breakdown = Some(
+        serde_json::json!({
+            "source": "shazam_user_source_url",
+            "sources": ["Shazam", "Spotify"],
+            "user_verified_source": true,
+            "spotify_catalog_enriched": true,
+            "final_score": candidate.score
+        })
+        .to_string(),
+    );
+}
+
+fn fill_missing_source_fields(candidate: &mut Candidate, source: &Candidate) {
+    macro_rules! fill {
+        ($field:ident) => {
+            if candidate.$field.is_none() {
+                candidate.$field = source.$field.clone();
+            }
+        };
+    }
+    fill!(album);
+    fill!(album_artist);
+    fill!(track_number);
+    fill!(track_total);
+    fill!(disc_number);
+    fill!(disc_total);
+    fill!(year);
+    fill!(genre);
+    fill!(composer);
+    fill!(label);
+    fill!(isrc);
+    fill!(cover_url);
+    fill!(release_date);
+    fill!(release_type);
+    fill!(duration_delta);
+    candidate.is_compilation |= source.is_compilation;
+}
+
+fn is_soundcloud_host(host: Option<&str>) -> bool {
+    matches!(host, Some("soundcloud.com" | "www.soundcloud.com"))
+}
+
+fn is_shazam_host(host: Option<&str>) -> bool {
+    matches!(host, Some("shazam.com" | "www.shazam.com"))
+}
+
+fn is_audiomack_host(host: Option<&str>) -> bool {
+    matches!(host, Some("audiomack.com" | "www.audiomack.com"))
+}
+
+fn is_navahang_host(host: Option<&str>) -> bool {
+    matches!(host, Some("navahang.com" | "www.navahang.com"))
+}
+
+fn is_radiojavan_host(host: Option<&str>) -> bool {
+    matches!(
+        host,
+        Some("play.radiojavan.com" | "www.play.radiojavan.com")
+    )
+}
+
+fn is_genius_host(host: Option<&str>) -> bool {
+    matches!(host, Some("genius.com" | "www.genius.com"))
+}
+
+fn is_youtube_host(host: Option<&str>) -> bool {
+    matches!(
+        host,
+        Some("youtube.com" | "www.youtube.com" | "music.youtube.com" | "youtu.be")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, infrastructure::db};
+
+    #[tokio::test]
+    async fn remove_track_deletes_review_file_and_database_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("music");
+        tokio::fs::create_dir(&input).await.unwrap();
+        let source = input.join("remove-me.mp3");
+        tokio::fs::write(&source, b"test audio").await.unwrap();
+        let database = directory.path().join("remove-track.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let config = Config {
+            input_dir: input.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let state = Arc::new(AppState::new(config, pool.clone()));
+        let track_id = insert_test_track(&pool, source.to_str().unwrap(), "needs_review", 0).await;
+        insert_test_candidate(&pool, track_id, "Candidate", 70.0).await;
+
+        let response = remove_track(State(state), Path(TrackId(track_id)))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(response["removed"], true);
+        assert!(!source.exists());
+        let tracks: i64 = sqlx::query_scalar("SELECT count(*) FROM tracks WHERE id=?")
+            .bind(track_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let candidates: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM candidates WHERE track_id=?")
+                .bind(track_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tracks, 0);
+        assert_eq!(candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn remove_track_refuses_files_outside_music_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("music");
+        tokio::fs::create_dir(&input).await.unwrap();
+        let source = directory.path().join("keep-me.mp3");
+        tokio::fs::write(&source, b"test audio").await.unwrap();
+        let database = directory.path().join("safe-remove-track.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let config = Config {
+            input_dir: input.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let state = Arc::new(AppState::new(config, pool.clone()));
+        let track_id = insert_test_track(&pool, source.to_str().unwrap(), "needs_review", 0).await;
+
+        let result = remove_track(State(state), Path(TrackId(track_id))).await;
+
+        assert!(matches!(result, Err(ApiError::Validation(_))));
+        assert!(source.exists());
+        let tracks: i64 = sqlx::query_scalar("SELECT count(*) FROM tracks WHERE id=?")
+            .bind(track_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tracks, 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_duplicate_representative_promotes_the_best_remaining_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("music");
+        tokio::fs::create_dir(&input).await.unwrap();
+        let representative = input.join("representative.mp3");
+        let promoted = input.join("promoted.mp3");
+        tokio::fs::write(&representative, b"audio").await.unwrap();
+        tokio::fs::write(&promoted, b"audio").await.unwrap();
+        let database = directory.path().join("promote-duplicate.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(
+            Config {
+                input_dir: input.to_string_lossy().into_owned(),
+                ..Config::default()
+            },
+            pool.clone(),
+        ));
+        let representative_id = sqlx::query(
+            "INSERT INTO tracks(path,filename,format,bitrate,duration,content_fingerprint,status,
+             is_missing,first_seen_at,last_seen_at,last_scanned_at,stage)
+             VALUES(?,'representative.mp3','mp3',192,180.0,'fp:same','needs_review',0,
+             'now','now','now','review')",
+        )
+        .bind(representative.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let candidate_id = insert_test_candidate(&pool, representative_id, "Candidate", 70.0).await;
+        let promoted_id = sqlx::query(
+            "INSERT INTO tracks(path,filename,format,bitrate,duration,content_fingerprint,status,
+             is_missing,first_seen_at,last_seen_at,last_scanned_at,stage)
+             VALUES(?,'promoted.mp3','mp3',320,180.0,'fp:same','duplicate',0,
+             'now','now','now','skipped')",
+        )
+        .bind(promoted.to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let _ = remove_track(State(state), Path(TrackId(representative_id)))
+            .await
+            .unwrap();
+
+        let row: (String, String, Option<i64>) =
+            sqlx::query_as("SELECT status,stage,selected_candidate_id FROM tracks WHERE id=?")
+                .bind(promoted_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("review".into(), "review".into(), None));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT track_id FROM candidates WHERE id=?")
+                .bind(candidate_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            promoted_id
+        );
+        assert!(!representative.exists());
+        assert!(promoted.exists());
+    }
+
+    #[tokio::test]
+    async fn manual_metadata_with_a_verified_cover_becomes_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("manual.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        crate::infrastructure::provider_cache::ProviderCache::put(
+            &pool,
+            "artwork-url",
+            &crate::infrastructure::provider_cache::search_key(
+                "https://example.test/manual-cover.jpg",
+            ),
+            &serde_json::json!({
+                "data_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    crate::infrastructure::media::tag_writer::test_artwork_png()
+                )
+            }),
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/unknown.mp3','unknown.mp3','needs_review',0,'now','now','now','review')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+
+        let Json(response) = manual_candidate(
+            State(state),
+            Path(TrackId(track_id)),
+            Json(CandidateEdit {
+                title: "Correct title".into(),
+                artist: "Correct artist".into(),
+                artist_credits: Vec::new(),
+                album: Some("Correct album".into()),
+                album_artist: None,
+                album_artist_credits: Vec::new(),
+                track_number: Some(1),
+                track_total: None,
+                disc_number: None,
+                disc_total: None,
+                year: Some("2026".into()),
+                genre: None,
+                composer: None,
+                label: None,
+                isrc: None,
+                release_date: None,
+                cover_url: Some("https://example.test/manual-cover.jpg".into()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["ready"], true);
+        assert_eq!(response["cover_verified"], true);
+        let row: (String, String, String) = sqlx::query_as("SELECT tracks.stage,candidates.title,candidates.artist FROM tracks JOIN candidates ON candidates.id=tracks.selected_candidate_id WHERE tracks.id=?")
+            .bind(track_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "ready".into(),
+                "Correct title".into(),
+                "Correct artist".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_metadata_without_a_cover_stays_in_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("manual-no-cover.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/unknown.mp3','unknown.mp3','needs_review',0,'now','now','now','review')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+
+        let Json(response) = manual_candidate(
+            State(state),
+            Path(TrackId(track_id)),
+            Json(CandidateEdit {
+                title: "Correct title".into(),
+                artist: "Correct artist".into(),
+                artist_credits: Vec::new(),
+                album: Some("Correct album".into()),
+                album_artist: None,
+                album_artist_credits: Vec::new(),
+                track_number: Some(1),
+                track_total: None,
+                disc_number: None,
+                disc_total: None,
+                year: Some("2026".into()),
+                genre: None,
+                composer: None,
+                label: None,
+                isrc: None,
+                release_date: None,
+                cover_url: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["selected"], true);
+        assert_eq!(response["ready"], false);
+        assert_eq!(response["cover_verified"], false);
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT tracks.stage,tracks.status,(SELECT artwork_status FROM candidates WHERE id=tracks.selected_candidate_id)
+             FROM tracks WHERE id=?",
+        )
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "review");
+        assert_eq!(row.1, "needs_review");
+        assert_ne!(row.2, "verified");
+    }
+
+    #[tokio::test]
+    async fn explicit_choice_without_a_verified_cover_stays_in_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("choose-cover-pending.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/cover-pending.mp3','cover-pending.mp3','needs_review',0,'now','now','now','review')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let candidate_id = sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,album,cover_url,duration_delta,score,score_breakdown)
+             VALUES(?,'deezer','Song','Artist','Album','http://127.0.0.1:1/broken.jpg',1.0,95.0,'{}')",
+        )
+        .bind(track_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let Json(response) = select_candidate(
+            State(state),
+            Path(TrackId(track_id)),
+            Json(SelectRequest {
+                candidate_id: Some(CandidateId(candidate_id)),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["selected"], true);
+        assert_eq!(response["ready"], false);
+        assert_eq!(response["cover_verified"], false);
+        let row: (Option<i64>, String, String, String) = sqlx::query_as(
+            "SELECT selected_candidate_id,status,stage,
+                    (SELECT artwork_status FROM candidates WHERE id=?) FROM tracks WHERE id=?",
+        )
+        .bind(candidate_id)
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, Some(candidate_id));
+        assert_eq!(row.1, "needs_review");
+        assert_eq!(row.2, "review");
+        assert_ne!(row.3, "verified");
+    }
+
+    #[tokio::test]
+    async fn artwork_search_uses_a_same_release_cover_to_make_the_track_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("artwork-search.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        crate::infrastructure::provider_cache::ProviderCache::put(
+            &pool,
+            "artwork-url",
+            &crate::infrastructure::provider_cache::search_key(
+                "https://example.test/release-cover.jpg",
+            ),
+            &serde_json::json!({
+                "data_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    crate::infrastructure::media::tag_writer::test_artwork_png()
+                )
+            }),
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/pending-cover.mp3','pending-cover.mp3','needs_review',0,'now','now','now','review')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let candidate_id = sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,album,musicbrainz_release_id,cover_url,duration_delta,score,score_breakdown,artwork_status)
+             VALUES(?,'deezer','Song','Artist','Album','release-7','http://127.0.0.1:1/broken.jpg',1.0,95.0,'{}','retryable_error')",
+        )
+        .bind(track_id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+            .bind(candidate_id)
+            .bind(track_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,album,musicbrainz_release_id,cover_url,score,artwork_status)
+             VALUES(?,'itunes','Song','Artist','Album','release-7','https://example.test/release-cover.jpg',90,'verified')",
+        )
+        .bind(track_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(response) = search_artwork(State(state), Path(TrackId(track_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(response["cover_verified"], true);
+        assert_eq!(response["ready"], true);
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT tracks.stage,tracks.status,(SELECT artwork_status FROM candidates WHERE id=?) FROM tracks WHERE id=?",
+        )
+        .bind(candidate_id)
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "ready");
+        assert_eq!(row.1, "selected");
+        assert_eq!(row.2, "verified");
+    }
+
+    #[tokio::test]
+    async fn auto_approve_uses_smart_selection_and_leaves_unsafe_tracks() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("auto-approve.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        crate::infrastructure::provider_cache::ProviderCache::put(
+            &pool,
+            "artwork-url",
+            &crate::infrastructure::provider_cache::search_key("https://example.test/cover.jpg"),
+            &serde_json::json!({
+                "data_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    crate::infrastructure::media::tag_writer::test_artwork_png()
+                )
+            }),
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+
+        let review_id = insert_test_track(&pool, "/music/review.mp3", "needs_review", 0).await;
+        let smart_id = insert_test_candidate(&pool, review_id, "Song", 90.0).await;
+        let highest_id = insert_test_candidate(&pool, review_id, "Song (Live)", 99.0).await;
+        let corrupt_id = insert_test_track(&pool, "/music/corrupt.mp3", "corrupt", 0).await;
+        insert_test_candidate(&pool, corrupt_id, "Must stay", 99.0).await;
+        insert_test_track(&pool, "/music/unmatched.mp3", "needs_review", 0).await;
+        let missing_id = insert_test_track(&pool, "/music/missing.mp3", "needs_review", 1).await;
+        insert_test_candidate(&pool, missing_id, "Missing source", 99.0).await;
+
+        let result = auto_approve_review(State(state)).await.unwrap().0;
+
+        assert_eq!(result.approved, 1);
+        assert_eq!(result.remaining, 3);
+        assert_eq!(result.low_confidence, 0);
+        assert_eq!(result.unavailable, 3);
+        let selected: (Option<i64>, String, String, Option<String>) = sqlx::query_as(
+            "SELECT selected_candidate_id,status,stage,stage_message FROM tracks WHERE id=?",
+        )
+        .bind(review_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(selected.0, Some(smart_id));
+        assert_ne!(selected.0, Some(highest_id));
+        assert_eq!(selected.1, "selected");
+        assert_eq!(selected.2, "ready");
+        assert!(selected.3.unwrap().starts_with("Smart auto-approved"));
+        let untouched: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM tracks WHERE id IN (?,?) AND stage='review' AND selected_candidate_id IS NULL",
+        )
+        .bind(corrupt_id)
+        .bind(missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, 2);
+    }
+
+    #[tokio::test]
+    async fn return_to_review_clears_selection_but_keeps_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("return-to-review.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/ready.mp3','ready.mp3','selected',0,'now','now','now','ready')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let candidate_id = sqlx::query("INSERT INTO candidates(track_id,provider,title,artist,score) VALUES(?,'deezer','Song','Artist',95)")
+            .bind(track_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+            .bind(candidate_id)
+            .bind(track_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let _ = return_to_review(State(state), Path(TrackId(track_id)))
+            .await
+            .unwrap();
+
+        let track: (Option<i64>, String, String, Option<String>) = sqlx::query_as(
+            "SELECT selected_candidate_id,status,stage,stage_message FROM tracks WHERE id=?",
+        )
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(track.0, None);
+        assert_eq!(track.1, "needs_review");
+        assert_eq!(track.2, "review");
+        assert_eq!(track.3.as_deref(), Some("Returned to review"));
+        let candidates: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM candidates WHERE track_id=?")
+                .bind(track_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(candidates, 1);
+    }
+
+    async fn insert_test_track(
+        pool: &sqlx::SqlitePool,
+        path: &str,
+        status: &str,
+        is_missing: i64,
+    ) -> i64 {
+        sqlx::query("INSERT INTO tracks(path,filename,current_title,current_artist,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES(?,?,'Song','Artist',?,?,'now','now','now','review')")
+            .bind(path)
+            .bind(path.rsplit('/').next().unwrap())
+            .bind(status)
+            .bind(is_missing)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+    }
+
+    async fn insert_test_candidate(
+        pool: &sqlx::SqlitePool,
+        track_id: i64,
+        title: &str,
+        score: f64,
+    ) -> i64 {
+        sqlx::query("INSERT INTO candidates(track_id,provider,title,artist,album,cover_url,duration_delta,score,score_breakdown) VALUES(?,'deezer',?,'Artist','Album','https://example.test/cover.jpg',1.0,?,'{\"sources\":[\"Deezer\"]}')")
+            .bind(track_id)
+            .bind(title)
+            .bind(score)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+    }
+
+    #[test]
+    fn parses_browser_audio_ranges() {
+        assert_eq!(parse_byte_range(None, 100), Ok(None));
+        assert_eq!(parse_byte_range(Some("bytes=0-9"), 100), Ok(Some((0, 9))));
+        assert_eq!(parse_byte_range(Some("bytes=90-"), 100), Ok(Some((90, 99))));
+        assert_eq!(parse_byte_range(Some("bytes=-10"), 100), Ok(Some((90, 99))));
+        assert!(parse_byte_range(Some("bytes=100-"), 100).is_err());
+        assert!(parse_byte_range(Some("items=0-9"), 100).is_err());
+    }
+}
