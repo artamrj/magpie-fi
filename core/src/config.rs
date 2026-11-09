@@ -94,7 +94,31 @@ impl Config {
         override_from_env!(discogs_token, "UNUNKNOWN_DISCOGS_TOKEN");
         override_from_env!(lastfm_key, "UNUNKNOWN_LASTFM_KEY");
         override_from_env!(theaudiodb_key, "UNUNKNOWN_THEAUDIODB_KEY");
+        if let Some(value) = env_bool("UNUNKNOWN_DELETE_SOURCE_AFTER_WRITE") {
+            self.delete_source_after_write = value;
+        }
+        if let Some(value) = env_bool("UNUNKNOWN_AUTOMATIC_SCAN_ENABLED") {
+            self.automatic_scan_enabled = value;
+        }
+        if let Some(value) = std::env::var("UNUNKNOWN_AUTOMATIC_SCAN_INTERVAL_MINUTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            self.automatic_scan_interval_minutes = value;
+        }
         self.normalize();
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    parse_bool(&std::env::var(name).ok()?)
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -116,6 +140,17 @@ mod tests {
         assert_eq!(config.fingerprint_workers, 16);
         assert_eq!(config.lookup_workers, 1);
         assert_eq!(config.write_workers, 8);
+    }
+
+    #[test]
+    fn boolean_environment_values_are_parsed() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool(" ON "), Some(true));
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool(""), None);
+        assert_eq!(parse_bool("maybe"), None);
     }
 
     #[test]

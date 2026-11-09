@@ -174,6 +174,9 @@ fn discover_files(input_dir: &str) -> (Vec<PathBuf>, Vec<String>) {
     let mut files: Vec<PathBuf> = WalkDir::new(input_dir)
         .follow_links(false)
         .into_iter()
+        // Skip hidden and NAS system folders (`.incoming`, `.trash`, `@eaDir`). Other
+        // programs keep unfinished files there, so they must never be scanned.
+        .filter_entry(|entry| entry.depth() == 0 || !is_ignored_name(entry.file_name()))
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry),
             Err(error) => {
@@ -187,6 +190,11 @@ fn discover_files(input_dir: &str) -> (Vec<PathBuf>, Vec<String>) {
         .collect();
     files.sort();
     (files, walk_errors)
+}
+
+fn is_ignored_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with('.') || name.starts_with('@'))
 }
 
 async fn discover_files_in_background(input_dir: String) -> Result<(Vec<PathBuf>, Vec<String>)> {
@@ -573,6 +581,32 @@ pub(super) struct FingerprintEvidence<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_skips_hidden_and_nas_folders() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for path in [
+            "Artist/Album/01 - Song.m4a",
+            ".incoming/partial.m4a",
+            "Artist/.trash/old.mp3",
+            "@eaDir/thumb.flac",
+            "Artist/._Song.m4a",
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"audio").unwrap();
+        }
+
+        let (files, errors) = discover_files(root.to_str().unwrap());
+
+        assert!(errors.is_empty());
+        let expected = root
+            .join("Artist/Album/01 - Song.m4a")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(files, vec![expected]);
+    }
 
     #[tokio::test]
     async fn automatic_scan_only_returns_new_or_changed_files() {

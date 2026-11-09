@@ -1,4 +1,8 @@
-name: Release
+name: release
+
+# Push a tag like v0.1.0 to publish both images with that version:
+#   ghcr.io/<owner>/magpie-fi-core and ghcr.io/<owner>/magpie-fi-bot
+# (tags: 0.1.0, v0.1.0, 0.1, 0, latest; linux/amd64 + linux/arm64).
 
 on:
   push:
@@ -7,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version to create, for example v0.6.0
+        description: Release version to create, for example v0.1.0
         required: true
         type: string
 
@@ -19,14 +23,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/magpie-fi
 
 jobs:
   image:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.component }} ${{ matrix.suffix }}
     strategy:
       fail-fast: false
       matrix:
+        component: [core, bot]
+        platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -34,6 +40,12 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             suffix: arm64
+          # The core blocks on CRITICAL/HIGH findings (with documented exceptions).
+          # The bot image only reports them for now; it never had a scan before.
+          - component: core
+            trivy_exit_code: "1"
+          - component: bot
+            trivy_exit_code: "0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -43,8 +55,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # A manual release may create a tag that does not exist yet. Build the
-          # exact commit selected in the workflow UI instead of checking out the
-          # requested version as a ref.
+          # exact commit selected in the workflow UI.
           ref: ${{ github.sha }}
 
       - name: Resolve version
@@ -53,7 +64,7 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must use vMAJOR.MINOR.PATCH, for example v0.6.0"
+            echo "Release tag must use vMAJOR.MINOR.PATCH, for example v0.1.0"
             exit 1
           fi
           {
@@ -74,16 +85,16 @@ jobs:
       - name: Build and push native image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ matrix.component }}
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
+          tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
           build-args: |
             VERSION=${{ steps.version.outputs.value }}
             VCS_REF=${{ steps.version.outputs.sha }}
             SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=release-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=release-${{ matrix.suffix }}
+          cache-from: type=gha,scope=release-${{ matrix.component }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.component }}-${{ matrix.suffix }}
           provenance: mode=max
           sbom: true
 
@@ -93,13 +104,13 @@ jobs:
           TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
           version: v0.72.0
-          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
+          image-ref: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
           format: table
-          exit-code: "1"
+          exit-code: ${{ matrix.trivy_exit_code }}
           ignore-unfixed: false
           vuln-type: os,library
           severity: CRITICAL,HIGH
-          trivyignores: .trivyignore.yaml
+          trivyignores: ${{ matrix.component == 'core' && 'core/.trivyignore.yaml' || '' }}
 
   publish:
     needs: image
@@ -119,7 +130,7 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must use vMAJOR.MINOR.PATCH, for example v0.6.0"
+            echo "Release tag must use vMAJOR.MINOR.PATCH, for example v0.1.0"
             exit 1
           fi
           version="${RELEASE_TAG#v}"
@@ -147,15 +158,18 @@ jobs:
           MINOR: ${{ steps.version.outputs.minor }}
           MAJOR: ${{ steps.version.outputs.major }}
         run: |
-          docker buildx imagetools create \
-            --tag "$IMAGE_NAME:$VERSION" \
-            --tag "$IMAGE_NAME:$RELEASE_TAG" \
-            --tag "$IMAGE_NAME:$MINOR" \
-            --tag "$IMAGE_NAME:$MAJOR" \
-            --tag "$IMAGE_NAME:latest" \
-            "$IMAGE_NAME:$VERSION-amd64" \
-            "$IMAGE_NAME:$VERSION-arm64"
-          docker buildx imagetools inspect "$IMAGE_NAME:$VERSION"
+          for component in core bot; do
+            image="$IMAGE_PREFIX-$component"
+            docker buildx imagetools create \
+              --tag "$image:$VERSION" \
+              --tag "$image:$RELEASE_TAG" \
+              --tag "$image:$MINOR" \
+              --tag "$image:$MAJOR" \
+              --tag "$image:latest" \
+              "$image:$VERSION-amd64" \
+              "$image:$VERSION-arm64"
+            docker buildx imagetools inspect "$image:$VERSION"
+          done
 
       - name: Create GitHub Release
         env:

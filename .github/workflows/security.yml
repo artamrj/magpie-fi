@@ -1,4 +1,4 @@
-name: Security audit
+name: security audit
 
 on:
   schedule:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  frontend:
+  web:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -24,10 +24,10 @@ jobs:
           node-version: 26
 
       - name: Audit frontend dependencies
-        working-directory: frontend
+        working-directory: core/frontend
         run: npm audit --package-lock-only --audit-level=high
 
-  rust:
+  core:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -43,4 +43,5 @@ jobs:
         run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit Rust dependencies
+        working-directory: core
         run: cargo audit

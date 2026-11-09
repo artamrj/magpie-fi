@@ -678,14 +678,22 @@ magpie-fi/                       ← today this folder is still called navidrome
 
 Each phase is useful on its own. You can stop after any of them.
 
-### Phase 0 — "Glue mode": works this weekend, almost no code
-- Create the monorepo (history imported), one `compose.yaml` with **navidrome + bot + ununknown**.
-- Bot `MUSIC_DIR` = `/srv/music/inbox/links`. ununknown `INPUT` = `/srv/music/inbox`,
-  `OUTPUT` = `/srv/music/library`, automatic cleaning on, "remove input after output" on.
-- Navidrome reads `library/` read-only.
+### Phase 0 — "Glue mode": works this weekend, almost no code ✅ built
+- Monorepo with both histories (`core/` = ununknown, `bot/` = sync-me-maybe), one `compose.yaml`
+  with **navidrome + bot + core**. Root CI per component, one release workflow publishing
+  `magpie-fi-core` and `magpie-fi-bot` images.
+- Bot `MUSIC_DIR` = `MUSIC_ROOT/inbox` (the inbox **root**: ununknown keeps the input's subfolders,
+  so `inbox/links/…` would have become `library/links/…`). Bot temp folder = `inbox/.incoming`, so
+  finished files appear with one atomic rename.
+- Core input = `inbox`, output = `library`, automatic filing every 2 min, "remove input after output"
+  on. Two small core changes made this possible: the env overrides `UNUNKNOWN_DELETE_SOURCE_AFTER_WRITE`,
+  `UNUNKNOWN_AUTOMATIC_SCAN_ENABLED`, `UNUNKNOWN_AUTOMATIC_SCAN_INTERVAL_MINUTES`, and skipping
+  `.hidden` / `@nas` folders while scanning.
+- Navidrome 0.64.2 reads `library/` read-only, config in `config/navidrome.toml`.
 - ✅ Done when a Spotify link sent to the bot appears in Navidrome after the next automatic cycle.
-- Known gaps: bot playlists point to inbox paths (turn playlist writing off for now). Bot status says
-  "done" before the song is really in Navidrome. Output naming is still ununknown's `Artist - Title`.
+- Known gaps (listed in README): bot says "done" before filing; naming is `Album Artist/Album/Artist - Title`;
+  uploads land in the library root; bot `.m3u8` playlists stay in the inbox; lyrics off; bot forgets songs
+  once they leave the inbox; 20 MB Telegram download limit.
 
 ### Phase 1 — Core becomes the librarian
 - Permanent `library_items` table. Library layout from §5. Album folders, `cover.jpg`, `artist.jpg`.

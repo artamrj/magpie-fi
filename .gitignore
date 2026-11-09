@@ -1,0 +1,6 @@
+.env
+/music/
+/data/
+/config/ytdlp/*
+!/config/ytdlp/.gitkeep
+.DS_Store

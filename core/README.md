@@ -58,6 +58,11 @@ without persisting them in SQLite through `UNUNKNOWN_ACOUSTID_KEY`, `UNUNKNOWN_A
 `UNUNKNOWN_YOUTUBE_API_KEY`, `UNUNKNOWN_DISCOGS_TOKEN`, `UNUNKNOWN_LASTFM_KEY`, and
 `UNUNKNOWN_THEAUDIODB_KEY`.
 
+Behaviour settings from **Settings** can also be fixed by the environment (the environment wins):
+`UNUNKNOWN_AUTOMATIC_SCAN_ENABLED` and `UNUNKNOWN_DELETE_SOURCE_AFTER_WRITE` (`true`/`false`), and
+`UNUNKNOWN_AUTOMATIC_SCAN_INTERVAL_MINUTES`. Folders whose name starts with `.` or `@` (for example
+`.incoming` or a NAS's `@eaDir`) are never scanned.
+
 ### Docker Compose and GHCR
 
 The included Compose deployment pulls `ghcr.io/artamrj/ununknown:latest`, runs the application as a

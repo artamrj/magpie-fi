@@ -1,9 +1,8 @@
 version: 2
 
 updates:
-  # Rust application dependencies from Cargo.toml/Cargo.lock.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directory: "/core"
     schedule:
       interval: "monthly"
       time: "04:00"
@@ -14,9 +13,8 @@ updates:
         patterns:
           - "*"
 
-  # Frontend dependencies from frontend/package.json and package-lock.json.
   - package-ecosystem: "npm"
-    directory: "/frontend"
+    directory: "/core/frontend"
     schedule:
       interval: "monthly"
       time: "04:10"
@@ -26,14 +24,29 @@ updates:
       frontend-dependencies:
         patterns:
           - "*"
-    # typescript-eslint 8 requires TypeScript <6.1. Keep compatible TypeScript
-    # updates without opening a broken TypeScript 7 pull request.
+    # typescript-eslint 8 requires TypeScript <6.1.
     ignore:
       - dependency-name: "typescript"
         update-types:
           - "version-update:semver-major"
 
-  # Actions referenced by workflow files in .github/workflows.
+  # yt-dlp breaks when YouTube changes, so the bot is checked weekly.
+  - package-ecosystem: "uv"
+    directory: "/bot"
+    schedule:
+      interval: "weekly"
+      time: "04:15"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 3
+    groups:
+      youtube:
+        patterns:
+          - "yt-dlp*"
+          - "ytmusicapi"
+      python-dependencies:
+        patterns:
+          - "*"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -46,9 +59,10 @@ updates:
         patterns:
           - "*"
 
-  # Base images referenced by the root Dockerfile.
   - package-ecosystem: "docker"
-    directory: "/"
+    directories:
+      - "/core"
+      - "/bot"
     schedule:
       interval: "monthly"
       time: "04:30"
