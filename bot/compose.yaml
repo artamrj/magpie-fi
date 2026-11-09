@@ -1,0 +1,19 @@
+services:
+  sync-me-maybe:
+    image: ghcr.io/artamrj/sync-me-maybe:latest
+    container_name: sync-me-maybe
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-10}
+      MUSIC_DIR: /music
+      DOWNLOAD_TMP_DIR: /tmp/sync-me-maybe
+      DATA_DIR: /data
+      YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-}
+    volumes:
+      - ${MUSIC_DIR_HOST:-./music}:/music
+      - ${DOWNLOAD_TMP_DIR_HOST:-./tmp/sync-me-maybe}:/tmp/sync-me-maybe
+      - ${DATA_DIR_HOST:-./data}:/data
+      - ${YTDLP_COOKIES_FILE_HOST:-./cookies.txt}:/config/cookies.txt:ro
