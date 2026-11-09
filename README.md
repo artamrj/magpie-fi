@@ -4,7 +4,9 @@ Your own music service. Send a song link or an audio file to a Telegram bot. It 
 downloaded, identified, tagged and filed, and shows up in [Navidrome](https://www.navidrome.org)
 on every device. No subscription.
 
-The full plan is in [BLUEPRINT.md](BLUEPRINT.md). This repo joins two earlier projects (with their history):
+The full plan is in [BLUEPRINT.md](BLUEPRINT.md). The goal is **one Rust program in one Docker image**,
+with Navidrome running next to it. Today the repo is at **Phase 0 (bridge)**: the two earlier projects,
+imported with their history, glued together:
 
 | Folder | Was | Job |
 |---|---|---|
@@ -76,7 +78,7 @@ DATA_ROOT/
 
 ## Known gaps in Phase 0
 
-These are fixed in Phase 1 and 2 (see [BLUEPRINT.md §8](BLUEPRINT.md#8-roadmap)).
+These go away in Phases 1–3 (see [BLUEPRINT.md §8](BLUEPRINT.md#8-roadmap)), when the bridge is replaced by the one magpie program.
 
 - The bot says "Completed" when the download finishes. The song reaches Navidrome a few
   minutes later, or waits in review if the core is unsure.
@@ -106,5 +108,5 @@ CI runs only for the part that changed (`.github/workflows/core.yml`, `bot.yml`)
 ## Releases
 
 Push a tag like `v0.1.0`. GitHub Actions builds `ghcr.io/artamrj/magpie-fi-core` and
-`ghcr.io/artamrj/magpie-fi-bot` for amd64 and arm64. Set `MAGPIE_TAG=0.1.0` in `.env` to pin it.
+`ghcr.io/artamrj/magpie-fi-bot` for amd64 and arm64 (from Phase 1 on: one image, `ghcr.io/artamrj/magpie-fi`). Set `MAGPIE_TAG=0.1.0` in `.env` to pin it.
 New GHCR packages are private: make them public in the package settings, or run `docker login ghcr.io` on the server.

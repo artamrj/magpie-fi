@@ -5,12 +5,15 @@
 > One self-hosted system that replaces Spotify / Apple Music for you and your people:
 > **send anything to Telegram → it lands in Navidrome, correctly tagged, within a minute.**
 
-This document merges two existing projects into one plan:
+This document merges two existing projects into **one program, one image**:
 
 | Project | Repo | Language | Size | Role in the merge |
 |---|---|---|---|---|
-| **sync-me-maybe** v0.13.0 | `../sync-me-maybe` | Python 3.11, python-telegram-bot 22 | ~8k lines + 3.7k tests | **Gateway & Acquirer** — talks to you on Telegram and *gets* the audio |
-| **ununknown** v0.6.0 | `../ununknown` | Rust (axum 0.8, sqlx, lofty) + React 19 | ~21k Rust + 6k TS | **Librarian** — *makes the audio right* and owns the library |
+| **ununknown** v0.6.0 | `../ununknown` | Rust (axum 0.8, sqlx, lofty) + React 19 | ~21k Rust + 6k TS | **The foundation.** magpie-fi grows out of this code |
+| **sync-me-maybe** v0.13.0 | `../sync-me-maybe` | Python 3.11, python-telegram-bot 22 | ~8k lines + 3.7k tests | **The donor.** Its Telegram experience and "get the song" logic are rewritten in Rust, then the Python code is deleted |
+
+**In one sentence:** magpie-fi is one Rust program in one Docker image. Navidrome runs next to it,
+and one `docker compose up` starts both (§4).
 
 Contents
 
@@ -23,7 +26,7 @@ Contents
 6. [Modern things to use (Navidrome, Telegram, tooling)](#6-modern-things-to-use)
 7. [Repository layout of this folder](#7-repository-layout-of-this-folder)
 8. [Roadmap](#8-roadmap)
-9. [Decisions you still need to make](#9-decisions-you-still-need-to-make)
+9. [Decisions](#9-decisions)
 
 ---
 
@@ -160,18 +163,18 @@ Weak points:
 
 ### 2.1 Duplicated work (same job, done twice)
 
-| Area | sync-me-maybe | ununknown | Keep in the merge |
+| Area | sync-me-maybe | ununknown | In magpie-fi |
 |---|---|---|---|
-| Metadata lookup | `music/metadata.py` (Deezer) | `providers/deezer.rs` + 19 more | **ununknown** cascade |
-| Link → metadata | `music/providers/*` (Spotify, Apple, Shazam, YouTube) | `/api/source/resolve` (Shazam, Spotify, YouTube, Genius, RJ, Navahang, Audiomack) | Bot keeps link **expansion** (playlists); single-track identity goes through the core |
-| Scoring | `music/matching.py` | `smart_approval.rs`, `scan/score.rs` | **ununknown** for identity; bot keeps its YT Music *download-source* matcher |
-| Tag writing | `music/tagging.py` (mutagen) | `media/tag_writer.rs` (lofty) | **ununknown** — one tag writer only |
-| Cover art | Deezer URL, embed | verified worker | **ununknown** |
-| Duplicate detection | `library/index.py` | `input_dedup.rs` + caches | **ununknown** becomes the one library index; bot *asks* it |
-| Folder walking / indexing | `LibraryIndex.scan()` | `scan::run` | **ununknown** |
-| File naming / moving | `library/storage.py` | `apply.rs::destination` + `publish_no_clobber` | **ununknown**'s safe publish, with the **new layout** (§5) |
-| SQLite + queue + retry | `database.py`, `queueing/` | `db/`, workflow state | Each service keeps its own DB; core owns library state |
-| Docker entrypoint (PUID/PGID drop) | `docker-entrypoint.sh` | `scripts/docker-entrypoint.sh` | ununknown's hardened version, shared |
+| Metadata lookup | `music/metadata.py` (Deezer) | `providers/deezer.rs` + 19 more | ununknown's 20-source cascade |
+| Link → metadata | `music/providers/*` (Spotify, Apple, Shazam, YouTube) | `/api/source/resolve` (Shazam, Spotify, YouTube, Genius, RJ, Navahang, Audiomack) | One link reader in `acquire/` (ported bot scrapers + ununknown's resolvers) |
+| Scoring | `music/matching.py` | `smart_approval.rs`, `scan/score.rs` | One scorer: ununknown's, plus the bot's version penalties |
+| Tag writing | `music/tagging.py` (mutagen) | `media/tag_writer.rs` (lofty) | ununknown's (lofty) |
+| Cover art | Deezer URL, embed | verified worker | ununknown's verified worker |
+| Duplicate detection | `library/index.py` | `input_dedup.rs` + caches | One permanent library index |
+| Folder walking / indexing | `LibraryIndex.scan()` | `scan::run` | ununknown's |
+| File naming / moving | `library/storage.py` | `apply.rs::destination` + `publish_no_clobber` | ununknown's safe publish, with the **new layout** (§5) |
+| SQLite + queue + retry | `database.py`, `queueing/` | `db/`, workflow state | One database, one job queue |
+| Docker entrypoint (PUID/PGID drop) | `docker-entrypoint.sh` | `scripts/docker-entrypoint.sh` | One image, ununknown's hardened style |
 
 ### 2.2 Conflicts (they would break each other if you just ran both)
 
@@ -185,10 +188,11 @@ Weak points:
 
 The bot's biggest gap — *"Telegram uploads are not transcoded or metadata-normalized"* — is
 exactly ununknown's entire purpose. And ununknown's biggest gap — *"it can't get new music and
-can't be used from a phone"* — is exactly what the bot does. So the split is:
+can't be used from a phone"* — is exactly what the bot does. So they belong together:
 
-> **The bot gets audio and talks to people. The core decides what the audio is and files it.**
-> Nothing but the core ever writes into the library.
+> **Getting the song and talking to people** (the bot's strength) and **deciding what the song is
+> and filing it** (ununknown's strength) become two modules of **one program**.
+> Only the library module ever writes into the library.
 
 ---
 
@@ -221,7 +225,7 @@ with no subscription.
 
 ### Non-goals (to keep it small and stable)
 
-- Not a Navidrome fork. Navidrome stays a stock container; we talk to it through its APIs.
+- Not a Navidrome fork. Navidrome stays its own official container next to magpie; we talk to it through its API.
 - Not a public multi-tenant service. One household, a handful of guests.
 - No DRM circumvention. Spotify/Apple links are used as *search input*, like today.
 - Not a Lidarr replacement for "monitor every album an artist ever releases" (can integrate later).
@@ -232,133 +236,162 @@ with no subscription.
 - **Never destroy.** Atomic no-clobber writes; originals go to a trash with retention, not `rm`.
 - **Never wrong silently.** Low confidence → ask the human; never guess into the library.
 - **Survives restarts.** Every queue and every button persisted.
+- **One of everything.** One image, one database, one config, one queue. No job is done twice.
 - **Boring to run.** One `compose.yaml`, health checks, automatic updates, backups.
 
 ---
 
 ## 4. Architecture
 
+> **Decision (2026-11-10):** magpie-fi is **one program, in one language (Rust), shipped as one
+> Docker image.** The Python bot is ported into it and then deleted. Navidrome runs next to it as
+> its own official image, in the same `compose.yaml`, so one `docker compose up` starts everything.
+
 ### 4.1 Principles
 
-1. **Single writer.** Only `core` writes into `library/`. Everyone else writes into `inbox/`.
-2. **Inbox → Library pipeline.** Every input (link download, Telegram upload, folder drop) becomes a
-   file in `inbox/` plus an optional **hint** (what we already know). One pipeline handles all.
-3. **Hints, not decisions.** When the bot downloads from a Spotify link it *knows* the ISRC,
-   title, artists, duration and playlist position. It passes that as a hint. The core treats a
-   hint as strong evidence (fast path, no human needed) but still verifies duration/fingerprint.
-4. **Telegram is the remote control; Navidrome is the player; the web UI is the workbench.**
-5. **Stock Navidrome.** Read-only mount, configured by env, talked to via Subsonic/OpenSubsonic
-   API (and plugins only where they clearly help, see §6).
-6. **Each service owns its data.** `core.db` = library truth; `bot.db` = Telegram conversations.
+1. **One of everything.** One program, one image, one database, one config (`MAGPIE_*`), one job
+   queue, one tag writer, one duplicate index, one link reader, one scorer. Every job is done in
+   exactly one place.
+2. **Single writer.** Only the `library` module writes into `library/`.
+3. **One pipeline for every input.** A link, a Telegram upload, a file dropped in `inbox/` and a
+   link pasted in the web page all become the same thing — an **item** — and go through the same
+   stages (§4.3).
+4. **What you asked for is evidence.** A Spotify link already tells us the ISRC, title, artists and
+   duration. That "wanted" information becomes a first-class candidate during identification, so
+   most link downloads are filed without questions — but still checked against duration and fingerprint.
+5. **Ask, don't guess.** If magpie isn't sure, the item waits for a human. Nothing is filed silently wrong.
+6. **Telegram is the remote control, Navidrome is the player, the web page is the workbench**
+   (and the same page opens inside Telegram as a Mini App).
+7. **Stock Navidrome.** Read-only music mount, talked to only through its API.
+8. **Outside tools are bundled programs, not a second language.** ffmpeg, fpcalc, songrec, rsgain,
+   yt-dlp and Deno ship inside the image and are called like ununknown already calls ffmpeg.
 
 ### 4.2 The picture
 
 ```text
-                ┌───────────────────────── Telegram ─────────────────────────┐
-                │  chats, links, audio uploads, inline buttons, Mini App      │
-                └───────────────┬──────────────────────────────▲──────────────┘
-                                │ updates                      │ status edits / review prompts
-                       ┌────────▼──────────────────────────────┴────────┐
-                       │  bot  (Python — from sync-me-maybe)             │
-                       │  • Telegram UX, auth, guests                    │
-                       │  • link classify + playlist/album expansion     │
-                       │  • YT Music source matching + yt-dlp download   │
-                       │  • Telegram file download (via local Bot API)   │
-                       └───────┬──────────────────────────▲──────────────┘
-           writes audio +      │ POST /api/ingest          │ SSE /api/events
-           hint.json to inbox/ │ GET  /api/library/lookup  │ (progress, needs_review, filed)
-                       ┌───────▼──────────────────────────┴──────────────┐
-                       │  core  (Rust — from ununknown)                   │
-                       │  • inbox watcher + ingest jobs                   │
-                       │  • integrity → fingerprint → dedup → identify    │
-                       │  • smart approval / review queue                 │
-                       │  • tags, cover, lyrics (LRCLIB), ReplayGain      │
-                       │  • file into library/ (layout §5), playlists     │
-                       │  • Navidrome scan + song lookup                  │
-                       │  • serves web UI = Telegram Mini App             │
-                       └───────┬─────────────────────────────────────────┘
-                               │ only writer
-         ┌─────────────────────▼───────────────────────┐   Subsonic API
-         │  /srv/music/library   (read-only for ND)    │◄──────────────┐
-         └─────────────────────┬───────────────────────┘               │
-                               │                               ┌───────┴──────┐
-                               └──────────────────────────────►│  navidrome   │──► phone / desktop
-                                                               └──────────────┘    clients
+                 Telegram  (links · uploads · buttons · Mini App)
+                                │          ▲
+╔═══════════════════════════════╪══════════╪═════════════════════════════╗
+║  magpie  — one Rust program   ▼          │ status + review prompts     ║
+║                                                                        ║
+║   telegram ─────►  jobs: one queue  ◄───── http: web page, Mini App,   ║
+║                  (requests · items)        API, live updates, login    ║
+║                          │                                             ║
+║          ┌───────────────┼──────────────────┐                          ║
+║          ▼               ▼                  ▼                          ║
+║      acquire  ──────► identify  ──────►  library  ──────► navidrome    ║
+║      links,           fingerprint,       tags, cover,     client:      ║
+║      playlists,       dedup, 20          lyrics, gain,    scan, find,  ║
+║      YT Music,        sources,           §5 layout,       share        ║
+║      yt-dlp           scoring, review    trash                         ║
+║                                                                        ║
+║   bundled tools: ffmpeg · fpcalc · songrec · rsgain · yt-dlp · deno    ║
+╚════════════════════════════════════════════╪═══════════════════╪═══════╝
+                                    only writer│        Subsonic API│
+                                               ▼                    ▼
+                                    MUSIC_ROOT/library ──read-only──► navidrome ──► your apps
 ```
 
-### 4.3 Flows
+### 4.3 The pipeline
 
-**A. Link (single track)**
-1. Bot classifies the link, gets title/artists/duration/ISRC from the provider (as today).
-2. Bot asks core `GET /api/library/lookup?isrc=…&artist=…&title=…` → already owned? reply "already in library" + play link. Done.
-3. Bot matches the best YouTube Music source (its existing matcher) and downloads with yt-dlp
-   to `inbox/links/<job-id>.opus` + `inbox/links/<job-id>.hint.json`.
-4. Bot calls `POST /api/ingest {path, hint, requested_by, reply_to}` and listens on SSE.
-5. Core: integrity → fingerprint → dedup against library → identify **with the hint as a
-   first-class candidate** → completion + cover + lyrics + ReplayGain → file into `library/` →
-   Navidrome scan → `filed` event with the Navidrome song ID.
-6. Bot edits the status message: ✅ + "▶ Play" (Navidrome share link) / path.
+Every item goes through these stages. Each stage is a durable job in the database.
 
-**B. Playlist / album link** — bot expands to N track jobs (as today) and sends a
-`playlist` hint (`{name, source_url, position}`); core writes `library/Playlists/<name>.m3u8`
-with the *final* library paths after each track is filed.
+| # | Stage | What happens | Skipped for |
+|---|---|---|---|
+| 1 | **Expand** | A playlist/album link becomes N *wanted* tracks, plus a playlist record (name, order, source) | single tracks, uploads, drops |
+| 2 | **Already have it?** | Library index lookup by ISRC, source ID (YouTube video ID…) and normalised artist + title. Hit → reply "already in your library ▶ Play" | uploads, drops (checked by fingerprint in stage 4) |
+| 3 | **Get** | Pick the best YouTube Music source and download with yt-dlp, or download the Telegram file, into `.magpie/staging/` | drops (already on disk) |
+| 4 | **Identify** | Decode check → fingerprint → duplicate check against the library (proof only) → candidates from *wanted* + the 20 sources → smart scoring | — |
+| 5 | **Decide** | Sure → stage 6. Not sure → **review**: Telegram prompt with 3 candidate buttons + "Open review", and the web review list | — |
+| 6 | **File** | Tags, verified cover, lyrics, ReplayGain (track + album) → atomic no-clobber move into `library/` (§5) → original to `.magpie/trash/` → update playlists | — |
+| 7 | **Publish** | Debounced Navidrome scan → find the song's Navidrome ID → share link → "✅ In your library ▶ Play" to whoever asked | — |
 
-**C. Telegram upload** — bot downloads the file (local Bot API server, up to 2 GB) into
-`inbox/telegram/` with a hint containing only the original filename and the Telegram
-`performer`/`title` fields. Core runs the full identification cascade (this fixes the
-"raw uploads" gap).
+How each input enters:
 
-**D. Folder drop** — anything copied into `inbox/drop/` (SMB/AirDrop/Syncthing) is picked
-up by the core watcher; no bot involved. Result summary can be pushed to the owner on Telegram.
-
-**E. Needs review** — core emits `needs_review {track_id, top_candidates[3], reason}`. Bot
-sends one compact message: cover + "Is it one of these?" + 3 buttons + "Open review" (Mini App)
-+ "Keep as-is". Answer → `POST /api/tracks/{id}/choose` → filed.
-
-### 4.4 Why keep two languages (and not rewrite)
-
-| Option | Cost | Verdict |
+| Input | Enters at | Requester |
 |---|---|---|
-| **Python bot + Rust core** (recommended) | Two toolchains, one HTTP contract | Uses both codebases almost as-is. yt-dlp, ytmusicapi and python-telegram-bot are Python-native; the identification engine, fingerprints and tag writing are already excellent in Rust. |
-| All Rust (teloxide + yt-dlp subprocess) | Rewrite ~8k lines of bot + no Rust ytmusicapi | Possible later; not worth it first. |
-| All Python | Rewrite ~21k lines of hard-won Rust logic | No. |
+| Link sent to the bot | 1 (or 2 for a single track) | that Telegram user |
+| Audio file sent to the bot | 3 (Telegram download) | that Telegram user |
+| File copied into `inbox/` (SMB, Syncthing…) | 4, once the file has stopped growing | owner (summary on Telegram) |
+| Link pasted in the web page | 1 / 2 | the logged-in web user |
+| "Follow playlist" check (Phase 5) | 1, only for new songs | the follower |
 
-The rule that keeps polyglot cheap: **one clear boundary** (HTTP + SSE, JSON schema shared in
-`contracts/`), no shared database, each side tested on its own.
+### 4.4 Why one Rust program — and how the Python-only parts are replaced
 
-### 4.5 The contract (first version)
+Rust, because ununknown is the larger and more careful half (21k lines: fingerprints, scoring,
+safe file moves), a single Rust binary uses little memory on a NAS or Pi, and the compiler protects
+a program whose job is moving your files. The bot is the smaller half and is mostly Telegram
+screens and link scrapers — the easy part to port.
 
-```http
-POST /api/ingest
-{ "path": "inbox/links/8f3c.opus",
-  "origin": "link|upload|drop",
-  "requested_by": {"telegram_user_id": 123, "role": "owner|guest"},
-  "hint": {
-    "source_url": "https://open.spotify.com/track/…",
-    "title": "…", "artists": ["…"], "album": "…", "duration_s": 213.4,
-    "isrc": "USUM71703861", "deezer_id": 123, "youtube_video_id": "…",
-    "playlist": {"name": "Owner - Road Trip", "source_url": "…", "position": 7}
-  } }
-→ 202 { "job_id": "…" }
-
-GET  /api/library/lookup?isrc=&youtube_video_id=&artist=&title=   → { "found": true, "path": "…", "navidrome_id": "…" }
-GET  /api/events  (Server-Sent Events)
-     job.progress | job.needs_review | job.filed | job.duplicate | job.failed
-POST /api/tracks/{id}/choose      (already exists in ununknown)
-```
-
-Auth between bot and core: a shared secret header on the internal Docker network.
-Auth for humans in the web UI: Telegram Mini App `initData` validation (see §6), so the
-review UI is safe to reach from your phone without opening a port to the internet.
-
-### 4.6 Data ownership
-
-| Store | Owner | Contains |
+| Needed | In the Python bot | In magpie |
 |---|---|---|
-| `data/core/core.sqlite` | core | library index (path, fingerprint, ISRC, MBIDs, Navidrome ID), ingest jobs, candidates, review queue, caches, playlists |
-| `data/bot/bot.sqlite` | bot | Telegram requests, status messages, callback buttons, guests, playlist subscriptions |
-| `music/library/` | core | the music, read-only for everyone else |
-| `navidrome/data/` | navidrome | users, play counts, stars, ratings — **back this up**, it's your listening history |
+| Downloading from YouTube | `yt-dlp` Python library | The official standalone **`yt-dlp` program** inside the image, run as a tool. magpie checks for a new yt-dlp every night and keeps it in `DATA_ROOT/bin`, so YouTube fixes arrive without waiting for a new magpie image. |
+| YouTube Music search | `ytmusicapi` | yt-dlp's own YouTube Music search (`music.youtube.com/search?q=…#songs`) returns songs with duration; magpie's matcher scores them. *(Check the exact output in Phase 2.)* |
+| Telegram | `python-telegram-bot` | **`frankenstein`** crate (0.52.1, Sept 2026; follows the Bot API closely) + a small router of our own. magpie already has its own queue and state, so a big bot framework adds nothing. (`teloxide` was considered: last release July 2025, behind the Bot API.) |
+| Tags | `mutagen` | `lofty` (already used) |
+| Spotify / Apple page reading | `requests` + BeautifulSoup | `reqwest` + `scraper` + `serde_json` |
+
+**Cost:** about 5,500 Python lines get ported (≈3,300 Telegram + messages, ≈2,200 links, playlists,
+matching, download). About 2,400 lines are simply deleted because the Rust side already does that
+job better (tagging, storage, duplicate index, metadata, queue, config).
+
+### 4.5 Requests, jobs, items — how state works
+
+| Thing | What it is | Example |
+|---|---|---|
+| **request** | One thing one person asked, once | "this Spotify playlist", sent by Arta at 21:03 |
+| **item** | One song on its way: staging path, *wanted* info, fingerprint, candidates, decision, final path | track 7 of that playlist |
+| **job** | One durable unit of work for an item or request: kind, state, attempts, `not_before` | `acquire` item 7, attempt 2 |
+
+- **Retries** with back-off 30 s → 2 min → 10 min (from the bot). Permanent errors are not retried.
+- **Limits per resource** (from ununknown): downloads 2, fingerprints 3, lookups 3, tag writes 2,
+  SongRec 2, MusicBrainz 1 request/s, plus a polite pause between YouTube downloads.
+- **One event bus.** Every state change becomes an event. Two listeners render it: the Telegram
+  status message (edited at most every 2.5 s, final state immediately — from the bot) and the web
+  page (live updates).
+- **Survives restarts.** Jobs continue where they stopped; Telegram buttons keep working for 30 days.
+
+### 4.6 Web page, Mini App and login
+
+- One axum server. The React page is compiled **into** the binary, so everything comes from one
+  origin — which Telegram's Mini App rules (Bot API 10.2) require.
+- **Login is Telegram, everywhere.** In the Mini App, magpie checks Telegram's signed `initData`.
+  On a computer, send `/web` to the bot and it replies with a one-time login link. No passwords;
+  the same owner/guest roles as in the bot.
+- Published on `127.0.0.1` / your Tailscale network by default. A public HTTPS address
+  (Tailscale Funnel or Cloudflare Tunnel) is only needed for the Mini App.
+
+### 4.7 Data and config
+
+| Where | What |
+|---|---|
+| `DATA_ROOT/magpie.sqlite` | **the one database**: library index, requests, items, jobs, candidates, review queue, playlists, follows, Telegram buttons, guests, provider cache |
+| `DATA_ROOT/bin/` | auto-updated `yt-dlp` |
+| `MUSIC_ROOT/library/` | your music (only magpie writes, Navidrome reads) |
+| `MUSIC_ROOT/inbox/` | your drop zone |
+| `MUSIC_ROOT/.magpie/` | `staging/` (work in progress) and `trash/` (originals, kept 30 days) |
+| `DATA_ROOT/navidrome/` | Navidrome's database: play counts, stars — **back this up** |
+
+**Config = environment only** (`.env`, all keys start with `MAGPIE_`). Nothing is configured in
+the database, so there is one place to look. The web page *shows* the configuration and which
+sources are active, but doesn't edit secrets.
+
+### 4.8 What is inside the image
+
+`ghcr.io/artamrj/magpie-fi` — linux/amd64 + linux/arm64, Debian slim base (yt-dlp and Deno need
+glibc; ffmpeg and Chromaprint come from Debian packages):
+
+- `magpie` — the program, with the web page built in
+- `ffmpeg`/`ffprobe`, `fpcalc` (Chromaprint), `songrec`, `rsgain`, `yt-dlp`, `deno`
+- `tini`; starts as root only to drop to `PUID:PGID`; read-only root filesystem
+
+`compose.yaml` = **magpie + navidrome**. Optional helpers, off by default, each its own official image:
+
+| Profile | Image | Turn on when |
+|---|---|---|
+| `tgapi` | `aiogram/telegram-bot-api` | you send files bigger than 20 MB (FLAC) — raises the limit to 2 GB |
+| `pot` | `bgutil-ytdlp-pot-provider` | YouTube starts refusing downloads without a PO token |
+| `slskd` | `slskd/slskd` | you want lossless from Soulseek (⚖️ your legal risk) |
 
 ---
 
@@ -371,14 +404,14 @@ getting lost — while the tags are what Navidrome shows. Make both clean and co
 ### 5.1 Top-level layout (one disk / one dataset)
 
 ```text
-/srv/music/                         ← one filesystem: moves & hard links are atomic
+/srv/music/                         ← MUSIC_ROOT. One filesystem: moves are atomic
 ├── library/                        ← Navidrome MusicFolder (mounted :ro into Navidrome)
 │   ├── Radiohead/
 │   │   ├── artist.jpg
 │   │   ├── OK Computer (1997)/
 │   │   │   ├── cover.jpg
-│   │   │   ├── 01 - Airplane.flac
-│   │   │   ├── 01 - Airplane.lrc
+│   │   │   ├── 01 - Airbag.flac
+│   │   │   ├── 01 - Airbag.lrc
 │   │   │   └── 02 - Paranoid Android.flac
 │   │   └── Creep (1992) [Single]/
 │   │       ├── cover.jpg
@@ -390,22 +423,21 @@ getting lost — while the tags are what Navidrome shows. Make both clean and co
 │   │       └── 01 - Dick Dale & His Del-Tones - Misirlou.m4a
 │   └── Playlists/
 │       └── Arta - Road Trip.m3u8        ← relative paths, auto-imported by Navidrome
-├── inbox/                          ← everything new lands here; only core reads/clears it
-│   ├── links/                      ← bot downloads (+ .hint.json)
-│   ├── telegram/                   ← Telegram uploads
-│   └── drop/                       ← SMB/Syncthing share for manual dumps
-├── review/                         ← (optional) files core couldn't identify after N days
-└── .trash/                         ← processed originals & replaced files, purged after 30 days
+├── inbox/                          ← YOUR drop zone (SMB, Syncthing, AirDrop…). magpie empties it
+└── .magpie/                        ← magpie's own work area (hidden; Navidrome never sees it)
+    ├── staging/                    ← downloads and Telegram uploads being identified, or waiting in review
+    └── trash/                      ← originals and replaced files, deleted after 30 days
 ```
 
 Why this way:
-- `library/` read-only for Navidrome = Navidrome can never damage files.
-- `inbox/`, `library/` and `.trash/` on **the same filesystem** — ununknown publishes with
-  hard links and the bot moves with `rename`; both are atomic only inside one filesystem.
-- Playlists live *inside* the music folder because Navidrome's `PlaylistsPath` is relative to
-  the music folder.
+- `library/` is read-only for Navidrome, so Navidrome can never damage files.
+- `inbox/` is only for you. Downloads and uploads go straight to `.magpie/staging/`, so your drop zone
+  never fills with half-finished files.
+- `library/`, `inbox/` and `.magpie/` sit on **the same filesystem**, so every move is one atomic rename.
+- Nothing is deleted right away: originals go to `.magpie/trash/` first.
+- Playlists live *inside* the music folder because Navidrome's `PlaylistsPath` is relative to it.
 
-### 5.2 Naming rules (the "core" writes exactly this)
+### 5.2 Naming rules (magpie writes exactly this)
 
 ```text
 {AlbumArtist}/{Album} ({OriginalYear})[ [Single]|[EP]]/{Disc-}{Track:02} - {Title}.{ext}
@@ -432,7 +464,7 @@ Rules:
 - **Never re-encode lossy → lossy.** Keep YouTube's original Opus/AAC stream; keep FLAC as FLAC.
   Let Navidrome transcode on the fly for mobile data.
 
-### 5.3 Tags the core writes (Navidrome-first)
+### 5.3 Tags magpie writes (Navidrome-first)
 
 | Tag | Notes |
 |---|---|
@@ -458,10 +490,10 @@ ununknown already writes MBIDs whenever AcoustID/MusicBrainz identified the trac
 
 Three Navidrome rules to respect:
 - Write **ID3v2.4** (not 2.3) for MP3s so multi-value tags survive.
-- **Never retag and move in the same scan.** The core files a track in one atomic step
+- **Never retag and move in the same scan.** magpie files a track in one atomic step
   (tags are written *before* it enters `library/`), so this is satisfied automatically.
 - The file watcher (`Scanner.WatcherWait`, on by default) usually does **not** fire on SMB/NFS mounts.
-  If the library lives on a NAS share, the core's explicit `startScan` call stays necessary.
+  If the library lives on a NAS share, magpie's explicit `startScan` call stays necessary.
 
 ---
 
@@ -475,15 +507,15 @@ under your current code and needs action.
 | What's new | Since | How this project uses it |
 |---|---|---|
 | ⚠️ **All IDs re-encoded** to 128-bit base62 | 0.64.0 | Never store Navidrome IDs as permanent truth. Store the library path; look the ID up again (`search3`) when you need it. Back up `navidrome/data` before upgrading. |
-| ⚠️ **Built-in Spotify agent removed** | 0.61 | Artist images come from Deezer/Last.fm, or from the official Apple Music plugin. Put `artist.jpg` in artist folders (core can fetch it). |
+| ⚠️ **Built-in Spotify agent removed** | 0.61 | Artist images come from Deezer/Last.fm, or from the official Apple Music plugin. magpie puts `artist.jpg` in artist folders. |
 | New scanner: multi-value artists, roles, persistent IDs (MBID-first), file watcher, resumable scans | 0.55 | Folder/tag rules in §5. |
 | **Multi-library** with per-user permissions | 0.58 | Optional: a separate library per person (e.g. guests' requests), or a "Persian" library. |
 | Missing-files management + `navidrome missing fix` (moves plays/stars to the new file) | 0.56 / 0.64 | Used once, when the old library is re-filed into the new layout (Roadmap phase 1). |
-| **WASM plugins** (Go/Rust/Python/TS; metadata, scrobbler, lyrics, scheduler, task queue, KV, Subsonic API access) | 0.57 → rewritten 0.60 | Later: a small Rust plugin (`nd-pdk`) for "request this from inside Navidrome" or "send to Telegram". Heavy work stays in core. |
+| **WASM plugins** (Go/Rust/Python/TS; metadata, scrobbler, lyrics, scheduler, task queue, KV, Subsonic API access) | 0.57 → rewritten 0.60 | Later: a small Rust plugin (`nd-pdk`) for "request this from inside Navidrome" or "send to Telegram". Heavy work stays in magpie. |
 | Selective scan `navidrome scan --target` | 0.59 | Not needed — Subsonic `startScan` + watcher are enough. |
-| Search rebuilt on SQLite FTS5 | 0.61 | Core's `library/lookup` can ask Navidrome `search3` to confirm a song is visible. |
+| Search rebuilt on SQLite FTS5 | 0.61 | After filing, magpie asks Navidrome `search3` for the song's ID to send a play link. |
 | Server-side transcoding decisions (OpenSubsonic `transcoding`) + concurrency limits | 0.61 / 0.62 | Store originals (Opus/AAC/FLAC); let Navidrome transcode for mobile data. |
-| **Sonic similarity** via plugins (e.g. AudioMuse-AI) | 0.62 | Phase 4: "radio"/Instant Mix that sounds right, Spotify-style. |
+| **Sonic similarity** via plugins (e.g. AudioMuse-AI) | 0.62 | Phase 5: "radio"/Instant Mix that sounds right, Spotify-style. |
 | **Structured lyrics**: TTML, ELRC (word-by-word), SRT, LRC sidecars, OpenSubsonic `songLyrics` v2 | 0.63 | Write `.lrc`, and `.elrc` when word timing exists. |
 | `EnableSharing` on by default; shares owner-scoped | 0.63 / 0.64 | The bot replies with a Navidrome **share link** so guests can play without an account. |
 | Experimental **Jellyfin Music API** (Finamp, Jellify) | 0.64 | Optional: more client choice. |
@@ -494,7 +526,7 @@ under your current code and needs action.
 ```toml
 MusicFolder = "/music"            # = /srv/music/library, mounted :ro
 DataFolder  = "/data"
-Scanner.Schedule     = "@every 6h" # safety net; core triggers scans after every filing
+Scanner.Schedule     = "@every 6h" # safety net; magpie triggers scans after every filing
 Scanner.WatcherWait  = "5s"
 Scanner.PurgeMissing = "never"     # keep stats if a file moves; clean with `navidrome missing fix`
 AutoImportPlaylists  = true
@@ -523,11 +555,11 @@ EnableInsightsCollector = false    # your choice; anonymous telemetry, on by def
 
 | Feature | API | Use it for |
 |---|---|---|
-| ⚠️ **Self-hosted Bot API server** (`tdlib/telegram-bot-api`, image `aiogram/telegram-bot-api`) | — | Cloud bots can only **download files ≤ 20 MB** and upload ≤ 50 MB. Local server: unlimited download, 2 GB upload, and `getFile` returns a **local path** — the bot just moves the file into `inbox/telegram/`. Fixes FLAC uploads. Needs `api_id`/`api_hash` from my.telegram.org. |
+| ⚠️ **Self-hosted Bot API server** (`tdlib/telegram-bot-api`, image `aiogram/telegram-bot-api`) | — | Cloud bots can only **download files ≤ 20 MB** and upload ≤ 50 MB. Local server: unlimited download, 2 GB upload, and `getFile` returns a **local path** — magpie just moves the file into `.magpie/staging/`. Fixes FLAC uploads. Needs `api_id`/`api_hash` from my.telegram.org. |
 | **Topics in private chats** | 9.3 / 9.4 | The bot creates topics in your DM: *Requests*, *Review*, *New in library*, *Errors*. No more one long mixed chat. |
 | **Reactions** | 7.0 | React 👀 → 👍 / 🤷 on the user's message as a lightweight ack (replaces the sticker trick). |
-| **Mini Apps**: fullscreen, home-screen shortcut, Secondary button, DeviceStorage/SecureStorage, `downloadFile` | 8.0 / 9.0 | The review workbench on your phone (§6.4). |
-| ⚠️ **Mini App same-origin hardening** | 10.2 (enforced 2026-07-20) | Serve the whole Mini App from **one HTTPS origin** (the core). No cross-origin iframes or redirects. |
+| **Mini Apps**: fullscreen, home-screen shortcut, Secondary button, DeviceStorage/SecureStorage, `downloadFile` | 8.0 / 9.0 | The review workbench on your phone (§4.6, Phase 4). |
+| ⚠️ **Mini App same-origin hardening** | 10.2 (enforced 2026-07-20) | Serve the whole Mini App from **one HTTPS origin** (magpie). No cross-origin iframes or redirects. |
 | `sendMessageDraft` / rich-message drafts (streamed text) | 9.3 / 9.5 / 10.1 | Optional: live "Downloading 43%…" without many edits. Plain edits throttled to every 2.5 s (what you do now) are fine. |
 | **Rich messages** (`sendRichMessage`, audio/table/list blocks) | 10.1–10.3 | Album / playlist result cards with a track table. |
 | **Disabled inline buttons**, ephemeral callback replies | 10.3 / 10.4 | Grey out "Rerun failed" while it runs. Show "Not authorized" only to the person who pressed. |
@@ -536,24 +568,21 @@ EnableInsightsCollector = false    # your choice; anonymous telemetry, on by def
 | **Profile music** — `getUserProfileAudios` | 9.4 | Fun extra: "/import_profile" pulls songs from a user's Telegram profile playlist into the library. |
 | Deep links `t.me/<bot>?startapp=review_<id>` | — | Notifications open the Mini App directly on the right track. |
 
-**Library choice.** **python-telegram-bot 22.8** (June 2026) supports up to Bot API **10.0**, and the
-10.1+ work (rich messages, widgets) hasn't landed yet. **aiogram 3.31** (Aug 2026) tracks the API
-within days (10.3). Recommendation: **stay on PTB for now.** Your queue, persistence and handler
-code are built on it. Call 10.1+ methods through `Bot.do_api_request()` when you want them.
-Move to aiogram only if you start leaning heavily on rich messages or widgets.
-
-**Python.** Move the bot from 3.11 → **3.14** (3.13 is now security-only; 3.15 is too new for
-some libraries).
+**Library choice (Rust).** **`frankenstein` 0.52.1** (Sept 2026) is a thin, typed Bot API client
+that follows new Telegram versions closely. magpie adds its own small router on top, because it
+already has its own queue, state and persistence. `teloxide` 0.17 (last release July 2025) is
+behind the Bot API and brings a framework we don't need. For comparison, in Python
+python-telegram-bot 22.8 stops at Bot API 10.0 and aiogram 3.31 at 10.3.
 
 ### 6.3 Getting audio (acquisition)
 
 | Item | State in Nov 2026 | Action |
 |---|---|---|
-| **yt-dlp 2026.10.26** | YouTube needs a JS runtime (Deno ✓ you have it) **and increasingly PO tokens** (SABR streaming) | Add the **`bgutil-ytdlp-pot-provider` 2.0.2** sidecar (compose profile) + plugin. Pin yt-dlp + `yt-dlp-ejs` and let Renovate auto-merge updates fast — YouTube breaks things every few weeks. |
+| **yt-dlp 2026.10.26** | YouTube needs a JS runtime (Deno ✓ you have it) **and increasingly PO tokens** (SABR streaming) | Bundle the standalone `yt-dlp` program + Deno in the image, and let magpie **update yt-dlp itself every night** (into `DATA_ROOT/bin`) — YouTube breaks things every few weeks. Optional `pot` profile: **`bgutil-ytdlp-pot-provider` 2.0.2** when PO tokens become necessary. |
 | Formats | 251 = Opus ~130–160 kbps (best free), 140 = AAC 128, 141/774 = Premium only (cookies) | Keep stream copy (you do). Never re-encode lossy→lossy. |
-| **ytmusicapi 1.12.3** | Works, unofficial | Keep `filter="songs"` matching. |
-| ⚠️ **Spotify Web API** | Since Feb/Mar 2026 Dev Mode: app owner **must have Premium**, max 5 users, search limit 10, **playlist items only for playlists you own/collaborate on**, batch endpoints removed | The bot's tokenless public-page scraping is now the *only* way to read other people's playlists. Keep it, and add tests that alert when it breaks. In core, make the Spotify provider optional; prefer Deezer/MusicBrainz by ISRC. |
-| iTunes Search/Lookup | ~20 req/min/IP, no key | Cache aggressively (core already has `provider_cache`). |
+| ytmusicapi 1.12.3 | Works, unofficial, Python | **Not needed:** yt-dlp's YouTube Music search (`#songs`) gives the same song results; magpie scores them. |
+| ⚠️ **Spotify Web API** | Since Feb/Mar 2026 Dev Mode: app owner **must have Premium**, max 5 users, search limit 10, **playlist items only for playlists you own/collaborate on**, batch endpoints removed | Public-page reading (ported from the bot into `acquire/`) is now the *only* way to read other people's playlists. Add canary tests that warn when it breaks. The Spotify API provider stays optional; prefer Deezer/MusicBrainz by ISRC. |
+| iTunes Search/Lookup | ~20 req/min/IP, no key | Cache aggressively (`provider_cache`, from ununknown). |
 | Deezer public API | No key, rate-limited | Primary ISRC → metadata bridge. |
 | **slskd 0.26** (Soulseek) | Active, REST API | *Optional* lossless source (compose profile). Verify with fingerprint + duration + a check for fake FLACs (lossy files re-encoded as FLAC). ⚖️ This is file sharing, so the legal risk is yours. |
 | Tidal/Qobuz rippers (streamrip, OrpheusDL, Octo-Fiesta) | Exist | ⚖️ Break those services' terms; accounts get banned. Not in scope. |
@@ -563,191 +592,211 @@ some libraries).
 
 | Item | Version | Note |
 |---|---|---|
-| Chromaprint / fpcalc | 1.6.x (FFmpeg 8 support) | ✓ already in the ununknown image |
+| Chromaprint / fpcalc | 1.6.x (FFmpeg 8 support) | ✓ bundled in the image |
 | AcoustID | 3 req/s, **non-commercial only** | fine for personal use |
-| MusicBrainz API | 1 req/s, descriptive User-Agent mandatory | ✓ already rate-limited in core |
+| MusicBrainz API | 1 req/s, descriptive User-Agent mandatory | ✓ already rate-limited (from ununknown) |
 | SongRec (Shazam) | 0.8.1 | unofficial endpoint — fallback only (as now) |
-| **LRCLIB** | `/api/get` (duration ±2 s), new `hasWordSync`, 90 req/min with a User-Agent | move lyrics from bot → core; send a real User-Agent |
-| **rsgain 3.8** | ReplayGain 2.0, `rsgain easy` per album folder | Add **album gain**. Core currently measures track gain only. Run `rsgain easy` on the album folder after filing. Writes R128 tags for Opus correctly. |
+| **LRCLIB** | `/api/get` (duration ±2 s), new `hasWordSync`, 90 req/min with a User-Agent | lyrics in the `library` module; send a real User-Agent |
+| **rsgain 3.8** | ReplayGain 2.0, `rsgain easy` per album folder | Add **album gain**. ununknown measured track gain only. Run `rsgain easy` on the album folder after filing. Writes R128 tags for Opus correctly. |
 | FFmpeg | 9.0.x (8.1 still maintained) | either |
 | **lofty 0.25.5** | Rust tags | Bump from 0.24 (pre-1.0, minor API breaks) |
-| mutagen 1.48.1 | Python tags | will no longer be needed in the bot once core owns tagging |
 | MusicBrainz Picard **3.0.4** | Qt6, new plugin system | manual fallback for weird albums |
 | beets 2.14.1 | CLI tagger | reference only; album-centric matcher doesn't fit "one song at a time" |
-| AudioMuse-AI 3.7 | sonic analysis + Navidrome plugin | Phase 4 "radio" |
+| AudioMuse-AI 3.7 | sonic analysis + Navidrome plugin | Phase 5 "radio" |
 
 ### 6.5 Code & platform stack
 
 | Layer | Choice | Why |
 |---|---|---|
-| Core | **Rust 2024, axum 0.8, sqlx 0.9, tokio, lofty 0.25** | what ununknown already runs |
-| Bot | **Python 3.14 + uv**, python-telegram-bot 22.8, `httpx` (replace `requests`) | async HTTP everywhere; one less thread hop |
-| Web / Mini App | **React 19 + Vite 8** (already) + **TanStack Router/Query** + **Tailwind v4 + shadcn/ui** + **`@tma.js/sdk`** (3.3; 4.0 in RC) | one SPA, two modes: desktop workbench and Telegram Mini App |
-| Mini App auth | Validate `initData` HMAC (key = HMAC_SHA256("WebAppData", bot_token)) in core; send it as `Authorization: tma <initData>` | no passwords. Telegram user ID → owner/guest role |
-| Contract | `contracts/openapi.yaml` → generated TS types for web, a pydantic client for bot | the two languages can't drift apart |
-| DB | SQLite per service, WAL, `synchronous=NORMAL`, `busy_timeout`, single writer, **on SSD not on the NAS share** | proven at this scale; Navidrome itself had locking bugs on slow storage until 0.64.2 |
-| Jobs | Keep your own SQLite job tables (both projects already have them) | Huey/SAQ/Procrastinate/Temporal add infra for nothing here |
-| Logs | JSON logs (`structlog` / `tracing` JSON) with a shared `job_id` across bot ↔ core | follow one song end-to-end |
-| Containers | Compose v2+ syntax `compose.yaml`, healthchecks + `depends_on: service_healthy`, **profiles** for optional sidecars, read-only FS + `cap_drop` (ununknown style) for all services | |
-| Images | multi-arch amd64/arm64, GHCR, Trivy (ununknown's release workflow, reused for both) | |
-| Updates | **Renovate** (Docker + Cargo + uv + npm in one place), auto-merge yt-dlp / yt-dlp-ejs / bgutil when tests pass | |
-| Remote access | **Tailscale** for players (Navidrome over your tailnet). **Tailscale Funnel or Cloudflare Tunnel** only for the Mini App HTTPS origin. ⚠️ Don't stream audio through Cloudflare (their terms) | |
-| Backups | **restic + Backrest** UI. `sqlite3 .backup` before snapshot (or Litestream). Back up: both DBs, `navidrome/data`, `config/`, and the library | |
+| Program | **Rust 2024, tokio, axum 0.8, sqlx 0.9, lofty 0.25, reqwest, frankenstein** | ununknown's stack, plus a Telegram client |
+| Web / Mini App | **React 19 + Vite 8** (already) + **TanStack Router/Query** + **Tailwind v4 + shadcn/ui** + **`@tma.js/sdk`** (3.3; 4.0 in RC), built **into** the binary | one page, two modes: desktop workbench and Telegram Mini App |
+| Login | Telegram `initData` check (key = HMAC_SHA256("WebAppData", bot_token)) in the Mini App; one-time `/web` link on a computer | no passwords; owner/guest roles from the bot |
+| API types | Rust types → generated TypeScript types for `web/` | the page and the program can't drift apart |
+| Database | **One SQLite file**, WAL, `synchronous=NORMAL`, `busy_timeout`, one writer task, **on SSD, not on the NAS share** | proven at this scale; Navidrome itself had locking bugs on slow storage until 0.64.2 |
+| Jobs | Own SQLite job tables (§4.5) | Huey/SAQ/Temporal would add infrastructure for nothing |
+| Logs | JSON logs (`tracing`) with an `item_id` on every line | follow one song through every stage |
+| Image | **One image**, Debian slim, multi-arch amd64/arm64, GHCR, Trivy scan (ununknown's release workflow) | |
+| Compose | `compose.yaml` = magpie + navidrome, health checks, read-only root FS, `cap_drop`, **profiles** for optional helpers | |
+| Updates | **Renovate** (Docker + Cargo + npm); yt-dlp updates itself nightly | |
+| Remote access | **Tailscale** for players (Navidrome over your tailnet). **Tailscale Funnel or Cloudflare Tunnel** only for the Mini App HTTPS address. ⚠️ Don't stream audio through Cloudflare (their terms) | |
+| Backups | **restic + Backrest** UI. `sqlite3 .backup` before each snapshot. Back up: `magpie.sqlite`, `navidrome/` data, `.env`, `config/`, and the library | |
 | Hardware | Intel N100/N150 mini-PC (fingerprinting + rsgain on big backlogs) or Pi 5 8 GB + NVMe | |
 
 ---
 
 ## 7. Repository layout of this folder
 
-A **monorepo**. Both old repos are imported **with their git history**. Use
-`git filter-repo --to-subdirectory-filter core` on a clone of ununknown and `… bot` on a clone of
-sync-me-maybe, then merge them into this repo with `--allow-unrelated-histories`.
+One Rust crate at the root. The old `core/` and `bot/` folders disappear: ununknown's code moves
+to the root with `git mv` (its history stays: `git log --follow`), and the bot's ideas are
+rewritten into Rust modules. The bot's history remains in git as the record of where they came from.
 
 ```text
-magpie-fi/                       ← today this folder is still called navidrome-arta
-├── BLUEPRINT.md                 ← this file
-├── README.md                    ← "how to run it" (short)
-├── compose.yaml                 ← navidrome + core + bot + tgapi  (profiles: pot, slskd, backup)
-├── .env.example
-├── renovate.json
-├── config/
-│   └── navidrome.toml
-├── contracts/
-│   ├── openapi.yaml             ← core HTTP API: source of truth
-│   └── hint.schema.json         ← what bot may tell core about a file
-│
-├── core/                        ← Rust, from ununknown (librarian)
-│   ├── Cargo.toml  Dockerfile  migrations/
-│   └── src/
-│       ├── domain/              (matcher, credits, genre, audio — unchanged)
-│       ├── application/
-│       │   ├── scan/ smart_approval.rs metadata_completion.rs artwork.rs apply.rs   (existing)
-│       │   ├── ingest/          NEW  inbox watcher, ingest jobs, hint → candidate
-│       │   ├── library/         NEW  layout (§5), library index, playlists, lyrics, album gain
-│       │   └── events.rs        NEW  SSE event bus
-│       ├── infrastructure/
-│       │   ├── providers/       (existing 20 providers + lrclib.rs NEW)
-│       │   ├── media/           (existing + rsgain.rs NEW)
-│       │   └── navidrome.rs     NEW  Subsonic client: startScan, search3, createShare
-│       └── http/
-│           ├── handlers/ingest.rs library.rs events.rs   NEW
-│           └── auth.rs          NEW  service token + Telegram initData
-│
-├── web/                         ← React, from ununknown/frontend (workbench + Mini App)
-│   └── src/ app/ api/(generated) routes/ telegram/
-│
-├── bot/                         ← Python, from sync-me-maybe (gateway + acquirer)
-│   ├── pyproject.toml  Dockerfile
-│   └── src/magpie_bot/
-│       ├── telegram/            (handlers, commands, callbacks, uploads, requests, safe_api, persistence)
-│       ├── ui/                  (messages, keyboards)
-│       ├── acquire/             (urls, providers/, matching.py, downloader.py)
-│       ├── queueing/            (unchanged)
-│       └── core_client.py       NEW  ingest, lookup, SSE listener
-│
-├── navidrome-plugin/            ← later (Rust nd-pdk)
-├── scripts/
-│   ├── migrate-library.sh       ← dry-run → apply re-filing of the old library
-│   └── backup.sh
-├── docs/
-│   └── adr/                     ← one short file per big decision (0001-single-writer.md, …)
-└── .github/workflows/           ← core.yml, bot.yml, web.yml (path-filtered), release.yml
+magpie-fi/                       ← this folder is still called navidrome-arta on disk
+├── BLUEPRINT.md  README.md  CHANGELOG.md
+├── Cargo.toml  Cargo.lock       crate "magpie-fi", binary "magpie"
+├── Dockerfile                   the one image
+├── compose.yaml                 magpie + navidrome  (profiles: tgapi, pot, slskd)
+├── .env.example                 every setting, all MAGPIE_*
+├── config/navidrome.toml
+├── migrations/                  one database schema
+├── src/
+│   ├── main.rs  config.rs  error.rs
+│   ├── db/                      connection, single writer, queries
+│   ├── jobs/                    requests, items, jobs, workers, limits, retries, event bus
+│   ├── telegram/                client, router, commands, uploads, status messages,
+│   │                            buttons, guests, review prompts, /web login, the rhyme
+│   ├── acquire/                 link reading, providers/ (spotify, apple, shazam, youtube,
+│   │                            deezer), playlist expansion, source matcher, download
+│   ├── identify/                integrity, fingerprint, dedup, providers/ (the 20 sources),
+│   │                            scoring, completion, artwork
+│   ├── library/                 index, layout (§5), tags, publish, trash, lyrics,
+│   │                            ReplayGain, playlists, re-file tool
+│   ├── navidrome/               Subsonic client: scan, search, share
+│   ├── http/                    routes, Telegram login, live updates, built-in web page
+│   └── tools/                   ffmpeg, fpcalc, songrec, rsgain, yt-dlp runners + yt-dlp updater
+├── web/                         React (from ununknown/frontend): workbench + Mini App
+├── tests/                       end-to-end tests with small audio fixtures (from both projects)
+└── .github/workflows/           ci.yml · release.yml (one image) · security.yml
 ```
 
-**What moves where**
+### 7.1 Where every part of the old projects goes
 
-| From sync-me-maybe | Fate |
-|---|---|
-| `telegram_bot/*`, `ui/*`, `queueing/*`, `auth.py`, `config.py` | **keep** → `bot/` |
-| `music/urls.py`, `music/providers/*`, `music/matching.py`, `music/downloader.py` | **keep** → `bot/acquire/` |
-| `music/metadata.py` (Deezer), `music/enrichment.py` | shrink: canonical metadata comes from core `/api/source/resolve` |
-| `music/tagging.py`, `music/lyrics.py`, `music/filenames.py` | **delete** → core does it |
-| `library/index.py`, `library/storage.py`, `library/playlists.py`, `library/navidrome.py` | **delete** → core `application/library/` + `infrastructure/navidrome.rs` |
+**From sync-me-maybe (Python, ~8,000 lines)**
 
-| From ununknown | Fate |
+| Old file(s) | Lines | Fate |
+|---|---|---|
+| `telegram_bot/handlers.py` | 1,179 | **Port** → `telegram/` (message routing). Its download/tag/store logic is **not** ported: the pipeline (§4.3) does that now |
+| `telegram_bot/uploads.py`, `requests.py`, `callbacks.py`, `commands.py`, `runtime.py`, `safe_api.py`, `app.py` | 1,756 | **Port** → `telegram/` (upload batching, status lifecycle, buttons, commands, retry on Telegram errors) |
+| `ui/messages.py` | 369 | **Port** → `telegram/` (texts, progress bar, keyboards) |
+| `music/urls.py`, `music/providers/*` (spotify, apple, shazam, youtube, public_scrape) | 1,630 | **Port** → `acquire/` (link reading and playlist/album expansion) |
+| `music/matching.py` | 337 | **Merge** into one scorer: its version-penalty rules (live, remix, sped up…) join ununknown's matcher |
+| `music/downloader.py` | 227 | **Port** → `tools/` + `acquire/` (yt-dlp runner, timeout, cancel) |
+| `music/lyrics.py`, `library/playlists.py`, `library/navidrome.py` | 264 | **Rewrite small** → `library/`, `navidrome/` |
+| `music/tagging.py`, `music/metadata.py`, `music/enrichment.py`, `library/storage.py`, `library/index.py`, `music/filenames.py` | 1,177 | **Delete** — ununknown already does it better |
+| `queueing/*`, `database.py`, `telegram_bot/persistence.py`, `config.py`, `auth.py`, `main.py`, facades | ~1,000 | **Delete** — replaced by the one queue, one database, one config |
+| `pyproject.toml`, `uv.lock`, Python Dockerfile, ruff/mypy setup | — | **Delete** |
+
+**From ununknown (Rust + React)**
+
+| Old part | Fate |
 |---|---|
-| Everything in `src/` | **keep** → `core/` |
-| "Rows deleted after write" | ⚠️ **change**: keep a permanent `library_items` table (path, fingerprint, ISRC, MBIDs, source, added_by). That table becomes the one duplicate index for everything. |
-| `destination()` → `<input subfolder>/Artist - Title` | **replace** with §5 layout |
-| Loopback-only, no auth | **replace** with service token + Telegram initData; still never exposed without HTTPS |
-| Settings in SQLite + env | keep, env wins (as now) |
+| `src/domain/*`, `application/scan`, `smart_approval`, `metadata_completion`, `artwork`, `input_dedup`, `infrastructure/providers/*`, `media/*` | **Keep** → `identify/`, `library/`, `tools/` |
+| `application/apply.rs` (`publish_no_clobber`) | **Keep** → `library/` with the §5 layout instead of `<input subfolder>/Artist - Title` |
+| `frontend/` | **Keep** → `web/` |
+| "Scan" clears the whole workspace; tracks deleted after writing | **Replace** with the permanent library index + items |
+| Setup screen with input/output folders | **Delete** — fixed paths (`inbox/` → `library/`) |
+| Settings and API keys stored in SQLite | **Delete** — environment only |
+| "Remove input after output" switch | **Replace** — originals always go to `.magpie/trash/` |
+| Loopback-only, no login | **Replace** with Telegram login (§4.6) |
+| `/api/identify`-style one-shot workflow and the frontend "activity" heartbeat | **Replace** with the always-on job queue |
+
+**Duplicates resolved**
+
+| Was done twice | Now done once, in |
+|---|---|
+| Reading Spotify / Apple / Shazam / YouTube links | `acquire/providers` |
+| Metadata lookup (Deezer vs 20 sources) | `identify/providers` |
+| Scoring (bot matcher vs smart approval) | one scorer in `identify/` |
+| Tag writing (mutagen vs lofty) | `library/` (lofty) |
+| Cover art (unverified vs verified) | `identify/artwork` (verified) |
+| Duplicate detection (text vs proof) | `library/index` + fingerprints |
+| File naming and moving | `library/` (§5, atomic, no-clobber) |
+| Queue, retries, persistence | `jobs/` |
+| Database, config, Docker entrypoint, CI, release | one each |
 
 ---
 
 ## 8. Roadmap
 
-Each phase is useful on its own. You can stop after any of them.
+Each phase ends with something that works. You can use magpie-fi after any of them.
+Every phase lists what it **deletes**, so the project gets smaller, not bigger.
 
-### Phase 0 — "Glue mode": works this weekend, almost no code ✅ built
-- Monorepo with both histories (`core/` = ununknown, `bot/` = sync-me-maybe), one `compose.yaml`
-  with **navidrome + bot + core**. Root CI per component, one release workflow publishing
-  `magpie-fi-core` and `magpie-fi-bot` images.
-- Bot `MUSIC_DIR` = `MUSIC_ROOT/inbox` (the inbox **root**: ununknown keeps the input's subfolders,
-  so `inbox/links/…` would have become `library/links/…`). Bot temp folder = `inbox/.incoming`, so
-  finished files appear with one atomic rename.
-- Core input = `inbox`, output = `library`, automatic filing every 2 min, "remove input after output"
-  on. Two small core changes made this possible: the env overrides `UNUNKNOWN_DELETE_SOURCE_AFTER_WRITE`,
-  `UNUNKNOWN_AUTOMATIC_SCAN_ENABLED`, `UNUNKNOWN_AUTOMATIC_SCAN_INTERVAL_MINUTES`, and skipping
-  `.hidden` / `@nas` folders while scanning.
-- Navidrome 0.64.2 reads `library/` read-only, config in `config/navidrome.toml`.
-- ✅ Done when a Spotify link sent to the bot appears in Navidrome after the next automatic cycle.
-- Known gaps (listed in README): bot says "done" before filing; naming is `Album Artist/Album/Artist - Title`;
-  uploads land in the library root; bot `.m3u8` playlists stay in the inbox; lyrics off; bot forgets songs
-  once they leave the inbox; 20 MB Telegram download limit.
+### Phase 0 — Bridge ✅ built · ⏳ not yet tested end to end
+The old bot and old ununknown glued together through `inbox/` (three containers), so you can
+listen while the real thing is built. Details are in the README.
+- Phase 0 is temporary. Test it only if you want to use it during the rebuild.
+- ⛔ Deleted in Phase 3: `bot/`, the bot container, the `magpie-fi-bot` image.
 
-### Phase 1 — Core becomes the librarian
-- Permanent `library_items` table. Library layout from §5. Album folders, `cover.jpg`, `artist.jpg`.
-- Move lyrics (LRCLIB), `.m3u8` playlists and the Navidrome client into core. Add rsgain album gain.
-- `POST /api/ingest`, `GET /api/library/lookup`, `GET /api/events` (SSE). Hint → first-class candidate.
-- `scripts/migrate-library.sh`: plan (dry-run report) → apply re-filing of your existing library →
-  `navidrome missing fix` to keep play counts/stars.
-- ✅ Done when the same song arriving from a link, an upload and a folder drop ends up as **one**
-  file at the §5 path, and Navidrome shows it with cover, lyrics and gain.
+### Phase 1 — One home
+Turn ununknown into the magpie program and give it a real library.
+- Move `core/` to the root (`git mv`), crate `magpie-fi`, binary `magpie`, all settings `MAGPIE_*`
+  from the environment, `frontend/` → `web/`, module folders from §7.
+- **Library:** permanent index, §5 layout and tags, `.magpie/staging` and `.magpie/trash`,
+  `cover.jpg` + `artist.jpg`, lyrics (LRCLIB, `.lrc`/`.elrc`), track + album ReplayGain (rsgain),
+  `.m3u8` playlists.
+- **Inbox watcher:** files dropped into `inbox/` are filed automatically. Uncertain ones wait in review.
+- **Navidrome client:** scan after filing, find the song, share link.
+- **Re-file tool:** dry-run report → move your existing library into the §5 layout →
+  `navidrome missing fix` keeps play counts and stars.
+- **One image:** new Dockerfile (Debian slim + all tools), CI builds `ghcr.io/artamrj/magpie-fi`.
+- During Phase 1 the old Python bot keeps running and drops its downloads into `inbox/`.
+- ⛔ Deletes: input/output setup screen, settings-in-database, workspace reset, "remove input" switch,
+  the `core` image name.
+- ✅ Done when an old messy folder dropped into `inbox/` ends up as clean album folders with cover,
+  lyrics and gain, and Navidrome shows them.
 
-### Phase 2 — Bot becomes the thin gateway
-- Delete bot tagging/storage/index. Bot calls `lookup` before downloading and `ingest` after.
-- Status message follows core events: …Downloading → Identifying → **In library ▶ Play** (share link).
-- `needs_review` → compact prompt with 3 candidate buttons (coloured, 9.4) + "Open review".
-- Run the **local Bot API server** (2 GB files). Use DM topics for Requests / Review / Library news.
-- Python 3.14, `httpx`, Renovate.
-- ✅ Done when a 300 MB FLAC album forwarded in Telegram ends up correctly filed, and a doubtful
-  song gets resolved with one tap.
+### Phase 2 — Getting music, in Rust
+Port the bot's "get it" half, and make it usable from the web page first (easy to test without Telegram).
+- The one job queue: requests → items → jobs, retries, limits, event bus, live updates in the web page.
+- `acquire/`: link reading for Spotify, Apple Music, Shazam, YouTube, Deezer; playlist/album expansion
+  (Spotify public-page reading, since the Spotify API no longer shows other people's playlists);
+  YouTube Music source matching with the merged scorer; yt-dlp download.
+- *Wanted* info becomes a candidate. "Already have it?" check before downloading.
+- yt-dlp bundled + nightly self-update.
+- Web page: **"Paste a link"** box with live progress.
+- ⛔ Deletes from `bot/` nothing yet (the Python bot still serves Telegram).
+- ✅ Done when pasting a Spotify playlist link in the web page gives a Navidrome playlist in the same
+  order, every song stored once — and pasting it again downloads nothing.
 
-### Phase 3 — The workbench in your pocket
-- The React app runs as a **Telegram Mini App** (`@tma.js/sdk`, theme variables, Main/Secondary buttons,
-  fullscreen) on one HTTPS origin via Tailscale Funnel or Cloudflare Tunnel. initData auth in core.
-- Review queue, manual edit, artwork fix and "recently added" all on your phone. The desktop browser keeps working.
-- ✅ Done when you can clear the whole review queue from your phone without opening a laptop.
+### Phase 3 — Telegram in Rust → one image
+Port the bot's "talk to people" half. After this phase, magpie-fi is one image.
+- `telegram/` with `frankenstein`: commands, links, uploads (with batching), the status message
+  (Preparing → Downloading → Identifying → In your library ▶ Play), Stop / Rerun failed / details
+  buttons kept for 30 days, guest invites, `/web` login link, the magpie rhyme.
+- Review in Telegram: one compact message with 3 coloured candidate buttons + "Open review".
+- Reactions as quick acks; DM topics (Requests · Review · New in library) as an option.
+- Optional `tgapi` profile for files up to 2 GB.
+- ⛔ Deletes: **`bot/` completely**, the Phase 0 bridge, the `magpie-fi-bot` image, Python from CI.
+- ✅ Done when everything the old bot did works from the one image, and `bot/` is gone.
 
-### Phase 4 — Better than a subscription
-- **Playlist subscriptions**: `/follow <playlist link>` re-checks daily and fetches new songs. The Navidrome
-  playlist is kept in the same order.
-- **Discovery**: Navidrome → ListenBrainz scrobbling. Weekly, fetch "Weekly Exploration" tracks you don't
-  own (the Explo idea, but through *your* pipeline) → Navidrome playlist "New for you" → Telegram note.
-- **Sonic radio**: AudioMuse-AI + Navidrome sonic-similarity plugin.
-- "📲 Send me the file" (`sendAudio`), `/import_profile` (Telegram profile music), guest share links.
-- Optional `slskd` profile for lossless with fake-FLAC detection.
-- Optional small **Navidrome plugin** (Rust) so you can request songs from inside your player.
+### Phase 4 — The workbench in your pocket
+- The web page opens inside Telegram as a **Mini App** (`@tma.js/sdk`, Telegram theme colours,
+  Main/Secondary buttons, fullscreen), on one HTTPS address via Tailscale Funnel or Cloudflare Tunnel.
+- Review, manual edit, cover fix, "recently added", queue — all on your phone.
+- ✅ Done when you can clear the whole review list from your phone.
 
-### Phase 5 — Boring operations (do alongside)
-- Healthchecks on every service, Backrest/restic nightly, Navidrome built-in backup, SQLite `.backup`.
-- Renovate fast lane for yt-dlp + EJS + PO-token provider. Scraper canary tests (Spotify/Apple public pages)
-  that alert you on Telegram when a provider breaks.
-- JSON logs with `job_id`. `/health` in Telegram shows all services.
+### Phase 5 — Better than a subscription
+- **Follow playlists:** `/follow <link>` checks daily and fetches new songs; the Navidrome playlist keeps the order.
+- **Discovery:** Navidrome → ListenBrainz scrobbling; weekly, fetch "Weekly Exploration" songs you
+  don't own → "New for you" playlist → Telegram note.
+- **Sonic radio:** AudioMuse-AI + Navidrome's sonic-similarity plugin.
+- "📲 Send me the file", `/import_profile` (Telegram profile music), guest share links.
+- Optional `slskd` profile for lossless, with fake-FLAC detection.
+- Optional small Navidrome plugin (Rust) to request songs from inside your player.
+
+### Alongside every phase — boring operations
+- Health checks, nightly backups (Backrest/restic, `sqlite3 .backup`), Navidrome's built-in backup.
+- Fast automatic updates for yt-dlp. Canary tests for Spotify/Apple page reading that warn you on
+  Telegram when a site changes.
+- JSON logs with an `item_id` you can follow through every stage. `/health` in Telegram.
 
 ---
 
-## 9. Decisions you still need to make
+## 9. Decisions
 
-| # | Question | My recommendation |
+| # | Question | Answer |
 |---|---|---|
-| 1 | Keep Python + Rust, or rewrite to one language? | **Keep both** with the HTTP contract (§4.4). Revisit only if maintaining two toolchains really hurts. |
-| 2 | python-telegram-bot or aiogram? | **Stay on PTB 22.x**; use raw `do_api_request` for 10.1+ features. |
-| 3 | Default format for YouTube downloads | **m4a (AAC)** if your household uses iPhones/CarPlay (best compatibility); **opus** otherwise (smaller, slightly better). Never mp3. |
-| 4 | Should guest requests go straight into the library? | Into the library, but **always through review** if confidence isn't high. Or ask the owner first (a setting). |
-| 5 | Re-file your existing library into the new layout? | **Yes, once**, with the dry-run report first and `navidrome missing fix` after. Keep a full backup first. |
-| 6 | Library on the NAS share or local disk? | Music can live on the NAS; **databases on local SSD**. Inbox, library and trash on the **same** filesystem. |
-| 7 | Remote access | Tailscale for listening; one HTTPS origin (Funnel/Tunnel) only for the Mini App. |
-| 8 | Lossless via Soulseek? | Optional profile, off by default. The legal risk is yours. |
-| 9 | Persian music naming | Tags in original script, `ARTISTSORT` in Latin; folders follow the album-artist tag (NFC). ununknown's "prefer Latin" canonical-name setting becomes a per-library option. |
-| 10 | Project name | ✅ **Decided: `magpie-fi`** (§0). Names inside the code: Rust crate `magpie-core`, Python package `magpie_bot`, env prefix `MAGPIE_`, images `ghcr.io/artamrj/magpie-fi-core` / `-bot` / `-web`. |
+| 1 | One language or two? | ✅ **Decided: one program in Rust, one image** (§4). Navidrome stays its own official image in the same `compose.yaml`. |
+| 2 | Telegram library | ✅ **Recommended: `frankenstein`** (thin, up to date) + own router. Recheck its Bot API version when Phase 3 starts. |
+| 3 | Base image | **Debian slim** (yt-dlp and Deno need glibc). ununknown's Alpine image is replaced. |
+| 4 | Where settings live | **Environment only** (`MAGPIE_*`). The web page shows them, doesn't edit them. |
+| 5 | Login on a computer | **`/web` command → one-time login link.** No passwords. |
+| 6 | Default format for YouTube downloads | **m4a (AAC)** if your household uses iPhones/CarPlay; **opus** otherwise. Never mp3. |
+| 7 | Guest requests | Filed like yours, but **always through review** unless confidence is high. Option: owner approves first. |
+| 8 | Re-file your existing library | **Yes, once** (Phase 1), with the dry-run report first and a full backup. |
+| 9 | Library on the NAS share or local disk? | Music can live on the NAS; **`DATA_ROOT` on a local SSD**. `inbox/`, `library/` and `.magpie/` on the **same** filesystem. |
+| 10 | Remote access | Tailscale for listening; one HTTPS address (Funnel/Tunnel) only for the Mini App. |
+| 11 | Lossless via Soulseek? | Optional profile, off by default. The legal risk is yours. |
+| 12 | Persian music naming | Tags in the original script, `ARTISTSORT` in Latin; folders follow the album-artist tag (NFC). |
+| 13 | Rarely useful sources (SoundCloud needs credentials, AudD is paid) | Keep them, **off unless a key is set** — as today. |
+| 14 | Project name | ✅ **Decided: `magpie-fi`** (§0). Crate `magpie-fi`, binary `magpie`, env prefix `MAGPIE_`, image `ghcr.io/artamrj/magpie-fi`. |
