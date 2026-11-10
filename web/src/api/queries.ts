@@ -26,6 +26,7 @@ export function useArtistsQuery() {
   return useQuery({
     queryKey: queryKeys.artists,
     queryFn: () => api<ArtistSummary[]>("/artists"),
+    refetchInterval: 30000,
   });
 }
 
@@ -41,16 +42,19 @@ export function useSetupQuery() {
   return useQuery({
     queryKey: queryKeys.setup,
     queryFn: () => api<Setup>("/setup"),
+    refetchInterval: 30000,
   });
 }
 
+/** The server's state. Songs arrive and get filed without the page's help, so it always polls:
+ *  fast while the server works, slowly while it waits. */
 export function useStatusQuery() {
   return useQuery({
     queryKey: queryKeys.status,
     queryFn: () => api<Workflow>("/status"),
     refetchInterval: (query) => {
       const phase = query.state.data?.phase;
-      return phase && busyPhases.has(phase) ? 900 : false;
+      return phase && busyPhases.has(phase) ? 900 : 4000;
     },
     refetchIntervalInBackground: true,
   });
@@ -60,7 +64,7 @@ export function useTracksQuery(busy: boolean) {
   return useQuery({
     queryKey: queryKeys.tracks,
     queryFn: () => api<Track[]>("/tracks"),
-    refetchInterval: busy ? 5400 : false,
+    refetchInterval: busy ? 3000 : 10000,
     refetchIntervalInBackground: true,
   });
 }

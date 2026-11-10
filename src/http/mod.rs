@@ -86,7 +86,17 @@ fn origin_is_trusted(origin: &str, request_host: Option<&str>) -> bool {
 }
 
 pub async fn security_headers(request: Request, next: Next) -> Response {
-    let is_api = request.uri().path().starts_with("/api/");
+    let path = request.uri().path();
+    let is_api = path.starts_with("/api/");
+    // Vite names built assets by content hash, so they never change; the page itself
+    // (index.html) must be checked on every open, or Telegram's web view keeps an old copy.
+    let cache_control = if is_api {
+        "no-store"
+    } else if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -112,9 +122,10 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
         header::HeaderName::from_static("cross-origin-resource-policy"),
         HeaderValue::from_static("same-origin"),
     );
-    if is_api {
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
     response
 }
 
@@ -189,5 +200,45 @@ mod tests {
 
         let rejected = app.oneshot(request("https://example.com")).await.unwrap();
         assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn the_page_is_always_rechecked_and_hashed_assets_are_kept() {
+        let app = Router::new()
+            .route("/api/test", put(|| async { StatusCode::NO_CONTENT }))
+            .route("/", axum::routing::get(|| async { "page" }))
+            .route(
+                "/assets/index-abc123.js",
+                axum::routing::get(|| async { "js" }),
+            )
+            .layer(middleware::from_fn(security_headers));
+        let cache = |app: Router, method: Method, uri: &'static str| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            cache(app.clone(), Method::PUT, "/api/test").await,
+            "no-store"
+        );
+        assert_eq!(cache(app.clone(), Method::GET, "/").await, "no-cache");
+        assert_eq!(
+            cache(app, Method::GET, "/assets/index-abc123.js").await,
+            "public, max-age=31536000, immutable"
+        );
     }
 }

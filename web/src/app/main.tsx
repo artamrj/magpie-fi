@@ -9,7 +9,9 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: false,
-      refetchOnWindowFocus: false,
+      // Coming back to the page (or to the Mini App) shows the newest state.
+      refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
     },
   },
 });
@@ -23,11 +25,17 @@ if (telegram) {
   };
   followTheme();
   telegram.onEvent("themeChanged", followTheme);
+  // Telegram keeps a Mini App alive in the background; reload everything when it comes back.
+  telegram.onEvent("activated", () => void queryClient.invalidateQueries());
 } else {
   // Older versions saved a theme choice; the page now follows the system.
   localStorage.removeItem("magpie-fi-theme");
   localStorage.removeItem("magpie-theme");
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void queryClient.invalidateQueries();
+});
 
 createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={queryClient}>

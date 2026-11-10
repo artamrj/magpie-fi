@@ -36,8 +36,8 @@ type TelegramWebApp = {
   setBackgroundColor?(color: string): void;
   setBottomBarColor?(color: string): void;
   isVersionAtLeast(version: string): boolean;
-  onEvent(event: "themeChanged" | "viewportChanged", handler: () => void): void;
-  offEvent(event: "themeChanged" | "viewportChanged", handler: () => void): void;
+  onEvent(event: "themeChanged" | "viewportChanged" | "activated", handler: () => void): void;
+  offEvent(event: "themeChanged" | "viewportChanged" | "activated", handler: () => void): void;
   showConfirm(message: string, callback: (confirmed: boolean) => void): void;
   MainButton: BottomButton;
   SecondaryButton?: BottomButton;
