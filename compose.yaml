@@ -6,7 +6,7 @@ services:
     image: ghcr.io/artamrj/magpie-fi:${MAGPIE_TAG:-latest}
     restart: unless-stopped
     ports:
-      - "{MAGPIE_PORT:-7331}:7331"
+      - "${MAGPIE_PORT:-7331}:7331"
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"

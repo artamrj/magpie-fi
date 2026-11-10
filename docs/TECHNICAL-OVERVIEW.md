@@ -214,8 +214,8 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 ## 7. Web page login (`src/http/auth.rs`)
 
-- Without Telegram there is no login (the page is published on loopback only, and
-  `MAGPIE_PUBLIC_URL` is refused).
+- Without Telegram there is no login: anyone who can reach the port can use the page, and
+  `MAGPIE_PUBLIC_URL` is refused.
 - With Telegram, `require_login` guards every `/api` route except `health`, `login` and `me`:
   - **Mini App**: `Authorization: tma <initData>`; the HMAC-SHA256 signature is checked with a key
     derived from the bot token, and the data may be at most 24 h old. `/api/me` also sets a session

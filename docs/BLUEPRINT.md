@@ -73,7 +73,7 @@ only for the song list, the audio comes from YouTube); not Lidarr (no "monitor e
 7. **Tools are bundled programs.** ffmpeg, fpcalc, SongRec, rsgain, yt-dlp and Deno ship in the
    image and are run with timeouts. A missing optional tool turns a feature off, it doesn't stop
    magpie-fi.
-8. **Boring to run.** Settings only in `.env`, loopback-only port, read-only container, survives
+8. **Boring to run.** Settings only in `.env`, one port, read-only container, survives
    restarts (queue, buttons and review state live in the database).
 
 ---
@@ -194,7 +194,7 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 - `ghcr.io/artamrj/magpie-fi`, linux/amd64 + linux/arm64, Debian trixie slim (yt-dlp and Deno
   need glibc). Contains `magpie-fi`, the web page, ffmpeg/ffprobe, fpcalc, `songrec-lib-cli`,
   rsgain, yt-dlp (zipapp, self-updating), Deno and tini.
-- `compose.yaml` has one service, `magpie-fi`: port `127.0.0.1:7331`, `MUSIC_ROOT` mounted whole at
+- `compose.yaml` has one service, `magpie-fi`: port `MAGPIE_PORT` (7331) on every host interface, `MUSIC_ROOT` mounted whole at
   `/music` (so moves are renames), `DATA_ROOT/magpie-fi` at `/data`, `config/ytdlp` read-only for an
   optional `cookies.txt`.
 - The entrypoint creates magpie-fi's folders, fixes their owner to `PUID:PGID` (never your existing
@@ -388,8 +388,10 @@ change it. Worker counts are fixed in `src/config.rs`.
 
 ## 7. Security model
 
-- The port is published on `127.0.0.1` only. Remote access is `ssh -L` or Tailscale Funnel.
-- Without Telegram there is no login, so a public address without Telegram is refused at start.
+- The port is published on every interface of the host, so other devices on your network can
+  open the page. Remote access is Tailscale Funnel or `ssh -L`.
+- Without Telegram there is no login: anyone who can reach the port can use the page. A public
+  address without Telegram is refused at start.
 - With Telegram, Telegram is the login: signed Mini App data, or a one-time `/web` link that
   starts a 30-day session. Owners only; guests use the bot.
 - Secrets live only in `.env`; login tokens are stored as hashes; the database is `0600`.
