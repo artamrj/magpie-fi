@@ -56,7 +56,9 @@ only for the song list, the audio comes from YouTube); not Lidarr (no "monitor e
    `.env`), one queue, one tag writer, one duplicate index. Every job is done in exactly one place.
 2. **Your files are sacred.** Nothing is overwritten (atomic, no-clobber publish). Originals go to
    a trash with retention, never straight to `rm`. Existing library files are indexed, not moved
-   or renamed. Only magpie-fi writes into `library/`.
+   or renamed. Their tags change only when you ask: a fix on the Artists page, or a field you
+   edit on the Files tab, written on a copy that replaces the song in one rename. Only magpie-fi
+   writes into `library/`.
 3. **Sure → file, unsure → ask.** A song is filed automatically only when the evidence is strong
    (audio recognition or several agreeing sources, matching length, matching version). Everything
    else waits for you. A wrong guess never goes silently into the library.
@@ -168,8 +170,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     (bot, sources, folders, log out).
   - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
     wide screen), a search over titles, artists, albums and paths, and one song's tags, cover,
-    sound and path with a player. Read-only for now; hidden folders (`.magpie-fi`, `@eaDir`)
-    and anything outside `library/` are never shown.
+    sound and path with a player. The tags (title, artist, album, album artist, track, disc,
+    year, genre, composer, label, ISRC) can be edited: only changed fields are written, a file
+    that changed since it was opened is not overwritten, and the toast's Undo writes the old
+    values back. Folders and files are never renamed there, so a new album name or year does
+    not move the song (Navidrome goes by the tags). Hidden folders (`.magpie-fi`, `@eaDir`) and
+    anything outside `library/` are never shown.
   A browser window wider than 1024 px shows a sidebar, the list and the song side by side
   (Enter uses the match, → goes to the next song). Telegram's panel is never that wide.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the

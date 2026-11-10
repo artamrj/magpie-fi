@@ -33,6 +33,38 @@ pub async fn sha256(path: &Path) -> Result<String> {
     .await?
 }
 
+/// Changes a library song on a hidden copy in the same folder, then swaps the
+/// copy in with one rename, so Navidrome or a player never sees a half-written
+/// file. `edit` returns whether it changed anything; without a change, or on an
+/// error, the copy is removed and the song is left as it was. Blocking.
+pub fn edit_on_copy(
+    song: &Path,
+    label: &str,
+    edit: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<bool> {
+    use anyhow::Context;
+    let name = song
+        .file_name()
+        .context("song has no name")?
+        .to_string_lossy();
+    let extension = song
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let copy = song.with_file_name(format!(".{name}.magpie-fi-{label}.{extension}"));
+    std::fs::copy(song, &copy)?;
+    let result = edit(&copy).and_then(|changed| {
+        if changed {
+            std::fs::rename(&copy, song)?;
+        }
+        Ok(changed)
+    });
+    if !matches!(result, Ok(true)) {
+        let _ = std::fs::remove_file(&copy);
+    }
+    result
+}
+
 /// `Song.mp3` → `Song (2).mp3`.
 pub fn numbered(path: &Path, number: usize) -> PathBuf {
     let stem = path

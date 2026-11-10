@@ -304,7 +304,7 @@ export function App() {
         ) : tab === "add" ? (
           <AddMusic wide feedback={feedback} onOpenTrack={openFromElsewhere} />
         ) : tab === "files" ? (
-          <Files wide onNav={setFilesNav} />
+          <Files wide feedback={feedback} onNav={setFilesNav} />
         ) : (
           <Library setup={setup} wide feedback={feedback} />
         )}
@@ -322,7 +322,7 @@ export function App() {
     ) : tab === "add" ? (
       <AddMusic wide={false} feedback={feedback} onOpenTrack={openFromElsewhere} />
     ) : tab === "files" ? (
-      <Files wide={false} onNav={setFilesNav} />
+      <Files wide={false} feedback={feedback} onNav={setFilesNav} />
     ) : (
       <Library setup={setup} wide={false} feedback={feedback} />
     );

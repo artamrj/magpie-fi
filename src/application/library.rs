@@ -641,7 +641,7 @@ pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
 }
 
 /// Builds an index entry from a file's tags and audio fingerprint.
-async fn describe_file(pool: &SqlitePool, path: &Path) -> Result<LibraryEntry> {
+pub async fn describe_file(pool: &SqlitePool, path: &Path) -> Result<LibraryEntry> {
     let owned = path.to_path_buf();
     let (info, ids) = tokio::task::spawn_blocking(move || {
         let info = audio::read(&owned)?;

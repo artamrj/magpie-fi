@@ -259,7 +259,7 @@ The best-quality file of each group (lossless first, then bitrate, then path) is
 online; the others become `duplicate/skipped` and are trashed when it is filed. Remixes, live
 versions and different lengths never group. The same grouping runs again when filing.
 
-**Files tab** (`src/application/file_browser.rs`, read-only). Every path the page sends is
+**Files tab** (`src/application/file_browser.rs`). Every path the page sends is
 relative to `library/` and goes through `file_browser::resolve`: absolute paths, `..`, hidden or
 NAS folders (`.`/`@`) and links that lead outside the library are refused (422). A folder
 listing reads the folder itself (so unindexed files show, named after the file) and takes
@@ -267,7 +267,22 @@ titles and song counts from `library_items`, so no tags are read to list a folde
 needs every word to appear in the title, artist, album, path or `title_key` (so `ي`/`ی` and
 accents do not matter for titles), returns at most 100 songs, and finds folders whose path holds
 every word and whose own name holds one. One song's details are read fresh from the file with
-`tag_writer::read_details`, exactly as written (nothing cleaned up).
+`tag_writer::read_details`, exactly as written (nothing cleaned up), with a `version` (size and
+modification time).
+
+Saving (`PUT /files/song`, `file_browser::edit_song`) takes the workflow slot, then:
+1. refuses the save with 409 when the file's version is not the one the page read;
+2. checks the typed text (one line, NFC, at most 500 characters; title and artist stay; numbers
+   1–999; a year of four digits; a 12-character ISRC) and keeps only fields that differ;
+3. writes them with `tag_writer::edit_fields` on a hidden copy in the same folder
+   (`files::edit_on_copy`, shared with the Artists page), reads the copy back, and renames it
+   over the song only when every field reads as written;
+4. describes the song again into `library_items`.
+A new artist or album artist rewrites ARTISTS / ALBUMARTISTS from the text (`A feat. B` gives
+two, `A & B` stays one) and drops that artist's sort name and MusicBrainz artist IDs; a new year
+also replaces a release date of another year; an empty field removes the tag. The answer holds
+the old values of the changed fields, and the page's Undo saves them again. WAV and AIFF are not
+edited, and no file or folder is renamed.
 
 ---
 
@@ -473,7 +488,8 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /artists/{id}` | Rename, join, split or confirm an artist (retags and moves its songs) |
 | `GET /files?path=` | One folder of `library/` ("" is the library): folders with counts, songs |
 | `GET /files/search?q=&in=` | Songs and folders matching every word, optionally inside one folder |
-| `GET /files/song?path=` | Every tag of one song, read from the file |
+| `GET /files/song?path=` | Every tag of one song, read from the file, with its `version` |
+| `PUT /files/song` | Write changed tags `{path, version, changes}`; returns `{changed, before, song}` |
 | `GET /files/artwork?path=` | The cover inside one song |
 | `GET /files/audio?path=` | Stream one song (range requests) |
 | `POST /requests` | Read a link and queue its songs |
@@ -498,7 +514,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | Cover worker | `src/application/artwork.rs` |
 | Filing | `src/application/apply.rs` |
 | Library layout, index, trash, playlists | `src/application/library.rs` |
-| Files tab (browse, search, song details) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |
+| Files tab (browse, search, song details, tag editing) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |
 | Getting music from links | `src/acquire/` |
 | Telegram bot | `src/telegram/` |
 | Tracks and candidates in the database | `src/infrastructure/db/` |

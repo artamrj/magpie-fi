@@ -1,8 +1,10 @@
-//! The Files tab: browse and search `library/`, and look at one song. Read-only.
+//! The Files tab: browse and search `library/`, look at one song, fix its tags.
 
 use super::tracks::{artwork_response, audio_mime, stream_audio};
 use super::*;
-use crate::application::file_browser::{self, BrowseError, Folder, SearchResult, SongDetails};
+use crate::application::file_browser::{
+    self, BrowseError, Folder, Saved, SearchResult, SongChanges, SongDetails,
+};
 use axum::{extract::Query, http::HeaderMap};
 
 #[derive(Deserialize)]
@@ -25,6 +27,8 @@ impl From<BrowseError> for ApiError {
         match error {
             BrowseError::Outside => ApiError::validation(error.to_string()),
             BrowseError::NotFound => ApiError::not_found(error.to_string()),
+            BrowseError::Invalid(message) => ApiError::validation(message),
+            BrowseError::Changed => ApiError::conflict(error.to_string()),
             BrowseError::Other(error) => ApiError::Internal(error),
         }
     }
@@ -60,6 +64,40 @@ pub async fn song_details(
     Query(query): Query<PathQuery>,
 ) -> ApiResult<Json<SongDetails>> {
     Ok(Json(file_browser::song(&library(&s), &query.path).await?))
+}
+
+#[derive(Deserialize)]
+pub struct SongEdit {
+    path: String,
+    /// The `version` the page read; a file changed since then is not overwritten.
+    version: String,
+    changes: SongChanges,
+}
+
+/// `PUT /api/files/song` — writes the changed fields into the file. Runs in the
+/// workflow slot, so no scan or filing touches the library meanwhile.
+pub async fn save_song(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<SongEdit>,
+) -> ApiResult<Json<Saved>> {
+    if !s
+        .try_claim_workflow(WorkflowPhase::Apply, "Saving a song's tags")
+        .await
+    {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+    let result = file_browser::edit_song(
+        &s.pool,
+        &library(&s),
+        &body.path,
+        &body.version,
+        &body.changes,
+    )
+    .await;
+    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+    Ok(Json(result?))
 }
 
 /// `GET /api/files/artwork?path=` — the cover inside the song.

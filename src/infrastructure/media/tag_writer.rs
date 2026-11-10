@@ -294,8 +294,18 @@ pub fn read_details(path: &Path) -> Result<SongTags> {
     };
     details.title = text(ItemKey::TrackTitle);
     details.artist = text(ItemKey::TrackArtist);
-    details.artists = tag
-        .get_strings(ItemKey::TrackArtists)
+    // MP4 keeps all ARTISTS values in one atom, of which the generic tag shows the first.
+    let artists: Vec<String> = match file.file_type() {
+        lofty::file::FileType::Mp4 => read_ilst(path)?
+            .map(|ilst| mp4_values(&ilst, ItemKey::TrackArtists))
+            .unwrap_or_default(),
+        _ => tag
+            .get_strings(ItemKey::TrackArtists)
+            .map(str::to_owned)
+            .collect(),
+    };
+    details.artists = artists
+        .into_iter()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect();
@@ -316,6 +326,137 @@ pub fn read_details(path: &Path) -> Result<SongTags> {
     details.track_gain = text(ItemKey::ReplayGainTrackGain);
     details.album_gain = text(ItemKey::ReplayGainAlbumGain);
     Ok(details)
+}
+
+/// Fields changed by hand on the Files tab. `None` leaves a field alone,
+/// `Some(None)` removes it, `Some(Some(value))` writes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TagEdit {
+    pub title: Option<Option<String>>,
+    pub artist: Option<Option<String>>,
+    pub album: Option<Option<String>>,
+    pub album_artist: Option<Option<String>>,
+    pub track: Option<Option<u32>>,
+    pub track_total: Option<Option<u32>>,
+    pub disc: Option<Option<u32>>,
+    pub disc_total: Option<Option<u32>>,
+    pub year: Option<Option<String>>,
+    pub genre: Option<Option<String>>,
+    pub composer: Option<Option<String>>,
+    pub label: Option<Option<String>>,
+    pub isrc: Option<Option<String>>,
+}
+
+impl TagEdit {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Writes only the fields in `edit`, leaving every other tag, the cover and
+/// the lyrics alone. A new artist also rewrites the separate ARTISTS values
+/// Navidrome credits ("A feat. B" gives A and B; "A & B" stays one name) and
+/// drops that artist's sort name and MusicBrainz IDs, which belonged to the
+/// old name. A new year also moves a release date from another year.
+pub fn edit_fields(path: &Path, edit: &TagEdit) -> Result<()> {
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(extension.as_str(), "wav" | "aiff" | "aif") {
+        bail!("Tags of WAV and AIFF files are not edited here");
+    }
+    let mut file = Probe::open(path)?.guess_file_type()?.read()?;
+    if file.primary_tag().is_none() {
+        file.insert_tag(Tag::new(file.primary_tag_type()));
+    }
+    let tag = file.primary_tag_mut().expect("primary tag present");
+    let text = |tag: &mut Tag, key: ItemKey, value: &Option<Option<String>>| match value {
+        None => {}
+        Some(None) => tag.remove_key(key),
+        Some(Some(value)) => set(tag, key, value),
+    };
+    text(tag, ItemKey::TrackTitle, &edit.title);
+    text(tag, ItemKey::AlbumTitle, &edit.album);
+    text(tag, ItemKey::Genre, &edit.genre);
+    text(tag, ItemKey::Composer, &edit.composer);
+    text(tag, ItemKey::Label, &edit.label);
+    text(tag, ItemKey::Isrc, &edit.isrc);
+    for (value, display, list, sort, ids) in [
+        (
+            &edit.artist,
+            ItemKey::TrackArtist,
+            ItemKey::TrackArtists,
+            ItemKey::TrackArtistSortOrder,
+            ItemKey::MusicBrainzArtistId,
+        ),
+        (
+            &edit.album_artist,
+            ItemKey::AlbumArtist,
+            ItemKey::AlbumArtists,
+            ItemKey::AlbumArtistSortOrder,
+            ItemKey::MusicBrainzReleaseArtistId,
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        for key in [display, list, sort, ids] {
+            tag.remove_key(key);
+        }
+        if let Some(name) = value {
+            set(tag, display, name);
+            let credits = crate::domain::credits::normalize_featured(name, "");
+            push_text_values(
+                tag,
+                list,
+                crate::domain::credits::individual_names(&credits.artists),
+            );
+        }
+    }
+    match &edit.year {
+        None => {}
+        Some(None) => {
+            for key in [ItemKey::RecordingDate, ItemKey::Year, ItemKey::ReleaseDate] {
+                tag.remove_key(key);
+            }
+        }
+        Some(Some(year)) => {
+            tag.remove_key(ItemKey::Year);
+            set(tag, ItemKey::RecordingDate, year);
+            if tag
+                .get_string(ItemKey::ReleaseDate)
+                .is_some_and(|date| !date.trim().starts_with(year.as_str()))
+            {
+                set(tag, ItemKey::ReleaseDate, year);
+            }
+        }
+    }
+    match edit.track {
+        None => {}
+        Some(None) => tag.remove_track(),
+        Some(Some(number)) => tag.set_track(number),
+    }
+    match edit.track_total {
+        None => {}
+        Some(None) => tag.remove_track_total(),
+        Some(Some(number)) => tag.set_track_total(number),
+    }
+    match edit.disc {
+        None => {}
+        Some(None) => tag.remove_disk(),
+        Some(Some(number)) => tag.set_disk(number),
+    }
+    match edit.disc_total {
+        None => {}
+        Some(None) => tag.remove_disk_total(),
+        Some(Some(number)) => tag.set_disk_total(number),
+    }
+    file.save_to_path(path, WriteOptions::default())?;
+    if file.file_type() == lofty::file::FileType::Mp4 {
+        merge_duplicate_atoms(path)?;
+    }
+    Ok(())
 }
 
 pub fn read_lyrics(path: &Path) -> Result<Option<String>> {
@@ -998,6 +1139,111 @@ mod tests {
 
         let file = Probe::open(&path).unwrap().read().unwrap();
         assert_eq!(file.primary_tag().unwrap().pictures()[0].data(), artwork);
+    }
+
+    #[test]
+    fn a_hand_edit_changes_only_its_fields() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for (name, codec) in [
+            ("edit.mp3", vec!["-q:a", "9"]),
+            ("edit.flac", vec!["-c:a", "flac"]),
+            ("edit.m4a", vec!["-c:a", "aac"]),
+        ] {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.3")
+                .args(codec)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let filed = Candidate {
+                title: "Get Lucky".into(),
+                artist: "Daft Punk".into(),
+                artist_credits: vec![crate::domain::credits::ArtistCredit {
+                    musicbrainz_id: Some("056e4f3e-d505-4dad-8ec1-d04f521cbb56".into()),
+                    ..crate::domain::credits::ArtistCredit::new("Daft Punk", "")
+                }],
+                album: Some("Random Access Memories".into()),
+                genre: Some("Electronic".into()),
+                composer: Some("Thomas Bangalter".into()),
+                isrc: Some("USQX91300108".into()),
+                year: Some("2013".into()),
+                release_date: Some("2013-05-17".into()),
+                recording_id: Some("f7c0d7bf-0b2a-4b6a-8b4b-1d6f0e0c6d11".into()),
+                track_number: Some(8),
+                track_total: Some(13),
+                ..Default::default()
+            };
+            write(&path, &filed, Some(one_pixel_png()), None).unwrap();
+            let before = read_details(&path).unwrap();
+
+            edit_fields(
+                &path,
+                &TagEdit {
+                    artist: Some(Some("Daft Punk feat. Pharrell Williams".into())),
+                    genre: Some(Some("Disco".into())),
+                    composer: Some(None),
+                    year: Some(Some("2014".into())),
+                    track_total: Some(Some(14)),
+                    ..TagEdit::default()
+                },
+            )
+            .unwrap();
+
+            let details = read_details(&path).unwrap();
+            assert_eq!(details.title.as_deref(), Some("Get Lucky"), "{name}");
+            assert_eq!(
+                details.artist.as_deref(),
+                Some("Daft Punk feat. Pharrell Williams"),
+                "{name}"
+            );
+            assert_eq!(
+                details.artists,
+                ["Daft Punk", "Pharrell Williams"],
+                "{name}"
+            );
+            assert_eq!(details.genre.as_deref(), Some("Disco"), "{name}");
+            assert_eq!(details.composer, None, "{name}");
+            assert_eq!(details.year.as_deref(), Some("2014"), "{name}");
+            assert_eq!(details.release_date.as_deref(), Some("2014"), "{name}");
+            assert_eq!(
+                (details.track, details.track_total),
+                (Some(8), Some(14)),
+                "{name}"
+            );
+            // Untouched tags, the cover and the recording ID stay.
+            assert_eq!(details.isrc.as_deref(), Some("USQX91300108"), "{name}");
+            assert_eq!(
+                details.album.as_deref(),
+                Some("Random Access Memories"),
+                "{name}"
+            );
+            assert_eq!(
+                details.musicbrainz_recording, before.musicbrainz_recording,
+                "{name}"
+            );
+            assert!(details.has_cover, "{name}");
+            // The old artist's MusicBrainz ID no longer fits the new credit.
+            let file = Probe::open(&path).unwrap().read().unwrap();
+            let tag = file.primary_tag().unwrap();
+            assert!(
+                tag.get_string(ItemKey::MusicBrainzArtistId).is_none(),
+                "{name}"
+            );
+        }
+
+        let wav = directory.path().join("song.wav");
+        std::fs::write(&wav, b"RIFF").unwrap();
+        assert!(edit_fields(&wav, &TagEdit::default()).is_err());
     }
 
     #[test]

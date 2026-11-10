@@ -177,6 +177,10 @@ export type SongDetails = {
   folder: string;
   size: number;
   format: string;
+  /** Size and modification time; a save over another version is refused. */
+  version: string;
+  /** WAV and AIFF tags are not edited. */
+  editable: boolean;
   title?: string | null;
   artist?: string | null;
   artists: string[];
@@ -204,3 +208,24 @@ export type SongDetails = {
   bit_depth?: number | null;
   channels?: number | null;
 };
+/** Typed tag values to write; an empty string removes the tag. */
+export type SongChanges = Partial<
+  Record<
+    | "title"
+    | "artist"
+    | "album"
+    | "album_artist"
+    | "track"
+    | "track_total"
+    | "disc"
+    | "disc_total"
+    | "year"
+    | "genre"
+    | "composer"
+    | "label"
+    | "isrc",
+    string
+  >
+>;
+/** After a save: how many fields changed, their old values (for Undo), and the song now. */
+export type SongSaved = { changed: number; before: SongChanges; song: SongDetails };

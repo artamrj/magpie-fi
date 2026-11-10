@@ -445,30 +445,13 @@ async fn rename_folder(state: &Arc<AppState>, from: &Path, to: &Path) -> Result<
 
 /// Replaces every old spelling on a copy, then swaps the copy in.
 fn retag(song: &Path, old_spellings: &[String], new_names: &[String]) -> Result<bool> {
-    let name = song
-        .file_name()
-        .context("song has no name")?
-        .to_string_lossy();
-    let extension = song
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = song.with_file_name(format!(".{name}.magpie-fi-artist.{extension}"));
-    std::fs::copy(song, &temporary)?;
-    let result = (|| {
+    files::edit_on_copy(song, "artist", |copy| {
         let mut changed = false;
         for old in old_spellings {
-            changed |= tag_writer::replace_artist(&temporary, old, new_names)?;
-        }
-        if changed {
-            std::fs::rename(&temporary, song)?;
+            changed |= tag_writer::replace_artist(copy, old, new_names)?;
         }
         Ok(changed)
-    })();
-    if !matches!(result, Ok(true)) {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    })
 }
 
 async fn unused(target: PathBuf) -> Result<PathBuf> {

@@ -1,4 +1,5 @@
-//! The Files tab: walk `library/` one folder at a time and search it. Read-only.
+//! The Files tab: walk `library/` one folder at a time, search it, and fix a
+//! song's tags by hand.
 //!
 //! Every path the page sends is relative to the library and goes through
 //! [`resolve`] first, so nothing outside the library can be listed or read.
@@ -6,8 +7,12 @@
 //! titles from `library_items` (so a folder of 500 songs opens without reading
 //! 500 files).
 
-use crate::{domain::names::match_key, infrastructure::media::tag_writer};
-use serde::Serialize;
+use crate::{
+    application::{files, library},
+    domain::names::match_key,
+    infrastructure::media::tag_writer::{self, TagEdit},
+};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,6 +30,11 @@ pub enum BrowseError {
     Outside,
     #[error("That file or folder is no longer in the library")]
     NotFound,
+    /// What the page sent cannot be written; the text says why.
+    #[error("{0}")]
+    Invalid(String),
+    #[error("The file changed since you opened it. Open it again to see the new tags.")]
+    Changed,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -77,6 +87,10 @@ pub struct SongDetails {
     pub folder: String,
     pub size: u64,
     pub format: String,
+    /// Size and modification time; a save is refused when the file no longer matches.
+    pub version: String,
+    /// WAV and AIFF tags are not edited.
+    pub editable: bool,
     #[serde(flatten)]
     pub tags: tag_writer::SongTags,
 }
@@ -443,6 +457,7 @@ pub async fn song(root: &Path, path: &str) -> Result<SongDetails> {
     if !file.is_file() || !crate::domain::audio::is_supported(&file) {
         return Err(BrowseError::NotFound);
     }
+    let version = version(&file).await?;
     let size = tokio::fs::metadata(&file)
         .await
         .map_err(|error| BrowseError::Other(error.into()))?
@@ -453,16 +468,273 @@ pub async fn song(root: &Path, path: &str) -> Result<SongDetails> {
         .map_err(|error| BrowseError::Other(error.into()))??;
     let path = path.trim_matches('/').to_owned();
     let (folder, name) = path.rsplit_once('/').unwrap_or(("", &path));
+    let format = file
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     Ok(SongDetails {
         folder: folder.to_owned(),
         name: name.to_owned(),
-        format: file
-            .extension()
-            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default(),
+        editable: !matches!(format.as_str(), "wav" | "aiff" | "aif"),
+        format,
         size,
+        version,
         tags,
         path: path.clone(),
+    })
+}
+
+async fn version(file: &Path) -> Result<String> {
+    let (size, modified) = files::stamp(file).await?;
+    Ok(format!("{size}-{modified}"))
+}
+
+/// Fields typed on the Files tab, as text. A missing field is left alone; an
+/// empty one removes the tag.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SongChanges {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_total: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_total: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isrc: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Saved {
+    /// How many fields really changed (0 when every value was already there).
+    pub changed: usize,
+    /// The old values of the changed fields; saving them again undoes the edit.
+    pub before: SongChanges,
+    pub song: SongDetails,
+}
+
+/// One line of text: NFC, trimmed, at most 500 characters. `None` for empty.
+fn line(field: &str, value: &str) -> Result<Option<String>> {
+    let value: String = value.nfc().collect::<String>().trim().to_owned();
+    if value.chars().any(char::is_control) {
+        return Err(BrowseError::Invalid(format!("{field} must be one line")));
+    }
+    if value.chars().count() > 500 {
+        return Err(BrowseError::Invalid(format!("{field} is too long")));
+    }
+    Ok((!value.is_empty()).then_some(value))
+}
+
+fn number(field: &str, value: &str) -> Result<Option<u32>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.parse::<u32>() {
+        Ok(number @ 1..=999) => Ok(Some(number)),
+        _ => Err(BrowseError::Invalid(format!(
+            "{field} must be a number from 1 to 999"
+        ))),
+    }
+}
+
+/// The typed text as values to write, keeping only fields that differ from
+/// the file. Also returns the old values of those fields, as typed text.
+fn plan(changes: &SongChanges, now: &tag_writer::SongTags) -> Result<(TagEdit, SongChanges)> {
+    let mut edit = TagEdit::default();
+    let mut before = SongChanges::default();
+    let shown = |value: &Option<String>| value.clone().unwrap_or_default();
+    let count = |value: Option<u32>| value.map(|number| number.to_string()).unwrap_or_default();
+    macro_rules! text {
+        ($field:ident, $label:literal) => {
+            if let Some(typed) = &changes.$field {
+                let value = line($label, typed)?;
+                if value != now.$field {
+                    before.$field = Some(shown(&now.$field));
+                    edit.$field = Some(value);
+                }
+            }
+        };
+    }
+    macro_rules! numeric {
+        ($field:ident, $label:literal) => {
+            if let Some(typed) = &changes.$field {
+                let value = number($label, typed)?;
+                if value != now.$field {
+                    before.$field = Some(count(now.$field));
+                    edit.$field = Some(value);
+                }
+            }
+        };
+    }
+    text!(title, "Title");
+    text!(artist, "Artist");
+    text!(album, "Album");
+    text!(album_artist, "Album artist");
+    text!(genre, "Genre");
+    text!(composer, "Composer");
+    text!(label, "Label");
+    numeric!(track, "Track");
+    numeric!(track_total, "Track total");
+    numeric!(disc, "Disc");
+    numeric!(disc_total, "Disc total");
+    if let Some(typed) = &changes.year {
+        let value = line("Year", typed)?;
+        if let Some(year) = &value
+            && !(year.len() == 4
+                && year
+                    .parse::<u32>()
+                    .is_ok_and(|number| (1000..3000).contains(&number)))
+        {
+            return Err(BrowseError::Invalid(
+                "Year must be four digits, like 2013".into(),
+            ));
+        }
+        // A full date in the file ("2013-05-17") is the same year as "2013".
+        let same = match (&value, &now.year) {
+            (Some(year), Some(old)) => old.starts_with(year.as_str()),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            before.year = Some(shown(&now.year));
+            edit.year = Some(value);
+        }
+    }
+    if let Some(typed) = &changes.isrc {
+        let value = match line("ISRC", typed)? {
+            None => None,
+            Some(text) => Some(
+                crate::application::input_dedup::normalize_isrc(&text).ok_or_else(|| {
+                    BrowseError::Invalid(
+                        "An ISRC has 12 letters and digits, like USQX91300108".into(),
+                    )
+                })?,
+            ),
+        };
+        if value != now.isrc {
+            before.isrc = Some(shown(&now.isrc));
+            edit.isrc = Some(value);
+        }
+    }
+    if matches!(edit.title, Some(None)) || matches!(edit.artist, Some(None)) {
+        return Err(BrowseError::Invalid(
+            "A song needs a title and an artist".into(),
+        ));
+    }
+    Ok((edit, before))
+}
+
+/// The file says what was meant to be written; otherwise the save is undone.
+fn check(written: &tag_writer::SongTags, edit: &TagEdit) -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    macro_rules! same {
+        ($field:ident) => {
+            if let Some(expected) = &edit.$field
+                && *expected != written.$field
+            {
+                wrong.push(stringify!($field));
+            }
+        };
+    }
+    same!(title);
+    same!(artist);
+    same!(album);
+    same!(album_artist);
+    same!(genre);
+    same!(composer);
+    same!(label);
+    same!(isrc);
+    same!(track);
+    same!(track_total);
+    same!(disc);
+    same!(disc_total);
+    same!(year);
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("the file did not keep {}", wrong.join(", "))
+    }
+}
+
+/// Writes the changed fields of one song. The caller holds the workflow slot,
+/// so no scan or filing touches the library meanwhile.
+pub async fn edit_song(
+    pool: &SqlitePool,
+    root: &Path,
+    path: &str,
+    expected_version: &str,
+    changes: &SongChanges,
+) -> Result<Saved> {
+    let file = song_file(root, path)?;
+    if version(&file).await? != expected_version {
+        return Err(BrowseError::Changed);
+    }
+    let reading = file.clone();
+    let now = tokio::task::spawn_blocking(move || tag_writer::read_details(&reading))
+        .await
+        .map_err(|error| BrowseError::Other(error.into()))??;
+    let (edit, before) = plan(changes, &now)?;
+    let changed = [
+        edit.title.is_some(),
+        edit.artist.is_some(),
+        edit.album.is_some(),
+        edit.album_artist.is_some(),
+        edit.track.is_some(),
+        edit.track_total.is_some(),
+        edit.disc.is_some(),
+        edit.disc_total.is_some(),
+        edit.year.is_some(),
+        edit.genre.is_some(),
+        edit.composer.is_some(),
+        edit.label.is_some(),
+        edit.isrc.is_some(),
+    ]
+    .into_iter()
+    .filter(|changed| *changed)
+    .count();
+    if !edit.is_empty() {
+        let writing = file.clone();
+        tokio::task::spawn_blocking(move || {
+            files::edit_on_copy(&writing, "edit", |copy| {
+                tag_writer::edit_fields(copy, &edit)?;
+                check(&tag_writer::read_details(copy)?, &edit)?;
+                Ok(true)
+            })
+        })
+        .await
+        .map_err(|error| BrowseError::Other(error.into()))?
+        .map_err(|error| BrowseError::Invalid(format!("Could not save the tags: {error:#}")))?;
+        // Search, lists and the Artists page see the new tags at once.
+        match library::describe_file(pool, &file).await {
+            Ok(entry) => library::remember(pool, &entry).await?,
+            Err(error) => {
+                tracing::warn!(path = %file.display(), error = format!("{error:#}"), "could not index the edited song")
+            }
+        }
+    }
+    Ok(Saved {
+        changed,
+        before,
+        song: song(root, path).await?,
     })
 }
 
@@ -698,6 +970,127 @@ mod tests {
             search(&pool, &root, "lucky", "../").await,
             Err(BrowseError::Outside)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_save_writes_only_what_changed_and_can_be_undone() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (_directory, root, pool) = library().await;
+        let relative = "Radiohead/OK Computer (1997)/12 - Edit Me.flac";
+        let file = root.join(relative);
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=1")
+            .args([
+                "-metadata",
+                "title=Edit Me",
+                "-metadata",
+                "artist=Radiohead",
+                "-metadata",
+                "genre=Alternative",
+                "-metadata",
+                "composer=Thom Yorke",
+            ])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let opened = song(&root, relative).await.unwrap();
+
+        // A file that changed since it was opened is not overwritten.
+        let changes = SongChanges {
+            title: Some(" Edit Me ".into()),
+            genre: Some("Art Rock".into()),
+            composer: Some(String::new()),
+            ..SongChanges::default()
+        };
+        assert!(matches!(
+            edit_song(&pool, &root, relative, "0-0", &changes).await,
+            Err(BrowseError::Changed)
+        ));
+
+        // Bad input is refused before anything is written.
+        for bad in [
+            SongChanges {
+                title: Some(String::new()),
+                ..SongChanges::default()
+            },
+            SongChanges {
+                year: Some("13".into()),
+                ..SongChanges::default()
+            },
+            SongChanges {
+                track: Some("one".into()),
+                ..SongChanges::default()
+            },
+            SongChanges {
+                isrc: Some("nope".into()),
+                ..SongChanges::default()
+            },
+            SongChanges {
+                album: Some("two\nlines".into()),
+                ..SongChanges::default()
+            },
+        ] {
+            assert!(matches!(
+                edit_song(&pool, &root, relative, &opened.version, &bad).await,
+                Err(BrowseError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            edit_song(&pool, &root, "../x.flac", &opened.version, &changes).await,
+            Err(BrowseError::Outside)
+        ));
+
+        // The title is the same once trimmed, so only two fields change.
+        let saved = edit_song(&pool, &root, relative, &opened.version, &changes)
+            .await
+            .unwrap();
+        assert_eq!(saved.changed, 2);
+        assert_eq!(saved.before.genre.as_deref(), Some("Alternative"));
+        assert_eq!(saved.before.composer.as_deref(), Some("Thom Yorke"));
+        assert_eq!(saved.before.title, None);
+        assert_eq!(saved.song.tags.genre.as_deref(), Some("Art Rock"));
+        assert_eq!(saved.song.tags.composer, None);
+        assert_ne!(saved.song.version, opened.version);
+        // No hidden copy is left in the album folder, and the index knows the song.
+        let leftovers: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty());
+        let indexed: Option<String> =
+            sqlx::query_scalar("SELECT title FROM library_items WHERE path=?")
+                .bind(file.to_string_lossy().as_ref())
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(indexed.as_deref(), Some("Edit Me"));
+
+        // Saving the old values again is the undo.
+        let undone = edit_song(&pool, &root, relative, &saved.song.version, &saved.before)
+            .await
+            .unwrap();
+        assert_eq!(undone.song.tags.genre.as_deref(), Some("Alternative"));
+        assert_eq!(undone.song.tags.composer.as_deref(), Some("Thom Yorke"));
+
+        // Nothing new to write leaves the file alone.
+        let current = SongChanges {
+            genre: Some("Alternative".into()),
+            ..SongChanges::default()
+        };
+        let same = edit_song(&pool, &root, relative, &undone.song.version, &current)
+            .await
+            .unwrap();
+        assert_eq!(same.changed, 0);
+        assert_eq!(same.song.version, undone.song.version);
     }
 
     #[tokio::test]

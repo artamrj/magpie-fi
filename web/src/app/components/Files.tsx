@@ -1,13 +1,27 @@
 import { Fragment, useEffect, useState } from "react";
-import { useFileSearchQuery, useFolderQuery, useSongDetailsQuery } from "../../api/queries";
-import type { LibraryFolderEntry, LibrarySong, SongDetails } from "../../api/types";
+import { useQueryClient } from "@tanstack/react-query";
+import { api, ApiError } from "../../api/client";
+import {
+  queryKeys,
+  useFileSearchQuery,
+  useFolderQuery,
+  useSongDetailsQuery,
+} from "../../api/queries";
+import type {
+  LibraryFolderEntry,
+  LibrarySong,
+  SongChanges,
+  SongDetails,
+  SongSaved,
+} from "../../api/types";
 import { Icon } from "../Icons";
 import { haptic } from "../telegram";
 import { formatDuration } from "../trackUtils";
 import { LibraryCover } from "./Cover";
 import { EmptyState, ListSkeleton } from "./EmptyStates";
 import { Player } from "./SongScreen";
-import { Callout, Cell, PageTitle, Section, Tag } from "./ui";
+import type { Feedback } from "./ReviewList";
+import { BottomActions, Callout, Cell, PageTitle, Section, Tag } from "./ui";
 
 /** What the app shell needs from the Files tab on a phone. */
 export type FilesNav = { back?: () => void; song: boolean };
@@ -16,8 +30,16 @@ const parentOf = (path: string) => path.split("/").slice(0, -1).join("/");
 const nameOf = (path: string) => path.split("/").pop() || "library";
 const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-/** The library folder as it is on disk: browse it, search it, look at one song. */
-export function Files({ wide, onNav }: { wide: boolean; onNav: (nav: FilesNav) => void }) {
+/** The library folder as it is on disk: browse it, search it, fix one song's tags. */
+export function Files({
+  wide,
+  feedback,
+  onNav,
+}: {
+  wide: boolean;
+  feedback: Feedback;
+  onNav: (nav: FilesNav) => void;
+}) {
   const [folder, setFolder] = useState("");
   const [songPath, setSongPath] = useState<string>();
   const [search, setSearch] = useState("");
@@ -154,7 +176,7 @@ export function Files({ wide, onNav }: { wide: boolean; onNav: (nav: FilesNav) =
         <aside className="detail">
           <div className="screen">
             {songPath ? (
-              <SongView key={songPath} path={songPath} />
+              <SongView key={songPath} path={songPath} feedback={feedback} />
             ) : (
               <EmptyState
                 icon="folder"
@@ -170,7 +192,12 @@ export function Files({ wide, onNav }: { wide: boolean; onNav: (nav: FilesNav) =
   if (songPath)
     return (
       <main className="screen no-tabs">
-        <SongView key={songPath} path={songPath} onBack={() => setSongPath(undefined)} />
+        <SongView
+          key={songPath}
+          path={songPath}
+          feedback={feedback}
+          onBack={() => setSongPath(undefined)}
+        />
       </main>
     );
 
@@ -510,7 +537,15 @@ function TreeFolder({
 }
 
 /** Everything one song's file says about itself. */
-function SongView({ path, onBack }: { path: string; onBack?: () => void }) {
+function SongView({
+  path,
+  onBack,
+  feedback,
+}: {
+  path: string;
+  onBack?: () => void;
+  feedback: Feedback;
+}) {
   const details = useSongDetailsQuery(path);
   const song = details.data;
   return (
@@ -527,15 +562,58 @@ function SongView({ path, onBack }: { path: string; onBack?: () => void }) {
           </Callout>
         </div>
       ) : (
-        song && <SongInfo song={song} />
+        // A new version (after a save or an undo) starts the form again from the file.
+        song && <SongInfo key={song.version} song={song} feedback={feedback} />
       )}
     </>
   );
 }
 
-function SongInfo({ song }: { song: SongDetails }) {
-  const of = (number?: number | null, total?: number | null) =>
-    number ? (total ? `${number} / ${total}` : String(number)) : undefined;
+type FieldName = keyof SongChanges;
+const fieldLabels: Record<FieldName, string> = {
+  title: "Title",
+  artist: "Artist",
+  album: "Album",
+  album_artist: "Album artist",
+  track: "Track",
+  track_total: "of",
+  disc: "Disc",
+  disc_total: "of",
+  year: "Year",
+  genre: "Genre",
+  composer: "Composer",
+  label: "Label",
+  isrc: "ISRC",
+};
+
+/** The file's tags as the form shows them. */
+function formOf(song: SongDetails): Record<FieldName, string> {
+  const text = (value?: string | number | null) => (value == null ? "" : String(value));
+  return {
+    title: text(song.title),
+    artist: text(song.artist),
+    album: text(song.album),
+    album_artist: text(song.album_artist),
+    track: text(song.track),
+    track_total: text(song.track_total),
+    disc: text(song.disc),
+    disc_total: text(song.disc_total),
+    year: text(song.year),
+    genre: text(song.genre),
+    composer: text(song.composer),
+    label: text(song.label),
+    isrc: text(song.isrc),
+  };
+}
+
+function SongInfo({ song, feedback }: { song: SongDetails; feedback: Feedback }) {
+  const queryClient = useQueryClient();
+  const original = formOf(song);
+  const [form, setForm] = useState(original);
+  const [busy, setBusy] = useState(false);
+  const changed = (Object.keys(form) as FieldName[]).filter(
+    (name) => form[name].trim() !== original[name],
+  );
   const sound = [
     song.format.toUpperCase(),
     song.bitrate && `${song.bitrate} kbps`,
@@ -554,12 +632,94 @@ function SongInfo({ song }: { song: SongDetails }) {
     song.track_gain && `${song.track_gain} track`,
     song.album_gain && `${song.album_gain} album`,
   ].filter(Boolean);
-  const more: Array<[string, string | undefined | null]> = [
-    ["Composer", song.composer],
-    ["Label", song.label],
-    ["ISRC", song.isrc],
-    ["Release date", song.release_date],
-  ];
+
+  /** Saves `changes` over `version`; the old values come back for Undo. */
+  const write = async (version: string, changes: SongChanges) => {
+    const saved = await api<SongSaved>("/files/song", {
+      method: "PUT",
+      body: JSON.stringify({ path: song.path, version, changes }),
+    });
+    queryClient.setQueryData([...queryKeys.files, "song", song.path], saved.song);
+    // Lists, search and the Artists page show the new tags.
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: [...queryKeys.files, "folder"] }),
+      queryClient.invalidateQueries({ queryKey: [...queryKeys.files, "search"] }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.artists }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.recent }),
+    ]);
+    return saved;
+  };
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const changes = Object.fromEntries(changed.map((name) => [name, form[name].trim()]));
+      const saved = await write(song.version, changes);
+      haptic.success();
+      if (!saved.changed) {
+        feedback.notify("Nothing to save: the file already says that");
+        return;
+      }
+      feedback.notify(`Saved ${count(saved.changed, "change", "changes")}`, async () => {
+        await write(saved.song.version, saved.before);
+        haptic.success();
+        feedback.notify("Changes undone");
+      });
+    } catch (reason) {
+      haptic.error();
+      feedback.fail((reason as Error).message);
+      // Someone or something else changed the file: show what it says now.
+      if (reason instanceof ApiError && reason.status === 409)
+        void queryClient.invalidateQueries({ queryKey: [...queryKeys.files, "song", song.path] });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const field = (name: FieldName, numeric = false) => (
+    <input
+      id={`file-${name}`}
+      aria-label={fieldLabels[name] === "of" ? `${name.replace("_", " ")}` : fieldLabels[name]}
+      dir="auto"
+      value={form[name]}
+      disabled={!song.editable || busy}
+      inputMode={numeric ? "numeric" : undefined}
+      placeholder={numeric ? "–" : "Empty"}
+      autoComplete="off"
+      onChange={(event) => setForm({ ...form, [name]: event.target.value })}
+    />
+  );
+  const row = (name: FieldName, numeric = false) => {
+    const isChanged = changed.includes(name);
+    return (
+      <label className={`field-row ${isChanged ? "changed" : ""}`} key={name}>
+        <span>{fieldLabels[name]}</span>
+        {field(name, numeric)}
+        {isChanged && (
+          <small className="was">was {original[name] ? `“${original[name]}”` : "empty"}</small>
+        )}
+      </label>
+    );
+  };
+  const pair = (name: FieldName, total: FieldName) => {
+    const isChanged = changed.includes(name) || changed.includes(total);
+    return (
+      <label className={`field-row ${isChanged ? "changed" : ""}`} key={name}>
+        <span>{fieldLabels[name]}</span>
+        <span className="number-pair">
+          {field(name, true)}
+          <i>of</i>
+          {field(total, true)}
+        </span>
+        {isChanged && (
+          <small className="was">
+            was {original[name] || "–"} of {original[total] || "–"}
+          </small>
+        )}
+      </label>
+    );
+  };
+
   return (
     <>
       <div className="hero">
@@ -576,39 +736,47 @@ function SongInfo({ song }: { song: SongDetails }) {
         </div>
       </div>
 
-      <Section title="Tags">
-        <Info label="Title" value={song.title} />
-        <Info label="Artist" value={song.artist} />
-        {song.artists.length > 1 && <Info label="Artists" value={song.artists.join(", ")} />}
-        <Info label="Album" value={song.album} />
-        <Info label="Album artist" value={song.album_artist} />
-        <Info label="Track" value={of(song.track, song.track_total)} />
-        <Info label="Disc" value={of(song.disc, song.disc_total)} />
-        <Info label="Year" value={song.year} />
-        <Info label="Genre" value={song.genre} />
+      <Section
+        title="Tags"
+        aside={
+          changed.length > 0 && (
+            <span className="changed-note">{count(changed.length, "change", "changes")}</span>
+          )
+        }
+        footer={
+          song.editable
+            ? "Only the fields you change are written. Duets and features (“A feat. B”) get credit for each artist in Navidrome."
+            : "Tags of WAV and AIFF files are not edited here."
+        }
+      >
+        {row("title")}
+        {row("artist")}
+        {row("album")}
+        {row("album_artist")}
+        {pair("track", "track_total")}
+        {pair("disc", "disc_total")}
+        {row("year", true)}
+        {row("genre")}
       </Section>
 
-      {(more.some(([, value]) => value) || lyrics) && (
-        <Section title="More tags">
-          {more
-            .filter(([, value]) => value)
-            .map(([label, value]) => (
-              <Info key={label} label={label} value={value} />
-            ))}
-          {lyrics && (
-            <Info
-              label="Lyrics"
-              value={[synced ? "Synced" : "Plain", firstLine && `“${firstLine}…”`]
-                .filter(Boolean)
-                .join(" · ")}
-            />
-          )}
-        </Section>
-      )}
+      <Section title="More tags">
+        {row("composer")}
+        {row("label")}
+        {row("isrc")}
+        {song.release_date && <Info label="Release date" value={song.release_date} />}
+        {lyrics && (
+          <Info
+            label="Lyrics"
+            value={[synced ? "Synced" : "Plain", firstLine && `“${firstLine}…”`]
+              .filter(Boolean)
+              .join(" · ")}
+          />
+        )}
+      </Section>
 
       <Section
         title="File"
-        footer="MusicBrainz IDs and loudness are written by magpie-fi when it files a song."
+        footer="MusicBrainz IDs and loudness are written by magpie-fi when it files a song. A new artist drops that artist’s old MusicBrainz ID."
       >
         <Info
           label="Cover"
@@ -624,6 +792,23 @@ function SongInfo({ song }: { song: SongDetails }) {
         {loudness.length > 0 && <Info label="Loudness" value={loudness.join(" · ")} />}
         <Info label="Path" value={song.path} mono />
       </Section>
+
+      <BottomActions
+        primary={
+          changed.length
+            ? {
+                text: `Save ${count(changed.length, "change", "changes")}`,
+                onClick: () => void save(),
+                busy,
+              }
+            : undefined
+        }
+        secondary={
+          changed.length
+            ? { text: "Undo changes", onClick: () => setForm(original), disabled: busy }
+            : undefined
+        }
+      />
     </>
   );
 }
