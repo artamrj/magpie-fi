@@ -180,7 +180,9 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     year does not move the song (Navidrome goes by the tags). Hidden folders (`.magpie-fi`,
     `@eaDir`) and anything outside `library/` are never shown.
   A browser window wider than 1024 px shows a sidebar, the list and the song side by side
-  (Enter uses the match, → goes to the next song). Telegram's panel is never that wide.
+  (Enter uses the match, → goes to the next song). Telegram's panel is never that wide. From
+  1360 px (a 15–16" laptop or a desktop screen) the song also puts the release list and "what
+  changes in your file" next to each other, so both are in view without scrolling.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
   bot's menu button or "📱 Open review" (`?view=review`).
 - The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
