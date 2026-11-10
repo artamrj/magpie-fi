@@ -240,6 +240,8 @@ async fn approve_review_tracks(s: &AppState) -> ApiResult<AutoApproveResult> {
             title: track.current_title.as_deref(),
             artist: track.current_artist.as_deref(),
             album: track.current_album.as_deref(),
+            // Not stored for songs already in Review; a new check reads it from the file.
+            isrc: None,
         };
         let Some(decision) = crate::application::smart_approval::select(evidence, &candidates)
         else {

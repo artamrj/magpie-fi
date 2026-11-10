@@ -11,9 +11,29 @@ pub struct AudioInfo {
     pub album_artist: Option<String>,
     pub track_number: Option<u32>,
     pub genre: Option<String>,
+    /// The ISRC tag (a song's official code), written by stores, rippers and
+    /// magpie-fi's own link downloads. A source with the same code and length
+    /// is proof of the recording.
+    pub isrc: Option<String>,
     pub duration: f64,
     pub bitrate: Option<u32>,
     pub format: String,
+}
+
+/// An ISRC in its plain 12-character form ("GB-DUW-00-00059" → "GBDUW0000059"),
+/// or `None` when the text is not one.
+pub fn normalize_isrc(value: &str) -> Option<String> {
+    let code = value
+        .chars()
+        .filter(|character| !matches!(character, '-' | ' '))
+        .flat_map(char::to_uppercase)
+        .collect::<String>();
+    let bytes = code.as_bytes();
+    (bytes.len() == 12
+        && bytes[..2].iter().all(u8::is_ascii_uppercase)
+        && bytes[2..5].iter().all(u8::is_ascii_alphanumeric)
+        && bytes[5..].iter().all(u8::is_ascii_digit))
+    .then_some(code)
 }
 
 pub fn read(path: &Path) -> Result<AudioInfo> {
@@ -57,6 +77,9 @@ fn info_from_tagged(path: &Path, tagged: &lofty::file::TaggedFile) -> AudioInfo 
         }),
         track_number: tag.and_then(|t| t.track()),
         genre: tag.and_then(|t| t.genre().map(|v| v.into_owned())),
+        isrc: tag
+            .and_then(|t| t.get_string(lofty::tag::ItemKey::Isrc))
+            .and_then(normalize_isrc),
         duration: props.duration().as_secs_f64(),
         bitrate: props.audio_bitrate(),
         format: canonical_lofty_format(tagged.file_type(), path),
@@ -71,7 +94,7 @@ fn info_from_ffprobe(path: &Path) -> Result<AudioInfo> {
             "-select_streams",
             "a:0",
             "-show_entries",
-            "format=format_name,duration,bit_rate:format_tags=title,artist,album,album_artist,track,genre:stream=codec_name,duration,bit_rate:stream_tags=title,artist,album,album_artist,track,genre",
+            "format=format_name,duration,bit_rate:format_tags=title,artist,album,album_artist,track,genre,isrc,ISRC,TSRC:stream=codec_name,duration,bit_rate:stream_tags=title,artist,album,album_artist,track,genre,isrc,ISRC,TSRC",
             "-of",
             "json",
         ])
@@ -119,6 +142,11 @@ fn parse_ffprobe(path: &Path, value: &serde_json::Value) -> Result<AudioInfo> {
             .and_then(|track| track.split('/').next())
             .and_then(|track| track.parse().ok()),
         genre: tag("genre"),
+        isrc: tag("isrc")
+            .or_else(|| tag("ISRC"))
+            .or_else(|| tag("TSRC"))
+            .as_deref()
+            .and_then(normalize_isrc),
         duration,
         bitrate,
         format: canonical_ffprobe_format(
@@ -368,6 +396,36 @@ pub fn is_supported(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isrc_codes_are_read_in_one_form() {
+        assert_eq!(
+            normalize_isrc("gb-duw-00-00059").as_deref(),
+            Some("GBDUW0000059")
+        );
+        assert_eq!(
+            normalize_isrc(" CBEFB2600137 ").as_deref(),
+            Some("CBEFB2600137")
+        );
+        for junk in ["", "unknown", "GBDUW000005", "12DUW0000059", "GBDUW00000AB"] {
+            assert_eq!(normalize_isrc(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn the_isrc_tag_is_read_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.5")
+            .args(["-metadata", "title=Song", "-metadata", "TSRC=CBEFB2600137"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(read(&path).unwrap().isrc.as_deref(), Some("CBEFB2600137"));
+    }
 
     #[test]
     fn replaces_social_spam_artist_from_pipe_title() {

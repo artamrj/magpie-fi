@@ -98,6 +98,8 @@ export type Candidate = {
   artwork_message?: string;
   score_breakdown?: string;
   score: number;
+  /** Seconds between this release's length and the file's; missing when the source gives none. */
+  duration_delta?: number | null;
 };
 export type ArtworkStatus = "searching" | "verified" | "retryable_error" | "cover_required";
 export type ArtistCredit = {

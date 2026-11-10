@@ -3,11 +3,14 @@ pub(crate) use crate::domain::versions::version_tags;
 use crate::infrastructure::providers::Candidate;
 use std::collections::{BTreeSet, HashSet};
 
+#[derive(Default)]
 pub struct TrackEvidence<'a> {
     pub filename: &'a str,
     pub title: Option<&'a str>,
     pub artist: Option<&'a str>,
     pub album: Option<&'a str>,
+    /// The file's own ISRC tag, already in its plain form.
+    pub isrc: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -22,6 +25,9 @@ pub struct RankedDecision {
     pub candidate_index: usize,
     pub confidence: f64,
     pub explanation: String,
+    /// Other releases of the same recording that pass the same checks, best
+    /// first. Filing falls back to them when the chosen release has no cover.
+    pub alternates: Vec<usize>,
 }
 
 struct Evaluated<'a> {
@@ -34,6 +40,8 @@ struct Evaluated<'a> {
     artist_available: bool,
     sources: usize,
     audio_recognition: bool,
+    /// The source gives the file's own ISRC and the same length.
+    isrc_proof: bool,
     duration_close: bool,
     album_similarity: Option<f64>,
     variants: BTreeSet<&'static str>,
@@ -50,7 +58,11 @@ pub fn select(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<D
     })
 }
 
-pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<RankedDecision> {
+/// Every usable candidate measured against the file, best first.
+fn evaluate_all<'a>(
+    evidence: &TrackEvidence<'_>,
+    candidates: &'a [Candidate],
+) -> Vec<Evaluated<'a>> {
     let source_text = [evidence.filename, evidence.title.unwrap_or_default()].join(" ");
     let expected_variants = version_tags(&source_text);
     let mut evaluated = candidates
@@ -60,24 +72,48 @@ pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<Ran
             !candidate.title.trim().is_empty() && !candidate.artist.trim().is_empty()
         })
         .map(|(index, candidate)| {
-            evaluate(index, &evidence, candidate, &expected_variants, candidates)
+            evaluate(index, evidence, candidate, &expected_variants, candidates)
         })
-        .filter(is_supported)
         .collect::<Vec<_>>();
     evaluated.sort_by(|left, right| right.total.total_cmp(&left.total));
+    evaluated
+}
+
+pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<RankedDecision> {
+    let evaluated = evaluate_all(&evidence, candidates)
+        .into_iter()
+        .filter(is_supported)
+        .collect::<Vec<_>>();
 
     let best = evaluated.first()?;
     if best.total < 68.0 {
         return None;
     }
-    if let Some(second) = evaluated.get(1)
-        && !same_recording(best, second)
-        && best.total - second.total < 12.0
+    // Other releases of the same recording (the single, the album, a store that
+    // lists fewer singers) are not rivals: any of them is the right song. The
+    // margin is kept against the best match that is a different recording.
+    if let Some(rival) = evaluated
+        .iter()
+        .skip(1)
+        .find(|other| !same_recording(best, other))
+        && best.total - rival.total < 12.0
     {
         return None;
     }
+    let alternates = evaluated
+        .iter()
+        .skip(1)
+        // A compilation is never a fallback: the song belongs with its own album.
+        .filter(|other| {
+            other.total >= 68.0 && !other.candidate.is_compilation && same_recording(best, other)
+        })
+        .map(|other| other.index)
+        .collect();
 
     let mut reasons = Vec::new();
+    if best.isrc_proof {
+        reasons.push("same ISRC as the file".to_owned());
+    }
     if best.audio_recognition {
         reasons.push("audio recognition".to_owned());
     }
@@ -112,7 +148,85 @@ pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<Ran
         } else {
             reasons.join(", ")
         },
+        alternates,
     })
+}
+
+/// Why [`rank`] would not choose on its own, in plain words for the Review
+/// screen: the one thing a person should check.
+pub fn unsure_reason(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> String {
+    let evaluated = evaluate_all(&evidence, candidates);
+    let supported = evaluated
+        .iter()
+        .filter(|candidate| is_supported(candidate))
+        .collect::<Vec<_>>();
+    if let Some(best) = supported.first() {
+        if let Some(rival) = supported
+            .iter()
+            .skip(1)
+            .find(|other| !same_recording(best, other))
+            && best.total - rival.total < 12.0
+        {
+            return format!(
+                "Two different recordings fit almost equally well: {} and {}.",
+                describe(best.candidate),
+                describe(rival.candidate)
+            );
+        }
+        return format!(
+            "The best match, {}, is not certain enough to file without a look.",
+            describe(best.candidate)
+        );
+    }
+    let Some(top) = evaluated.first() else {
+        return "No source found this song.".to_owned();
+    };
+    let found = describe(top.candidate);
+    let source = crate::domain::provider_name(&top.candidate.provider);
+    if let Some(delta) = top
+        .candidate
+        .duration_delta
+        .filter(|delta| *delta > MAX_AUTOMATIC_DURATION_GAP_SECONDS)
+    {
+        return format!(
+            "The closest match, {found}, is {delta:.0} seconds longer or shorter than this file: it may be a music video, a live or an edited version."
+        );
+    }
+    if top.variant_conflict {
+        return format!(
+            "The closest match, {found}, is a different version of the song than this file."
+        );
+    }
+    if top.artist_available && top.artist_similarity < 0.72 {
+        return format!("The closest match, {found}, is credited to other singers.");
+    }
+    if top.sources < 2 && !top.audio_recognition {
+        if top.candidate.duration_delta.is_none() {
+            return format!(
+                "Only {source} found {found}, and it gives no length to compare with this file."
+            );
+        }
+        return format!(
+            "Only {source} found {found}, and one source is not enough unless title, artist and length all match."
+        );
+    }
+    format!("The closest match, {found}, does not match the file closely enough.")
+}
+
+/// “Title” by Artist (Album), for Review messages.
+fn describe(candidate: &Candidate) -> String {
+    match meaningful_album(candidate.album.as_deref()) {
+        Some(album) => format!(
+            "“{}” by {} ({album})",
+            candidate.title.trim(),
+            candidate.artist.trim()
+        ),
+        None => format!(
+            "“{}” by {}",
+            candidate.title.trim(),
+            candidate.artist.trim()
+        ),
+    }
 }
 
 fn evaluate<'a>(
@@ -145,6 +259,15 @@ fn evaluate<'a>(
     let variants = version_tags(&candidate.title);
     let variant_conflict = variants != *expected_variants;
     let audio_recognition = has_audio_recognition(candidate);
+    let isrc_proof = evidence
+        .isrc
+        .zip(candidate.isrc.as_deref())
+        .is_some_and(|(file, found)| {
+            crate::domain::audio::normalize_isrc(found).is_some_and(|found| found == file)
+        })
+        && candidate
+            .duration_delta
+            .is_some_and(|delta| delta <= ISRC_PROOF_MAX_DURATION_GAP_SECONDS);
     let mut sources = source_count(candidate);
     let agreeing_providers = candidates
         .iter()
@@ -235,6 +358,7 @@ fn evaluate<'a>(
         + provider_trust(&candidate.provider)
         + (candidate.score.clamp(0.0, 100.0) * 0.08)
         + if audio_recognition { 15.0 } else { 0.0 }
+        + if isrc_proof { 15.0 } else { 0.0 }
         + if original_album { 4.0 } else { 0.0 }
         + variant_score
         + if candidate.is_compilation { -7.0 } else { 0.0 };
@@ -249,6 +373,7 @@ fn evaluate<'a>(
         artist_available: evidence.artist.is_some(),
         sources,
         audio_recognition,
+        isrc_proof,
         duration_close,
         album_similarity,
         variants,
@@ -261,6 +386,11 @@ fn evaluate<'a>(
 /// chosen automatically. Catalogs searched with the same tags agreeing with
 /// each other says nothing about the audio itself (a wrongly tagged file).
 const MAX_AUTOMATIC_DURATION_GAP_SECONDS: f64 = 15.0;
+
+/// An ISRC names a recording, but a download can still be another cut of it
+/// (a music video, a radio edit). The same code only proves the song when the
+/// lengths agree too (BLUEPRINT rule: proof with lengths within 3 s).
+const ISRC_PROOF_MAX_DURATION_GAP_SECONDS: f64 = 3.0;
 
 fn is_supported(candidate: &Evaluated<'_>) -> bool {
     if candidate
@@ -295,9 +425,10 @@ fn is_supported(candidate: &Evaluated<'_>) -> bool {
         && (!candidate.artist_available || candidate.artist_similarity >= 0.65);
     let catalog_exact = credible_catalog && exact_text && candidate.duration_close;
     let weak_raw_score = candidate.candidate.score < 55.0;
+    let proven = candidate.audio_recognition || candidate.isrc_proof;
 
-    (recognized || corroborated || catalog_exact)
-        && !(weak_raw_score && !candidate.audio_recognition && candidate.sources < 2)
+    (recognized || candidate.isrc_proof || corroborated || catalog_exact)
+        && !(weak_raw_score && !proven && candidate.sources < 2)
         && !candidate.variant_conflict
 }
 
@@ -311,12 +442,33 @@ fn same_recording(left: &Evaluated<'_>, right: &Evaluated<'_>) -> bool {
     {
         return true;
     }
-    left.variants == right.variants
-        && title_similarity(&left.candidate.title, &right.candidate.title) >= 0.90
-        && artist_similarity(&left.candidate.artist, &right.candidate.artist).max(
-            versions::artists_similarity(&left.candidate.artist, &right.candidate.artist),
-        ) >= 0.82
+    if left.variants != right.variants
+        || title_similarity(&left.candidate.title, &right.candidate.title) < 0.90
+    {
+        return false;
+    }
+    if artist_similarity(&left.candidate.artist, &right.candidate.artist).max(
+        versions::artists_similarity(&left.candidate.artist, &right.candidate.artist),
+    ) >= 0.82
+    {
+        return true;
+    }
+    // One store credits only some of the singers ("54 Ultra" for "ANOTR feat.
+    // 54 Ultra"). With the same title and both lengths matching the file, it is
+    // the same song listed with a shorter credit, not a rival recording.
+    let matches_file = |candidate: &Candidate| {
+        candidate
+            .duration_delta
+            .is_some_and(|delta| delta <= SAME_SONG_MAX_DURATION_GAP_SECONDS)
+    };
+    matches_file(left.candidate)
+        && matches_file(right.candidate)
+        && versions::credit_within(&left.candidate.artist, &right.candidate.artist)
 }
+
+/// Two releases whose lengths are both this close to the file's are the same
+/// cut of the song (BLUEPRINT rule: proof with lengths within 3 s).
+const SAME_SONG_MAX_DURATION_GAP_SECONDS: f64 = 3.0;
 
 fn candidates_agree(left: &Candidate, right: &Candidate) -> bool {
     let left_variants = version_tags(&left.title);
@@ -510,6 +662,7 @@ mod tests {
             title: Some("In The End  (Mellen Gi & Tommee Profitt Remix)"),
             artist: Some("Linkin Park"),
             album: None,
+            isrc: None,
         };
         let candidates = vec![
             // Upload-site copies with the file's own wrong credit.
@@ -578,6 +731,7 @@ mod tests {
             title: Some("Some Song"),
             artist: Some("Some Artist"),
             album: None,
+            isrc: None,
         };
         let candidates = vec![performed(
             1,
@@ -597,6 +751,7 @@ mod tests {
             title: Some("Fly me to the moon"),
             artist: Some("The Macarons Project"),
             album: None,
+            isrc: None,
         };
         let candidates = vec![
             performed(
@@ -667,6 +822,7 @@ mod tests {
             title: Some("Male Man Bash"),
             artist: Some("Amir Tataloo feat. Sohrab MJ & Orchid"),
             album: None,
+            isrc: None,
         };
         let only_featured = vec![performed(
             1,
@@ -699,6 +855,7 @@ mod tests {
             title: Some("Perfect"),
             artist: Some("Ed Sheeran"),
             album: None,
+            isrc: None,
         };
         let mut wrong = Vec::new();
         for (id, provider) in [(1, "itunes"), (2, "deezer"), (3, "musicbrainz")] {
@@ -720,6 +877,7 @@ mod tests {
             title: Some("Perfect"),
             artist: Some("Ed Sheeran"),
             album: None,
+            isrc: None,
         };
         assert!(select(evidence, &wrong).is_some());
     }
@@ -744,6 +902,7 @@ mod tests {
                 title: Some("Perfect"),
                 artist: Some("Ed Sheeran"),
                 album: Some("Divide (Deluxe)"),
+                isrc: None,
             },
             &[duet, plain],
         )
@@ -774,6 +933,7 @@ mod tests {
                 title: Some("Kippe"),
                 artist: Some("ENNIO"),
                 album: None,
+                isrc: None,
             },
             &[stripped, album],
         )
@@ -794,6 +954,7 @@ mod tests {
                 title: Some("Perfect"),
                 artist: Some("Ed Sheeran"),
                 album: Some("Divide (Deluxe)"),
+                isrc: None,
             },
             &[wrong_album, right_album],
         )
@@ -829,6 +990,7 @@ mod tests {
                 title: Some("Khoroosh e Zendegi"),
                 artist: Some("Ebi"),
                 album: None,
+                isrc: None,
             },
             &[apple, incomplete],
         )
@@ -854,6 +1016,7 @@ mod tests {
                 title: Some("Perfect"),
                 artist: Some("Ed Sheeran"),
                 album: Some("Divide (Deluxe)"),
+                isrc: None,
             },
             &[incomplete, complete],
         )
@@ -874,6 +1037,7 @@ mod tests {
                     title: Some("Unknown"),
                     artist: Some("Unknown Artist"),
                     album: None,
+                    isrc: None,
                 },
                 &[weak],
             )
@@ -895,6 +1059,7 @@ mod tests {
                 title: None,
                 artist: None,
                 album: None,
+                isrc: None,
             },
             &[recognized],
         )
@@ -918,6 +1083,7 @@ mod tests {
                     title: Some("Halo"),
                     artist: None,
                     album: None,
+                    isrc: None,
                 },
                 &[first, second],
             )
@@ -928,5 +1094,188 @@ mod tests {
     #[test]
     fn ignores_filename_filler_words_when_ranking_title() {
         assert!(title_similarity("Such A Lonely Day", "Lonely Day") >= 0.94);
+    }
+
+    #[test]
+    fn a_store_that_lists_fewer_singers_is_not_a_rival_recording() {
+        // Real answers for "Talk To You" (Nov 2026): Apple Music credits only 54 Ultra,
+        // Deezer and MusicBrainz credit ANOTR feat. 54 Ultra. Same song, same length.
+        let evidence = || TrackEvidence {
+            filename: "ANOTR feat. 54 Ultra - Talk To You.mp3",
+            title: Some("Talk To You"),
+            artist: Some("ANOTR feat. 54 Ultra"),
+            album: Some("Talk To You (feat. 54 Ultra) - Single"),
+            isrc: None,
+        };
+        let mut apple = performed(
+            1,
+            "itunes",
+            "Talk To You",
+            "54 Ultra",
+            "Talk To You (feat. 54 Ultra) - Single",
+            2.1,
+        );
+        apple.score_breakdown =
+            Some(serde_json::json!({"sources":["Apple Music","Audiomack"]}).to_string());
+        apple.score = 90.0;
+        let deezer = performed(
+            2,
+            "deezer",
+            "Talk To You",
+            "ANOTR feat. 54 Ultra",
+            "Talk To You (ft. 54 Ultra)",
+            2.0,
+        );
+        let candidates = vec![apple.clone(), deezer.clone()];
+        let decision = rank(evidence(), &candidates).expect("one song, two listings");
+        assert_eq!(decision.alternates.len(), 1);
+
+        // With a length that does not match the file, a shorter credit stays a rival.
+        let mut far = deezer;
+        far.duration_delta = Some(7.0);
+        assert!(!same_recording(
+            &evaluate_all(&evidence(), &[apple.clone()])[0],
+            &evaluate_all(&evidence(), &[far])[0],
+        ));
+    }
+
+    #[test]
+    fn the_margin_is_kept_against_every_different_recording() {
+        // The runner-up is another release of the best match, but a different recording
+        // follows close behind: that one still has to be clearly beaten.
+        let evidence = TrackEvidence {
+            filename: "Halo.mp3",
+            title: Some("Halo"),
+            artist: None,
+            album: None,
+            isrc: None,
+        };
+        let mut first = candidate(1, "deezer", "Halo", "I Am... Sasha Fierce", 92.0);
+        first.artist = "Beyoncé".into();
+        let mut again = candidate(2, "itunes", "Halo", "Halo - Single", 91.5);
+        again.artist = "Beyoncé".into();
+        let mut other = candidate(3, "musicbrainz", "Halo", "Halo", 91.0);
+        other.artist = "LP".into();
+        other.score_breakdown =
+            Some(serde_json::json!({"sources":["MusicBrainz","Spotify"]}).to_string());
+        assert!(rank(evidence, &[first, again, other]).is_none());
+    }
+
+    #[test]
+    fn the_files_own_isrc_with_the_same_length_proves_the_song() {
+        let evidence = |isrc| TrackEvidence {
+            filename: "u7.mp3",
+            title: Some("Gheseh Eshgh"),
+            artist: Some("Ebi"),
+            album: None,
+            isrc,
+        };
+        // One source, a spelling the text rules call only "close", no second source.
+        let mut found = performed(1, "deezer", "Ghesseyeh Eshgh", "Ebi", "Koohe Yakh", 1.0);
+        found.isrc = Some("IR-AB1-08-00001".into());
+        assert!(rank(evidence(None), std::slice::from_ref(&found)).is_none());
+        let decision = rank(evidence(Some("IRAB10800001")), std::slice::from_ref(&found))
+            .expect("the code and the length agree");
+        assert!(decision.explanation.contains("same ISRC"));
+
+        // The same code on a cut 10 s longer (a music video) is not proof.
+        found.duration_delta = Some(10.0);
+        assert!(rank(evidence(Some("IRAB10800001")), &[found]).is_none());
+    }
+
+    #[test]
+    fn a_session_recording_is_another_version() {
+        let evidence = || TrackEvidence {
+            filename: "Marie.mp3",
+            title: Some("Marie"),
+            artist: Some("AnnenMayKantereit"),
+            album: None,
+            isrc: None,
+        };
+        let session = performed(
+            1,
+            "musicbrainz",
+            "Marie (Dach Session)",
+            "AnnenMayKantereit",
+            "Marie",
+            1.0,
+        );
+        assert!(rank(evidence(), &[session]).is_none());
+    }
+
+    #[test]
+    fn a_compilation_is_never_the_fallback_release() {
+        let evidence = TrackEvidence {
+            filename: "Ebi - Gheseh Eshgh.mp3",
+            title: Some("Gheseh Eshgh"),
+            artist: Some("Ebi"),
+            album: Some("Koohe Yakh"),
+            isrc: None,
+        };
+        let album = performed(1, "itunes", "Gheseh Eshgh", "Ebi", "Koohe Yakh", 0.3);
+        let single = performed(2, "deezer", "Gheseh Eshgh", "Ebi", "Gheseh Eshgh", 1.0);
+        let mut hits = performed(3, "deezer", "Gheseh Eshgh", "Ebi", "48 Golden Hits", 1.0);
+        hits.is_compilation = true;
+        let decision = rank(evidence, &[album, single, hits]).unwrap();
+        assert_eq!(decision.candidate_index, 0);
+        assert_eq!(decision.alternates, vec![1]);
+    }
+
+    #[test]
+    fn review_says_what_to_check_in_plain_words() {
+        // Genius gives no length: say so instead of "length differs".
+        let evidence = || TrackEvidence {
+            filename: "No Longer Slaves.mp3",
+            title: Some("No Longer Slaves"),
+            artist: Some("Bright Ones (Ft. Josie Buchanan & Peyton Allen)"),
+            album: Some("Bright Ones"),
+            isrc: None,
+        };
+        let mut genius = performed(
+            1,
+            "genius",
+            "No Longer Slaves",
+            "Bright Ones feat. Peyton Allen feat. Josie Buchanan",
+            "Bright Ones",
+            0.0,
+        );
+        genius.duration_delta = None;
+        let reason = unsure_reason(evidence(), &[genius]);
+        assert!(
+            reason.starts_with("Only Genius found “No Longer Slaves”")
+                && reason.contains("gives no length"),
+            "{reason}"
+        );
+
+        let longer = performed(
+            1,
+            "itunes",
+            "No Longer Slaves",
+            "Bright Ones",
+            "Bright Ones",
+            41.0,
+        );
+        let reason = unsure_reason(evidence(), &[longer]);
+        assert!(reason.contains("41 seconds longer or shorter"), "{reason}");
+
+        let two_sources = Some(serde_json::json!({"sources":["Deezer","Spotify"]}).to_string());
+        let mut first = candidate(1, "deezer", "Halo", "Halo", 92.0);
+        first.artist = "Beyoncé".into();
+        first.score_breakdown = two_sources.clone();
+        let mut second = candidate(2, "itunes", "Halo", "Halo", 91.0);
+        second.artist = "LP".into();
+        second.score_breakdown = two_sources;
+        let reason = unsure_reason(
+            TrackEvidence {
+                filename: "Halo.mp3",
+                title: Some("Halo"),
+                ..Default::default()
+            },
+            &[first, second],
+        );
+        assert!(
+            reason.starts_with("Two different recordings fit"),
+            "{reason}"
+        );
     }
 }

@@ -4,6 +4,7 @@ import type { Candidate, Track } from "../../api/types";
 import { Icon } from "../Icons";
 import { askConfirm, haptic, hasTelegramButtons } from "../telegram";
 import {
+  reviewExplanation,
   candidateChips,
   candidateSignals,
   candidateSources,
@@ -470,17 +471,18 @@ function Explanation({
         the song on Spotify, Shazam, Radio Javan or YouTube.
       </Callout>
     );
+  const why = reviewExplanation(track);
   if (track.candidates.length === 1)
     return (
       <Callout>
-        <b>One match, but not sure enough.</b> Check the album and year, then use it or edit the
-        tags.
+        <b>One match, but not sure enough.</b>{" "}
+        {why ?? "Check the album and year, then use it or edit the tags."}
       </Callout>
     );
   return (
     <Callout>
-      <b>{track.candidates.length} releases match this recording.</b> Pick the one you want in your
-      library. The first is the best guess.
+      <b>Not sure which one this is.</b> {why ? `${why} ` : ""}Pick the right one; the first is the
+      best guess.
     </Callout>
   );
 }

@@ -307,18 +307,39 @@ values through the same route.
 | Agreement between sources | up to +15 |
 | Source trust | 0–5 |
 | Recognised by audio | +15 |
+| The file's own ISRC, length within 3 s | +15 |
 | Original album year | +4 |
 | Version tags (live/remix/acoustic/…) | −22 per unexpected, −16 per missing |
 | Compilation | −7 |
 
 A candidate is approved automatically only when:
 
-- it is *supported*: recognised by audio, confirmed by ≥2 sources, or an exact catalog match
-  (credible source, ≥0.90 title / ≥0.82 artist similarity, close duration);
-- its total is ≥ 68 and no *different* recording is within 12 points;
-- its version tags match the file's, and its length is at most 15 s off the audio.
+- it is *supported*: recognised by audio, carrying the file's own ISRC with a length within 3 s,
+  confirmed by ≥2 sources, or an exact catalog match (credible source, ≥0.90 title / ≥0.82
+  artist similarity, close duration);
+- its total is ≥ 68 and no *different* recording is within 12 points. Every supported candidate
+  below the best is checked, not only the runner-up. Releases of the *same* recording are not
+  rivals: same ISRC; or same version tags and ≥0.90 title, plus either ≥0.82 artist similarity
+  or one credit naming only some of the other's singers ("54 Ultra" within "ANOTR feat. 54
+  Ultra") with both lengths within 3 s of the file;
+- its version tags match the file's (`session` counts as a version, so "Marie (Dach Session)" is
+  not "Marie"), and its length is at most 15 s off the audio.
 
-Everything else stays in Review with a reason.
+**Recording first, release second** (`scan::process::decide`). The chosen release is completed and
+needs title, artist, album and a verified cover. Without them, up to 3 other releases of the
+same recording that pass the same checks are tried, best first; compilations are never used for
+this. If none is complete, the song waits in Review.
+
+**Listening as a tie-breaker.** When the text sources cannot decide (no approval, or no complete
+release) and SongRec has not listened yet, `identify` runs again with `Listen::Always`: SongRec
+recognises the audio and its result is looked up in the catalogs. The text answers come from
+`provider_cache`, so the second pass costs one recognition.
+
+Everything else stays in Review with a reason in plain words (`smart_approval::unsure_reason`):
+two different recordings fit equally well, the closest match is N seconds longer or shorter, is
+another version, is credited to other singers, or only one source found it (and whether that
+source gave a length at all). The Review screen shows this text. A release without a length
+(Genius) shows "Not known" for length, not "different".
 
 **Titles and artists** are compared the same way in the per-source score and here
 (`domain::versions`):
@@ -354,9 +375,12 @@ cheap and free ones first:
    **Navahang** — free
    catalogs, good for Persian and international music.
 5. **Genius**, only when the results still lack details.
-6. **SongRec** (Shazam recognition), only when AcoustID found nothing and no candidate scores
-   ≥ 90; at most two at a time. Its artist/title is fed back through the catalogs of step 3–5.
-7. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
+6. **Deezer by ISRC** (`track/isrc:…`, free), when the file has an ISRC tag and no source
+   returned that code yet. Finds songs whose names are spelled differently in the catalogs.
+7. **SongRec** (Shazam recognition), when AcoustID found nothing and no candidate scores ≥ 90,
+   or on the second pass when the text sources could not decide (§9); at most two at a time.
+   Its artist/title is fed back through the catalogs of step 3–5.
+8. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
    service is used.
 
 Free without a key: MusicBrainz, Apple Music, Deezer, Radio Javan, Audiomack, Navahang, Genius,

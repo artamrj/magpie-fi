@@ -12,9 +12,7 @@ pub(super) use crate::{
     },
     domain::{
         audio,
-        matcher::{
-            artist_similarity, normalize_match_key, text_close, text_similarity, title_similarity,
-        },
+        matcher::{artist_similarity, normalize_match_key, text_close, title_similarity},
         provider_name,
     },
     infrastructure::{
@@ -621,6 +619,7 @@ mod tests {
             album_artist: Some("Current album artist".into()),
             track_number: Some(7),
             genre: Some("Rock".into()),
+            isrc: None,
             duration: 181.4,
             bitrate: Some(320),
             format: "mp3".into(),
@@ -859,6 +858,7 @@ mod tests {
                 title: Some("Out of Time"),
                 artist: Some("The Weeknd"),
                 album: Some("Dawn FM"),
+                isrc: None,
             },
             &candidates,
         )

@@ -42,7 +42,7 @@ export function candidateSignals(track: Track, candidate: Candidate) {
     comparisonSignal("Title", track.current_title, candidate.title, evidence.title),
     comparisonSignal("Artist", track.current_artist, candidate.artist, evidence.artist),
     comparisonSignal("Album", track.current_album, candidate.album, evidence.album_context),
-    durationSignal(evidence.duration),
+    durationSignal(candidate, evidence.duration),
   ];
 }
 
@@ -66,12 +66,21 @@ function comparisonSignal(
   return { label, value: "Mismatch", tone: "warning" };
 }
 
-function durationSignal(rawSimilarity?: unknown) {
-  if (typeof rawSimilarity !== "number")
-    return { label: "Audio length", value: "Not checked", tone: "muted" };
-  if (rawSimilarity >= 0.9) return { label: "Audio length", value: "Same", tone: "good" };
-  if (rawSimilarity >= 0.55) return { label: "Audio length", value: "Close", tone: "good" };
-  return { label: "Audio length", value: "Different", tone: "warning" };
+/**
+ * How the release's length compares with the file. A source that gives no length (Genius,
+ * some Audiomack pages) is "not known", not "different": nothing was compared.
+ */
+function durationSignal(candidate: Candidate, rawSimilarity?: unknown) {
+  const label = "Audio length";
+  // Only scored matches carry a length difference; a pasted link was never compared.
+  if (typeof rawSimilarity !== "number") return { label, value: "Not checked", tone: "muted" };
+  const delta = candidate.duration_delta;
+  if (typeof delta !== "number" || !Number.isFinite(delta))
+    return { label, value: "Not known", tone: "muted" };
+  const seconds = Math.round(delta);
+  if (delta <= 3) return { label, value: "Same", tone: "good" };
+  if (delta <= 8) return { label, value: `Close, ${seconds} s off`, tone: "good" };
+  return { label, value: `${seconds} s longer or shorter`, tone: "warning" };
 }
 
 function normalizeText(value: string) {
@@ -206,13 +215,36 @@ export function needsCover(track: Track) {
   return Boolean(candidate && candidate.artwork_status !== "verified");
 }
 
+/**
+ * The scan's own explanation of why a song waits in Review, when it is one written for people
+ * (older scans stored technical notes, which are left out).
+ */
+export function reviewExplanation(track: Track) {
+  const message = track.stage_message?.trim();
+  if (!message || isPossibleDuplicate(track)) return undefined;
+  const plain = [
+    "Two different recordings",
+    "The best match",
+    "The closest match",
+    "Only ",
+    "The song was recognized",
+    "No source found",
+  ];
+  return plain.some((start) => message.startsWith(start)) ? message : undefined;
+}
+
 /** The one-line reason a song waits in Review. */
 export function reviewReason(track: Track) {
   if (isPossibleDuplicate(track)) return "Maybe already in your library";
   if (hasRetryableArtwork(track)) return "Cover download failed";
   if (needsCover(track)) return "Needs a cover";
+  const message = track.stage_message ?? "";
+  if (message.startsWith("The song was recognized")) return "No cover for this release";
+  if (message.startsWith("Two different recordings")) return "Two recordings fit";
+  if (message.startsWith("Only ")) return "Only one source found it";
+  if (/seconds longer or shorter/.test(message)) return "Length differs";
   const count = track.candidates.length;
-  if (count > 1) return `${count} releases match`;
+  if (count > 1) return `${count} possible matches`;
   if (count === 1) return "One match, not sure";
   return "Nothing recognized it";
 }

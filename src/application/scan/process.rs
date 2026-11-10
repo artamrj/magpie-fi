@@ -141,146 +141,204 @@ pub(crate) async fn process(
         }
     };
     let cfg = &state.config;
-    let mut candidates = identify(
-        state,
-        cfg,
-        limits,
-        path,
-        FingerprintEvidence {
-            value: &fp,
-            duration,
-        },
-        &info,
-        filename,
-    )
-    .await?;
-    let raw_candidate_count = candidates.len();
-    dedupe_candidates(&mut candidates);
-    sort_candidates_for_decision(&mut candidates);
-    tracing::info!(
-        file,
-        raw = raw_candidate_count,
-        usable = candidates.len(),
-        "providers returned candidates"
-    );
-    let Some(best) = candidates.first() else {
-        let fingerprint_note = if fp.is_empty() {
-            " Fingerprint creation failed; install Chromaprint (fpcalc) to identify difficult tracks."
-        } else if cfg.acoustid_key.is_empty() {
-            " A fingerprint was created, but online fingerprint lookup needs an AcoustID API key."
-        } else {
-            ""
-        };
-        let message = format!(
-            "No catalog match from Apple Music, Deezer, MusicBrainz, or the enabled optional sources.{fingerprint_note}"
-        );
-        persist_unmatched(&state.pool, path, &info, &message).await?;
-        tracing::warn!(file, "{message}");
-        return Ok(ProcessOutcome::NeedsReview);
-    };
-    let smart_decision = crate::application::smart_approval::rank(
-        crate::application::smart_approval::TrackEvidence {
+    // Text sources first; SongRec listens only when they are not sure. If the
+    // text alone still cannot decide, listen once more before asking a person:
+    // the audio settles most "which of these is it?" questions.
+    let mut listen = Listen::WhenUnsure;
+    loop {
+        let identified = identify(
+            state,
+            cfg,
+            limits,
+            path,
+            FingerprintEvidence {
+                value: &fp,
+                duration,
+            },
+            &info,
             filename,
-            title: info.title.as_deref(),
-            artist: info.artist.as_deref(),
-            album: info.album.as_deref(),
-        },
-        &candidates,
-    );
-    let Some(smart_decision) = smart_decision else {
-        let message = if best.score >= 40.0 {
-            let mut source_names = candidates
-                .iter()
-                .flat_map(candidate_source_list)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            source_names.sort();
-            let sources = source_names.join(", ");
-            let title_match = info
-                .title
-                .as_deref()
-                .is_some_and(|title| title_similarity(title, &best.title) >= 0.94);
-            let artist_match = info
-                .artist
-                .as_deref()
-                .is_some_and(|artist| artist_similarity(artist, &best.artist) >= 0.75);
-            match (
-                candidates.len(),
-                info.album.as_deref(),
-                best.album.as_deref(),
-            ) {
-                _ if title_match
-                    && artist_match
-                    && best.duration_delta.is_some_and(|delta| delta > 15.0) =>
-                {
-                    format!(
-                        "Found matching catalog metadata, but this audio is {:.0} seconds longer or shorter; it may be a music-video, live, or edited version. Review before applying it.",
-                        best.duration_delta.unwrap_or_default()
-                    )
-                }
-                _ if title_match && !artist_match => format!(
-                    "Found this title in {sources}, but only by different performers; keep the current artist or enter this performance manually."
-                ),
-                (1, Some(existing), Some(found)) if text_similarity(existing, found) < 0.65 => {
-                    format!(
-                        "Found one close match from {sources}, but its album “{found}” conflicts with the existing album “{existing}”; review before applying it."
-                    )
-                }
-                _ => format!(
-                    "Found {} possible release(s) from {sources}, but the release is ambiguous; choose the correct one.",
-                    candidates.len()
-                ),
-            }
-        } else {
-            "No candidate met strict matching rules; counted as unmatched".to_owned()
-        };
-        if best.score >= 40.0 {
-            persist_review(&state.pool, path, &info, &candidates, &message).await?;
-        } else {
-            persist_unmatched(&state.pool, path, &info, &message).await?;
-        }
-        tracing::warn!(file, "{message}");
-        return Ok(ProcessOutcome::NeedsReview);
-    };
-    let mut candidate = candidates[smart_decision.candidate_index].clone();
-    let completion = crate::application::finalize_selection(
-        state,
-        &mut candidate,
-        Some(crate::application::Donors {
-            candidates: &candidates,
-            existing_album: info.album.as_deref(),
-        }),
-        Some(crate::application::FileTags {
-            artist: info.artist.as_deref(),
-            title: info.title.as_deref(),
-        }),
-    )
-    .await?;
-    if !completion.core_complete {
-        candidates[smart_decision.candidate_index] = candidate;
-        candidates.swap(0, smart_decision.candidate_index);
-        let message = format!(
-            "A recording match was found, but the metadata worker could not find {}. It remains in review instead of creating an incomplete identification.",
-            completion.missing_fields.join(", ")
+            listen,
+        )
+        .await?;
+        let can_listen_again = !identified.listened
+            && listen == Listen::WhenUnsure
+            && infra_providers::songrec::available();
+        let mut candidates = identified.candidates;
+        let raw_candidate_count = candidates.len();
+        dedupe_candidates(&mut candidates);
+        sort_candidates_for_decision(&mut candidates);
+        tracing::info!(
+            file,
+            raw = raw_candidate_count,
+            usable = candidates.len(),
+            listened = identified.listened,
+            "providers returned candidates"
         );
-        persist_review(&state.pool, path, &info, &candidates, &message).await?;
-        tracing::warn!(file, "{message}");
-        return Ok(ProcessOutcome::NeedsReview);
+        let outcome = decide(state, &info, filename, &candidates).await?;
+        if !matches!(outcome, Decided::Filed { .. }) && can_listen_again {
+            tracing::info!(
+                file,
+                "the text sources could not decide; listening to the audio"
+            );
+            listen = Listen::Always;
+            continue;
+        }
+        return match outcome {
+            Decided::Filed { candidate, message } => {
+                tracing::info!(
+                    file,
+                    score = candidate.score.round(),
+                    artist = candidate.artist,
+                    title = candidate.title,
+                    "selected a match"
+                );
+                persist_match(&state.pool, path, &info, &candidate, &message).await?;
+                Ok(ProcessOutcome::Matched)
+            }
+            Decided::NothingFound => {
+                let fingerprint_note = if fp.is_empty() {
+                    " Fingerprint creation failed; install Chromaprint (fpcalc) to identify difficult tracks."
+                } else if cfg.acoustid_key.is_empty() {
+                    " A fingerprint was created, but online fingerprint lookup needs an AcoustID API key."
+                } else {
+                    ""
+                };
+                let message = format!(
+                    "No catalog match from Apple Music, Deezer, MusicBrainz, or the enabled optional sources.{fingerprint_note}"
+                );
+                persist_unmatched(&state.pool, path, &info, &message).await?;
+                tracing::warn!(file, "{message}");
+                Ok(ProcessOutcome::NeedsReview)
+            }
+            Decided::Unsure { reason } => {
+                if candidates[0].score >= 40.0 {
+                    persist_review(&state.pool, path, &info, &candidates, &reason).await?;
+                } else {
+                    persist_unmatched(
+                        &state.pool,
+                        path,
+                        &info,
+                        "No candidate met strict matching rules; counted as unmatched",
+                    )
+                    .await?;
+                }
+                tracing::warn!(file, "{reason}");
+                Ok(ProcessOutcome::NeedsReview)
+            }
+            Decided::Incomplete {
+                index,
+                candidate,
+                missing,
+            } => {
+                candidates[index] = candidate;
+                candidates.swap(0, index);
+                let message = format!(
+                    "The song was recognized, but no {} was found for this release, so it waits here instead of being filed incomplete.",
+                    missing.join(" or ")
+                );
+                persist_review(&state.pool, path, &info, &candidates, &message).await?;
+                tracing::warn!(file, "{message}");
+                Ok(ProcessOutcome::NeedsReview)
+            }
+        };
     }
-    let selection_message = format!(
-        "Smart auto-selected ({:.0}%): {}; {}",
-        smart_decision.confidence,
-        smart_decision.explanation,
-        completion.summary()
+}
+
+/// How many other releases of the same recording are tried when the chosen
+/// one has no verified cover. Each try may download covers.
+const MAX_ALTERNATE_RELEASES: usize = 3;
+
+enum Decided {
+    Filed {
+        candidate: infra_providers::Candidate,
+        message: String,
+    },
+    NothingFound,
+    Unsure {
+        reason: String,
+    },
+    /// The recording is known, but no release of it has everything filing needs.
+    Incomplete {
+        index: usize,
+        candidate: infra_providers::Candidate,
+        missing: Vec<String>,
+    },
+}
+
+/// Picks the recording, then the first of its releases that can be filed
+/// complete (title, artist, album, verified cover).
+async fn decide(
+    state: &Arc<AppState>,
+    info: &audio::AudioInfo,
+    filename: &str,
+    candidates: &[infra_providers::Candidate],
+) -> Result<Decided> {
+    if candidates.is_empty() {
+        return Ok(Decided::NothingFound);
+    }
+    let evidence = || crate::application::smart_approval::TrackEvidence {
+        filename,
+        title: info.title.as_deref(),
+        artist: info.artist.as_deref(),
+        album: info.album.as_deref(),
+        isrc: info.isrc.as_deref(),
+    };
+    let Some(ranked) = crate::application::smart_approval::rank(evidence(), candidates) else {
+        return Ok(Decided::Unsure {
+            reason: crate::application::smart_approval::unsure_reason(evidence(), candidates),
+        });
+    };
+    let mut first_incomplete = None;
+    let releases = std::iter::once(ranked.candidate_index).chain(
+        ranked
+            .alternates
+            .iter()
+            .copied()
+            .take(MAX_ALTERNATE_RELEASES),
     );
-    tracing::info!(
-        file,
-        score = candidate.score.round(),
-        artist = candidate.artist,
-        title = candidate.title,
-        "selected a match"
-    );
-    persist_match(&state.pool, path, &info, &candidate, &selection_message).await?;
-    Ok(ProcessOutcome::Matched)
+    for index in releases {
+        let mut candidate = candidates[index].clone();
+        let completion = crate::application::finalize_selection(
+            state,
+            &mut candidate,
+            Some(crate::application::Donors {
+                candidates,
+                existing_album: info.album.as_deref(),
+            }),
+            Some(crate::application::FileTags {
+                artist: info.artist.as_deref(),
+                title: info.title.as_deref(),
+            }),
+        )
+        .await?;
+        if completion.core_complete {
+            let fallback = if index == ranked.candidate_index {
+                ""
+            } else {
+                "; the best release had no usable cover, so another release of the same song was used"
+            };
+            let message = format!(
+                "Smart auto-selected ({:.0}%): {}{fallback}; {}",
+                ranked.confidence,
+                ranked.explanation,
+                completion.summary()
+            );
+            return Ok(Decided::Filed { candidate, message });
+        }
+        if first_incomplete.is_none() {
+            let missing = completion
+                .missing_fields
+                .iter()
+                .filter(|field| matches!(field.as_str(), "title" | "artist" | "album" | "cover"))
+                .cloned()
+                .collect();
+            first_incomplete = Some((index, candidate, missing));
+        }
+    }
+    let (index, candidate, missing) = first_incomplete.expect("the chosen release is always tried");
+    Ok(Decided::Incomplete {
+        index,
+        candidate,
+        missing,
+    })
 }

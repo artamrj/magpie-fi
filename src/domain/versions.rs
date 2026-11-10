@@ -15,6 +15,8 @@ pub fn version_tags(value: &str) -> BTreeSet<&'static str> {
         ("live", &["live"] as &[&str]),
         ("remix", &["remix", "mix"] as &[&str]),
         ("acoustic", &["acoustic", "unplugged"] as &[&str]),
+        // A studio or rooftop session ("Marie (Dach Session)") is its own performance.
+        ("session", &["session", "sessions"] as &[&str]),
         ("instrumental", &["instrumental"] as &[&str]),
         ("karaoke", &["karaoke"] as &[&str]),
         ("demo", &["demo"] as &[&str]),
@@ -197,6 +199,24 @@ pub fn artists_similarity(left: &str, right: &str) -> f64 {
     } else {
         direct
     }
+}
+
+/// Every person the shorter credit names is also in the longer one: "54 Ultra"
+/// is within "ANOTR feat. 54 Ultra". Stores often list only some of a song's
+/// singers; that alone does not make it another recording.
+pub fn credit_within(left: &str, right: &str) -> bool {
+    let (left_names, right_names) = (split_names(left), split_names(right));
+    let (shorter, longer) = if left_names.len() <= right_names.len() {
+        (left_names, right_names)
+    } else {
+        (right_names, left_names)
+    };
+    !shorter.is_empty()
+        && shorter.iter().all(|name| {
+            longer
+                .iter()
+                .any(|other| artist_similarity(name, other) >= 0.9)
+        })
 }
 
 pub fn credited_artist_similarity(

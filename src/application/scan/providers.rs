@@ -1,5 +1,21 @@
 use super::*;
 
+/// When SongRec (Shazam) listens to the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Listen {
+    /// Only when no fingerprint match and no strong text match was found.
+    WhenUnsure,
+    /// Always: the text sources were asked and could not decide.
+    Always,
+}
+
+pub(crate) struct Identified {
+    pub(crate) candidates: Vec<infra_providers::Candidate>,
+    /// SongRec was asked (it may still have recognized nothing).
+    pub(crate) listened: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn identify(
     state: &Arc<AppState>,
     cfg: &crate::config::Config,
@@ -8,7 +24,8 @@ pub(crate) async fn identify(
     fingerprint: FingerprintEvidence<'_>,
     current: &audio::AudioInfo,
     filename: &str,
-) -> Result<Vec<infra_providers::Candidate>> {
+    listen: Listen,
+) -> Result<Identified> {
     let mut out = match query_musicbrainz_acoustid(
         state,
         cfg,
@@ -44,9 +61,15 @@ pub(crate) async fn identify(
     if needs_genius_enrichment(&out) {
         out.extend(query_genius(state, limits, current, filename).await);
     }
+    out.extend(query_deezer_isrc(state, limits, current, filename, &out).await);
     let has_strong_free_candidate = out.iter().any(|candidate| candidate.score >= 90.0);
     let mut recognized_info = None;
-    if !acoustid_matched && !has_strong_free_candidate && infra_providers::songrec::available() {
+    let listened = infra_providers::songrec::available()
+        && match listen {
+            Listen::WhenUnsure => !acoustid_matched && !has_strong_free_candidate,
+            Listen::Always => true,
+        };
+    if listened {
         let songrec_candidates =
             query_songrec(state, limits, path, fingerprint.value, filename).await;
         if let Some(recognized) = songrec_candidates.first() {
@@ -100,7 +123,55 @@ pub(crate) async fn identify(
             "no enabled metadata source returned candidates"
         );
     }
-    Ok(out)
+    Ok(Identified {
+        candidates: out,
+        listened,
+    })
+}
+
+/// Looks the file's own ISRC up on Deezer (free, no key), unless a source
+/// already returned that code. Text searches miss songs whose names are
+/// spelled differently (Persian transliterations); the code does not.
+pub(crate) async fn query_deezer_isrc(
+    state: &Arc<AppState>,
+    limits: &PipelineLimits,
+    current: &audio::AudioInfo,
+    filename: &str,
+    found: &[infra_providers::Candidate],
+) -> Vec<infra_providers::Candidate> {
+    let Some(isrc) = current.isrc.as_deref() else {
+        return Vec::new();
+    };
+    let already_found = found.iter().any(|candidate| {
+        candidate
+            .isrc
+            .as_deref()
+            .and_then(audio::normalize_isrc)
+            .is_some_and(|found| found == isrc)
+    });
+    if already_found || provider_disabled(limits, "deezer").await {
+        return Vec::new();
+    }
+    let started = Instant::now();
+    match infra_providers::deezer::lookup_isrc(&state.pool, &state.client, isrc).await {
+        Ok(found) => {
+            let mut out = Vec::new();
+            if let Some(mut candidate) = found {
+                match score_text_candidate(&mut candidate, current, "deezer_isrc_lookup") {
+                    Ok(()) => out.push(candidate),
+                    Err(error) => {
+                        tracing::warn!(file = filename, "could not score the ISRC match: {error:#}")
+                    }
+                }
+            }
+            log_provider_count(filename, "deezer_isrc", out.len(), started);
+            out
+        }
+        Err(error) => {
+            handle_provider_error(limits, filename, "deezer", error).await;
+            Vec::new()
+        }
+    }
 }
 
 pub(crate) fn sort_candidates_for_decision(candidates: &mut [infra_providers::Candidate]) {

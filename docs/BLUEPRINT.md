@@ -212,16 +212,23 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   repaired), a Chromaprint fingerprint, or SHA-256 when fingerprinting fails.
 - **Evidence from a link.** A download carries the link's title, artist, album and ISRC as tags,
   so it is usually identified without questions — but still checked against length and sound.
+  The ISRC tag of any file (from a link, a store or a ripper) is read back: a source with the
+  same code and a length within 3 s is proof, and Deezer is asked for the code directly.
 - **Only free sources, cheap first.** AcoustID (by fingerprint) and MusicBrainz; YouTube (video
   ID in the filename); Apple Music, Deezer and the Persian catalogs Radio Javan, Audiomack and
-  Navahang; Genius; SongRec (Shazam) for audio recognition when nothing else matched; SoundCloud,
+  Navahang; Genius; SongRec (Shazam) for audio recognition when nothing else matched or the text
+  sources could not decide; SoundCloud,
   Discogs and Last.fm. Sources that need a (free) key are off without it. Cover Art Archive
   supplies covers, Wikidata artist genres, LRCLIB lyrics.
 - **Smart approval.** Every candidate gets a weighted score (title, artist, length, album,
   completeness, agreement between sources, audio recognition, version tags). Automatic only when
-  the best one is supported (recognised by audio, confirmed by two sources, or an exact catalog
-  match), scores ≥ 68, has no different recording within 12 points, has the same version tags
-  (live, remix, …) and is at most 15 s off the audio's length.
+  the best one is supported (recognised by audio, the file's own ISRC with the same length,
+  confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
+  within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
+  the audio's length. Other releases of the same recording (the single and the album, a store
+  that lists fewer singers with the same length) are not rivals. When the chosen release has no
+  cover, another release of the same recording is tried (never a compilation). Review says in
+  plain words what is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
   existing values are never replaced.
 - **The file decides who is the main singer.** Sources disagree about duets and featured
