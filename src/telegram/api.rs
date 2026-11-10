@@ -1,11 +1,11 @@
-//! A small Telegram Bot API client: frankenstein's typed parameters and
-//! results, sent with magpie-fi's own HTTP client.
+//! A small Telegram Bot API client: JSON parameters and our own result types
+//! (`types.rs`), sent with magpie-fi's own HTTP client.
 //!
 //! Bot API URLs contain the bot token, so every HTTP error drops its URL
 //! before it can reach a log, the database or a message.
 
+use super::types::{File, Response};
 use anyhow::{Context, Result, bail};
-use frankenstein::response::{ErrorResponse, MethodResponse};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, time::Duration};
 
@@ -93,18 +93,20 @@ impl Bot {
                 .bytes()
                 .await
                 .map_err(reqwest::Error::without_url)?;
-            if let Ok(ok) = serde_json::from_slice::<MethodResponse<R>>(&body) {
-                return Ok(ok.result);
-            }
-            let error: ErrorResponse = serde_json::from_slice(&body)
+            let answer: Response<R> = serde_json::from_slice(&body)
                 .with_context(|| format!("unexpected answer from Telegram for {method}"))?;
-            if let Some(wait) = error.parameters.as_ref().and_then(|p| p.retry_after) {
-                tokio::time::sleep(Duration::from_secs(u64::from(wait) + 1)).await;
+            if answer.ok
+                && let Some(result) = answer.result
+            {
+                return Ok(result);
+            }
+            if let Some(wait) = answer.parameters.and_then(|p| p.retry_after) {
+                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
                 continue;
             }
             return Err(TelegramError {
-                code: error.error_code,
-                description: error.description,
+                code: answer.error_code,
+                description: answer.description,
             }
             .into());
         }
@@ -129,7 +131,7 @@ impl Bot {
 
     /// Saves a file sent to the bot (at most [`DOWNLOAD_LIMIT`]).
     pub async fn download(&self, file_id: &str, target: &Path) -> Result<()> {
-        let file: frankenstein::types::File = match self
+        let file: File = match self
             .call("getFile", &serde_json::json!({"file_id": file_id}))
             .await
         {
