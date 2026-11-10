@@ -304,6 +304,11 @@ Everything else stays in Review with a reason.
 - Names credited in a title count as artists of the song: "In The End (Mellen Gi & Tommee
   Profitt Remix)" tagged *Linkin Park* matches "In the End (Mellen Gi Remix)" by *Tommee Profitt,
   Mellen Gi & Fleurie* (two shared names = full artist match, one = 0.85).
+- A match that names the file's featured singers but leaves out its main singer ("Sohrab MJ &
+  Orchid" for *Amir Tataloo feat. Sohrab MJ & Orchid*) scores at most 0.75 for the artist:
+  below the 0.82 of an exact match, so it needs the audio or a second source. Remixers named
+  in the title don't trigger this. When such a match is used, the main singer is put back
+  first (`credits::restore_missing_main`).
 - Two remix (live, acoustic…) titles match when the song and the remixer agree.
 - Artist lists are compared as sets of people: "A, B & C" = "A, C & B".
 - **Upload sites** (Audiomack, SoundCloud, YouTube) show what the uploader typed, often the same

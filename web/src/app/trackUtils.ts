@@ -252,12 +252,19 @@ export function candidateChips(track: Track, candidate: Candidate, rank: number)
     chips.push({ text: titleDifference(track.current_title, candidate.title), tone: "warn" });
   if (artist.tone === "warning") chips.push({ text: "Different artist", tone: "warn" });
   else {
-    // The same singers, but the source puts a featured one first: the file's main singer
-    // is kept first when the match is used, so say so instead of "different artist".
+    // The same singers, but the source puts a featured one first or leaves the main one out:
+    // the file's main singer is kept first when the match is used, so say so instead of
+    // "different artist".
     const fileMain = mainName(track.current_artist);
-    const matchMain = mainName(candidate.artist);
-    if (fileMain && matchMain && normalizeText(fileMain) !== normalizeText(matchMain))
-      chips.push({ text: `Lists ${matchMain} first`, tone: "warn" });
+    const matchNames = creditNames(candidate.artist);
+    const matchMain = matchNames[0] ?? "";
+    if (fileMain && matchMain && normalizeText(fileMain) !== normalizeText(matchMain)) {
+      const credited = matchNames.some((name) => normalizeText(name) === normalizeText(fileMain));
+      chips.push({
+        text: credited ? `Lists ${matchMain} first` : `Leaves out ${fileMain}`,
+        tone: "warn",
+      });
+    }
   }
   if (album.tone === "warning" && track.current_album)
     chips.push({ text: "Different album", tone: "warn" });
@@ -268,14 +275,18 @@ export function candidateChips(track: Track, candidate: Candidate, rank: number)
   return chips;
 }
 
-/** The first name in a credit: before feat., &, commas, x, and, و. */
+/** Every name in a credit, split at feat., &, commas, x, and, و. */
+function creditNames(value?: string) {
+  if (!value) return [];
+  return value
+    .split(/\s*(?:,|،|\s&\s|\sx\s|\sand\s|\sو\s|feat\.?\s|ft\.?\s|featuring\s|\/|;)\s*/i)
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+/** The first name in a credit. */
 function mainName(value?: string) {
-  if (!value) return "";
-  return (
-    value
-      .split(/\s*(?:,|،|\s&\s|\sx\s|\sand\s|\sو\s|feat\.?\s|ft\.?\s|featuring\s|\/|;)\s*/i)[0]
-      ?.trim() ?? ""
-  );
+  return creditNames(value)[0] ?? "";
 }
 
 function titleDifference(original?: string, proposed?: string) {

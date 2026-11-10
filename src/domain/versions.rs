@@ -220,12 +220,43 @@ pub fn credited_artist_similarity(
         .collect::<Vec<_>>();
     shared.sort();
     shared.dedup();
-    match shared.len() {
+    let similarity: f64 = match shared.len() {
         0 => 0.0,
         1 => 0.85,
         _ => 1.0,
+    };
+    if leaves_out_main_singer(file_artist, file_title, &performers) {
+        similarity.min(MAIN_SINGER_MISSING_SIMILARITY)
+    } else {
+        similarity
     }
 }
+
+/// A source that credits only the featured singers ("Sohrab MJ & Orchid" for a file tagged
+/// "Amir Tataloo feat. Sohrab MJ & Orchid") shares names with the file but leaves out its
+/// main singer. That is not an exact artist match: it needs the audio or a second source
+/// before a song is filed on its own. Remixers named in the title don't count: a remix is
+/// rightly credited to them, not to the original singer.
+fn leaves_out_main_singer(file_artist: &str, file_title: &str, performers: &[String]) -> bool {
+    let singers = super::credits::normalize_featured(file_artist, file_title)
+        .artists
+        .iter()
+        .flat_map(|credit| super::credits::loose_names(&credit.name))
+        .collect::<Vec<_>>();
+    let Some((main, featured)) = singers.split_first() else {
+        return false;
+    };
+    let credits = |name: &str| {
+        performers
+            .iter()
+            .any(|performer| artist_similarity(name, performer) >= 0.9)
+    };
+    !credits(main) && featured.iter().any(|name| credits(name))
+}
+
+/// Below the 0.82 an exact title-and-artist match needs, at or above the 0.72 that audio
+/// recognition or two agreeing sources need (see `smart_approval::is_supported`).
+const MAIN_SINGER_MISSING_SIMILARITY: f64 = 0.75;
 
 fn normalized_text(value: &str) -> String {
     value

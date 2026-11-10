@@ -226,17 +226,74 @@ pub fn main_name(artist: &str, title: &str) -> Option<String> {
     (!first.is_empty()).then_some(first)
 }
 
+/// Separators sources use between co-singers inside one credit.
+const LOOSE_SEPARATORS: [&str; 9] = [
+    ", ", "، ", " & ", " x ", " and ", " و ", " vs ", " vs. ", " with ",
+];
+
+/// The earliest loose separator in `value`: (byte index, separator length).
+fn next_loose_separator(value: &str) -> Option<(usize, usize)> {
+    // ASCII lowercasing keeps byte positions, so the index is valid in `value` too.
+    let lower = value.to_ascii_lowercase();
+    LOOSE_SEPARATORS
+        .iter()
+        .filter_map(|separator| lower.find(separator).map(|index| (index, separator.len())))
+        .min_by_key(|(index, _)| *index)
+}
+
 fn loose_first_name(value: &str) -> String {
-    let lower = value.to_lowercase();
-    let mut end = value.len();
-    for separator in [
-        ", ", "، ", " & ", " x ", " and ", " و ", " vs ", " vs. ", " with ",
-    ] {
-        if let Some(index) = lower.find(separator) {
-            end = end.min(index);
-        }
-    }
+    let end = next_loose_separator(value).map_or(value.len(), |(index, _)| index);
     clean_text(&value[..end])
+}
+
+/// Every person in one credit, split at the loose separators too:
+/// "Sohrab MJ & Orchid" → Sohrab MJ, Orchid.
+pub fn loose_names(value: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = value;
+    while let Some((index, length)) = next_loose_separator(rest) {
+        names.push(clean_text(&rest[..index]));
+        rest = &rest[index + length..];
+    }
+    names.push(clean_text(rest));
+    names.retain(|name| !name.is_empty());
+    names
+}
+
+/// Puts the file's main singer back when a source credits only the featured singers
+/// ("Sohrab MJ & Orchid" for a file tagged "Amir Tataloo feat. Sohrab MJ & Orchid"). Only
+/// when every name the source gives is also in the file, so a match by someone else, or the
+/// same singers written in another script, is left alone. Returns whether anything changed.
+pub fn restore_missing_main(
+    mut artists: Vec<ArtistCredit>,
+    main: &str,
+    file_artist: &str,
+    file_title: &str,
+) -> (Vec<ArtistCredit>, bool) {
+    let match_names = artists
+        .iter()
+        .flat_map(|credit| loose_names(&credit.name))
+        .collect::<Vec<_>>();
+    if match_names.is_empty() || match_names.iter().any(|name| same_name(name, main)) {
+        return (artists, false);
+    }
+    let file_names = normalize_featured(file_artist, file_title)
+        .artists
+        .iter()
+        .flat_map(|credit| loose_names(&credit.name))
+        .filter(|name| !same_name(name, main))
+        .collect::<Vec<_>>();
+    let all_in_file = match_names
+        .iter()
+        .all(|name| file_names.iter().any(|other| same_name(other, name)));
+    if !all_in_file {
+        return (artists, false);
+    }
+    artists.insert(0, ArtistCredit::new(main, " feat. "));
+    if let Some(last) = artists.last_mut() {
+        last.join_phrase.clear();
+    }
+    (artists, true)
 }
 
 /// Puts the song's main singer first when a source listed them after a featured artist
@@ -364,6 +421,27 @@ mod tests {
         assert!(!keep_main_first(same, "Tqvis").1);
         let other = normalize_featured("Maria", "").artists;
         assert!(!keep_main_first(other, "Tqvis").1);
+    }
+
+    #[test]
+    fn a_main_singer_the_source_left_out_is_put_back() {
+        let file = "Amir Tataloo feat. Sohrab MJ & Orchid";
+        let source = normalize_featured("Sohrab MJ & Orchid", "Male Man Bash").artists;
+        let (fixed, restored) = restore_missing_main(source, "Amir Tataloo", file, "Male Man Bash");
+        assert!(restored);
+        assert_eq!(
+            display_artist(&fixed),
+            "Amir Tataloo feat. Sohrab MJ & Orchid"
+        );
+        // The main singer is already there: nothing is added twice.
+        let source = normalize_featured("Sohrab MJ & Amir Tataloo", "").artists;
+        assert!(!restore_missing_main(source, "Amir Tataloo", file, "Male Man Bash").1);
+        // A name the file doesn't have means another credit or another script: left alone.
+        let source = normalize_featured("Sohrab MJ & Someone Else", "").artists;
+        assert!(!restore_missing_main(source, "Amir Tataloo", file, "Male Man Bash").1);
+        let source = normalize_featured("Amir Tataloo feat. Sohrab MJ", "").artists;
+        assert!(!restore_missing_main(source, "امیر تتلو", "امیر تتلو feat. Sohrab MJ", "").1);
+        assert_eq!(loose_names("Sohrab MJ & Orchid"), ["Sohrab MJ", "Orchid"]);
     }
 
     #[test]

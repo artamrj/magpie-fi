@@ -34,13 +34,16 @@ pub struct FileTags<'a> {
 /// Sources disagree about who is the main singer of a duet or a featured song: Radio Javan,
 /// YouTube or a release by the featured artist list that artist first. The file's own tag
 /// decides. When it names a main singer the match credits in another position, that singer
-/// goes first, the others become featured, and the album artist follows (a single's album
-/// artist is its main singer; a compilation is left alone).
+/// goes first and the others become featured. When the match credits only the featured
+/// singers ("Sohrab MJ & Orchid" for "Amir Tataloo feat. Sohrab MJ & Orchid"), the main
+/// singer is put back first. The album artist follows (a single's album artist is its main
+/// singer; a compilation is left alone).
 pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
-    let Some(main) = file
-        .artist
-        .and_then(|artist| credits::main_name(artist, file.title.unwrap_or_default()))
-    else {
+    let Some(file_artist) = file.artist else {
+        return;
+    };
+    let file_title = file.title.unwrap_or_default();
+    let Some(main) = credits::main_name(file_artist, file_title) else {
         return;
     };
     let artists = if candidate.artist_credits.is_empty() {
@@ -48,7 +51,10 @@ pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
     } else {
         std::mem::take(&mut candidate.artist_credits)
     };
-    let (artists, moved) = credits::keep_main_first(artists, &main);
+    let (artists, moved) = match credits::keep_main_first(artists, &main) {
+        (artists, true) => (artists, true),
+        (artists, false) => credits::restore_missing_main(artists, &main, file_artist, file_title),
+    };
     candidate.artist_credits = artists;
     if !moved {
         return;
@@ -64,7 +70,8 @@ pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
             candidate
                 .artist_credits
                 .iter()
-                .any(|credit| credits::identity_key(&credit.name) == credits::identity_key(&name))
+                .flat_map(|credit| credits::loose_names(&credit.name))
+                .any(|singer| credits::identity_key(&singer) == credits::identity_key(&name))
         });
     if album_artist_is_a_singer {
         candidate.album_artist = Some(primary.name.clone());
@@ -162,5 +169,25 @@ mod tests {
             },
         );
         assert_eq!(other.artist, "Maria");
+    }
+
+    #[test]
+    fn a_main_singer_the_match_left_out_is_put_back() {
+        // A catalog credits only the featured singers; the file names Amir Tataloo as main.
+        let mut candidate = Candidate {
+            artist: "Sohrab MJ & Orchid".into(),
+            title: "Male Man Bash".into(),
+            album_artist: Some("Sohrab MJ & Orchid".into()),
+            ..Default::default()
+        };
+        keep_file_main_singer(
+            &mut candidate,
+            FileTags {
+                artist: Some("Amir Tataloo feat. Sohrab MJ & Orchid"),
+                title: Some("Male Man Bash"),
+            },
+        );
+        assert_eq!(candidate.artist, "Amir Tataloo feat. Sohrab MJ & Orchid");
+        assert_eq!(candidate.album_artist.as_deref(), Some("Amir Tataloo"));
     }
 }

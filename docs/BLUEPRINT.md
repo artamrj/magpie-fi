@@ -217,9 +217,13 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   existing values are never replaced.
 - **The file decides who is the main singer.** Sources disagree about duets and featured
   songs: a release by the featured artist, Radio Javan or a YouTube channel list that artist
-  first. When the file's own artist tag names a main singer that the chosen match credits in
-  another position, that singer goes first, the others become featured, and a single's album
-  artist follows. Review shows "Lists X first" on such a match.
+  first, and some list only the featured singers. When the file's own artist tag names a main
+  singer that the chosen match credits in another position, that singer goes first and the
+  others become featured. When the match leaves the main singer out but every name it gives is
+  in the file ("Sohrab MJ & Orchid" for "Amir Tataloo feat. Sohrab MJ & Orchid"), the main
+  singer is put back first. A single's album artist follows. Such a match is also not an exact
+  artist match: it is filed on its own only with the audio or a second source agreeing. Review
+  shows "Lists X first" or "Leaves out X" on such a match.
 - **Verified covers.** A cover must belong to the chosen release, download, decode, and not be
   blank or tiny. No verified cover → no filing (the song waits in Review). A cover verified for
   one track of an album is reused for the others.

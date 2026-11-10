@@ -659,6 +659,38 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_leaves_out_the_main_singer_is_not_filed_on_its_own() {
+        // The file credits Amir Tataloo with two featured singers; one catalog lists only the
+        // featured singers. Sharing their names is not proof it is the right credit.
+        let evidence = || TrackEvidence {
+            filename: "male-man-bash.mp3",
+            title: Some("Male Man Bash"),
+            artist: Some("Amir Tataloo feat. Sohrab MJ & Orchid"),
+            album: None,
+        };
+        let only_featured = vec![performed(
+            1,
+            "itunes",
+            "Male Man Bash",
+            "Sohrab MJ & Orchid",
+            "Male Man Bash - Single",
+            1.0,
+        )];
+        assert!(select(evidence(), &only_featured).is_none());
+
+        // A catalog that names everyone is still filed automatically.
+        let everyone = vec![performed(
+            1,
+            "itunes",
+            "Male Man Bash",
+            "Amir Tataloo, Sohrab MJ & Orchid",
+            "Male Man Bash - Single",
+            1.0,
+        )];
+        assert!(select(evidence(), &everyone).is_some());
+    }
+
+    #[test]
     fn agreeing_catalogs_cannot_outvote_the_audio_length() {
         // A two-minute file tagged as a famous song: every catalog finds that
         // song by its tags, but the song is 80 seconds longer than the file.
