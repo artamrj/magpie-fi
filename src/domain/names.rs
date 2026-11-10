@@ -58,6 +58,36 @@ pub fn latin_key(value: &str) -> Option<String> {
     (folded.chars().filter(char::is_ascii_alphabetic).count() >= 5).then_some(folded)
 }
 
+/// A key for titles written in different Latin spellings of the same Persian words:
+/// "Gheseh Eshgh" = "Ghesseyeh Eshgh" = "Ghesse-ye Eshgh". On top of [`latin_key`], the
+/// ezafe ("-ye", "-yeh", "-e") that links a word to the next one is dropped. Only words
+/// followed by another word carry an ezafe, so a last word ("Sweetie") is kept whole.
+/// `None` when the title is not Latin script or too short to compare this loosely.
+pub fn loose_title_key(value: &str) -> Option<String> {
+    let key = latin_key(value)?;
+    // "Ghesse-ye" or "Ghese-e": the ezafe was written as its own word.
+    let words = key
+        .split(' ')
+        .filter(|word| !matches!(*word, "ie" | "e"))
+        .collect::<Vec<_>>();
+    let last = words.len().saturating_sub(1);
+    let words = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| match word.strip_suffix("ie") {
+            Some(stem) if index < last && stem.len() >= 3 => stem,
+            _ => word,
+        })
+        .collect::<Vec<_>>();
+    Some(words.join(" "))
+}
+
+/// Two titles that are the same Persian words in different Latin spellings
+/// (see [`loose_title_key`]).
+pub fn same_loose_title(left: &str, right: &str) -> bool {
+    loose_title_key(left).is_some_and(|key| Some(key) == loose_title_key(right))
+}
+
 fn fold_transliteration(word: &str) -> String {
     let mut word = word.to_owned();
     for (from, to) in [
@@ -176,6 +206,20 @@ mod tests {
         // Too short or not Latin: no loose key.
         assert_eq!(latin_key("Ebi"), None);
         assert_eq!(latin_key("گوگوش"), None);
+    }
+
+    #[test]
+    fn persian_titles_in_other_latin_spellings_share_a_loose_key() {
+        // MusicBrainz and Apple Music spell Ebi's "قصه عشق" differently.
+        assert!(same_loose_title("Gheseh Eshgh", "Ghesseyeh Eshgh"));
+        assert!(same_loose_title("Gheseh Eshgh", "Ghesse-ye Eshgh"));
+        assert!(same_loose_title("Ghesseh-e Eshgh", "Gheseh Eshgh"));
+        assert!(same_loose_title("Koohe Yakh", "Kouhe Yakh"));
+        // Different words stay different, and a last word keeps its ending.
+        assert!(!same_loose_title("Gheseh Eshgh", "Gheseh Gham"));
+        assert!(!same_loose_title("Sweetie", "Sweet"));
+        // Persian script has no loose key.
+        assert!(!same_loose_title("قصه عشق", "قصه عشق"));
     }
 
     #[test]

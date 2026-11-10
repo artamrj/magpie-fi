@@ -321,7 +321,10 @@ A candidate is approved automatically only when:
   below the best is checked, not only the runner-up. Releases of the *same* recording are not
   rivals: same ISRC; or same version tags and ≥0.90 title, plus either ≥0.82 artist similarity
   or one credit naming only some of the other's singers ("54 Ultra" within "ANOTR feat. 54
-  Ultra") with both lengths within 3 s of the file;
+  Ultra") with both lengths within 3 s of the file. A title in another Latin spelling of the
+  same Persian words counts as the same title when both lengths are within 3 s of the file
+  (`names::loose_title_key`: the artist Latin key, plus the ezafe "-ye"/"-yeh"/"-e" dropped
+  from words that are not last, so "Gheseh Eshgh" = "Ghesseyeh Eshgh");
 - its version tags match the file's (`session` counts as a version, so "Marie (Dach Session)" is
   not "Marie"), and its length is at most 15 s off the audio.
 
@@ -402,9 +405,17 @@ second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was
 
 `metadata_completion::complete` (`src/application/metadata_completion.rs`):
 
-1. Collect **agreeing recordings** (same ISRC, or same version tags + ≥0.90 title + ≥0.82
-   artist + compatible duration).
-2. **Never replace** a field that has a value; only fill missing ones.
+1. Collect **agreeing recordings** (same ISRC, or same version tags + ≥0.90 title or the same
+   Persian words in another spelling with both lengths within 3 s + ≥0.82 artist + compatible
+   duration).
+2. **Never replace** a field that has a value; only fill missing ones. Two exceptions:
+   - **Title spelling:** when agreeing matches differ only in spelling, the spelling most
+     sources use wins (Apple Music + Radio Javan + Audiomack "Gheseh Eshgh" over MusicBrainz
+     "Ghesseyeh Eshgh"); a tie keeps the chosen match's spelling.
+   - **Album year:** stores list old albums under the year they went digital. An earlier year
+     from another listing of the same plain album (same title, not a single, EP, compilation
+     or live album) wins: Ebi's "Koohe Yakh" is 1991 on MusicBrainz, not 2008 as on Apple
+     Music. The release date follows when it is in that year, otherwise it is cleared.
 3. Copy release fields (album, album artist, track/disc number, dates, label, country) **only
    from compatible releases**, so a compilation can't replace the original album.
 4. Normalise `Single`/`EP` and album-artist defaults.
