@@ -211,6 +211,11 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   (live, remix, …) and is at most 15 s off the audio's length.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
   existing values are never replaced.
+- **The file decides who is the main singer.** Sources disagree about duets and featured
+  songs: a release by the featured artist, Radio Javan or a YouTube channel list that artist
+  first. When the file's own artist tag names a main singer that the chosen match credits in
+  another position, that singer goes first, the others become featured, and a single's album
+  artist follows. Review shows "Lists X first" on such a match.
 - **Verified covers.** A cover must belong to the chosen release, download, decode, and not be
   blank or tiny. No verified cover → no filing (the song waits in Review). A cover verified for
   one track of an album is reused for the others.

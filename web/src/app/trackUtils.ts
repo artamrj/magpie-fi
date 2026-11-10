@@ -251,6 +251,14 @@ export function candidateChips(track: Track, candidate: Candidate, rank: number)
   if (title.tone === "warning")
     chips.push({ text: titleDifference(track.current_title, candidate.title), tone: "warn" });
   if (artist.tone === "warning") chips.push({ text: "Different artist", tone: "warn" });
+  else {
+    // The same singers, but the source puts a featured one first: the file's main singer
+    // is kept first when the match is used, so say so instead of "different artist".
+    const fileMain = mainName(track.current_artist);
+    const matchMain = mainName(candidate.artist);
+    if (fileMain && matchMain && normalizeText(fileMain) !== normalizeText(matchMain))
+      chips.push({ text: `Lists ${matchMain} first`, tone: "warn" });
+  }
   if (album.tone === "warning" && track.current_album)
     chips.push({ text: "Different album", tone: "warn" });
   if (duration.tone === "warning") chips.push({ text: "Length differs", tone: "warn" });
@@ -258,6 +266,16 @@ export function candidateChips(track: Track, candidate: Candidate, rank: number)
     chips.push({ text: "No cover found", tone: "warn" });
   chips.push({ text: candidateSources(candidate), tone: "plain" });
   return chips;
+}
+
+/** The first name in a credit: before feat., &, commas, x, and, و. */
+function mainName(value?: string) {
+  if (!value) return "";
+  return (
+    value
+      .split(/\s*(?:,|،|\s&\s|\sx\s|\sand\s|\sو\s|feat\.?\s|ft\.?\s|featuring\s|\/|;)\s*/i)[0]
+      ?.trim() ?? ""
+  );
 }
 
 function titleDifference(original?: string, proposed?: string) {

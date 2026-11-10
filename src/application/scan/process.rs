@@ -251,6 +251,10 @@ pub(crate) async fn process(
             candidates: &candidates,
             existing_album: info.album.as_deref(),
         }),
+        Some(crate::application::FileTags {
+            artist: info.artist.as_deref(),
+            title: info.title.as_deref(),
+        }),
     )
     .await?;
     if !completion.core_complete {

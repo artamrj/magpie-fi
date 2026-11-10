@@ -217,6 +217,50 @@ pub fn release_title_without_featured(value: &str) -> String {
     remove_feature_clause(value).0
 }
 
+/// The main singer a credit names: the first name, before any `feat.` and before the loose
+/// separators sources use between co-singers ("Ebi & Shadmehr", "Sasy x Tataloo").
+pub fn main_name(artist: &str, title: &str) -> Option<String> {
+    let credits = normalize_featured(artist, title);
+    let first = credits.artists.first()?.name.clone();
+    let first = loose_first_name(&first);
+    (!first.is_empty()).then_some(first)
+}
+
+fn loose_first_name(value: &str) -> String {
+    let lower = value.to_lowercase();
+    let mut end = value.len();
+    for separator in [
+        ", ", "، ", " & ", " x ", " and ", " و ", " vs ", " vs. ", " with ",
+    ] {
+        if let Some(index) = lower.find(separator) {
+            end = end.min(index);
+        }
+    }
+    clean_text(&value[..end])
+}
+
+/// Puts the song's main singer first when a source listed them after a featured artist
+/// ("Ferap feat. Tqvis" for a file tagged "Tqvis & Ferap"). The file's own tags say who is
+/// main; the others become featured. Returns whether anything moved.
+pub fn keep_main_first(mut artists: Vec<ArtistCredit>, main: &str) -> (Vec<ArtistCredit>, bool) {
+    let is_main = |credit: &ArtistCredit| {
+        same_name(&credit.name, main) || same_name(&loose_first_name(&credit.name), main)
+    };
+    let Some(index) = artists.iter().position(is_main) else {
+        return (artists, false);
+    };
+    if index == 0 {
+        return (artists, false);
+    }
+    let mut primary = artists.remove(index);
+    primary.join_phrase = " feat. ".into();
+    artists.insert(0, primary);
+    if let Some(last) = artists.last_mut() {
+        last.join_phrase.clear();
+    }
+    (artists, true)
+}
+
 fn dedupe_credits(artists: &mut Vec<ArtistCredit>) {
     let mut out: Vec<ArtistCredit> = Vec::new();
     for credit in artists.drain(..) {
@@ -300,6 +344,27 @@ fn same_name(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_files_main_singer_goes_first_whatever_a_source_said() {
+        assert_eq!(
+            main_name("Tqvis & Ferap", "Donyaye Movazi").as_deref(),
+            Some("Tqvis")
+        );
+        assert_eq!(
+            main_name("Arta", "Mi Amor (ft. Saaren)").as_deref(),
+            Some("Arta")
+        );
+        let source = normalize_featured("Ferap", "Donyaye Movazi (feat. Tqvis)").artists;
+        let (fixed, moved) = keep_main_first(source, "Tqvis");
+        assert!(moved);
+        assert_eq!(display_artist(&fixed), "Tqvis feat. Ferap");
+        // Already first, or not credited at all: nothing moves.
+        let same = normalize_featured("Tqvis feat. Ferap", "").artists;
+        assert!(!keep_main_first(same, "Tqvis").1);
+        let other = normalize_featured("Maria", "").artists;
+        assert!(!keep_main_first(other, "Tqvis").1);
+    }
 
     #[test]
     fn moves_featured_artist_from_title_to_artist_credit() {

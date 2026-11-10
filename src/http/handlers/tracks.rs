@@ -1,5 +1,7 @@
 use super::*;
-use crate::application::{Donors, finalize_selection, metadata_completion::CompletionReport};
+use crate::application::{
+    Donors, FileTags, finalize_selection, metadata_completion::CompletionReport,
+};
 use crate::infrastructure::{
     db::candidates as candidate_db,
     providers::{self, ArtworkCandidate, ArtworkStatus},
@@ -259,6 +261,10 @@ async fn approve_review_tracks(s: &AppState) -> ApiResult<AutoApproveResult> {
                 candidates: &candidates,
                 existing_album: track.current_album.as_deref(),
             }),
+            Some(FileTags {
+                artist: track.current_artist.as_deref(),
+                title: track.current_title.as_deref(),
+            }),
         )
         .await?;
         if !completion.core_complete {
@@ -415,6 +421,10 @@ pub async fn select_candidate(
         Some(Donors {
             candidates: &candidates,
             existing_album: track.current_album.as_deref(),
+        }),
+        Some(FileTags {
+            artist: track.current_artist.as_deref(),
+            title: track.current_title.as_deref(),
         }),
     )
     .await?;
@@ -590,7 +600,7 @@ pub async fn manual_candidate(
             ..Default::default()
         }];
     }
-    let completion = finalize_selection(&s, &mut candidate, None).await?;
+    let completion = finalize_selection(&s, &mut candidate, None, None).await?;
     let candidate_id = candidate_db::insert(&s.pool, id.0, &candidate).await?;
     if completion.core_complete
         && let Some(cover_url) = candidate.cover_url.as_deref()
@@ -711,7 +721,7 @@ pub async fn search_artwork(
     Path(id): Path<TrackId>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (_, mut candidate) = track_db::selected(&s.pool, id).await?;
-    let completion = finalize_selection(&s, &mut candidate, None).await?;
+    let completion = finalize_selection(&s, &mut candidate, None, None).await?;
     let mut transaction = s.pool.begin().await?;
     candidate_db::update(&mut *transaction, &candidate).await?;
     let (status, stage, message) =
