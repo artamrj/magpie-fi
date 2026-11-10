@@ -43,6 +43,7 @@ pub fn complete(
     agreeing.sort_by(|left, right| donor_quality(right).total_cmp(&donor_quality(left)));
 
     let mut enriched = Vec::new();
+    use_the_most_common_spelling(selected, &agreeing, &mut enriched);
     complete_release_identity(selected, &agreeing, &mut enriched);
     if selected.album.is_none()
         && let Some(donor) = choose_album_donor(&agreeing, existing_album)
@@ -130,6 +131,7 @@ pub fn complete(
         selected.year = Some(year.to_owned());
         enriched.push("year".into());
     }
+    take_earliest_album_year(selected, &release_donors, &mut enriched);
     fill_release_string(
         &mut selected.label,
         &release_donors,
@@ -497,9 +499,17 @@ pub(crate) fn same_recording(left: &Candidate, right: &Candidate) -> bool {
     {
         return true;
     }
+    let both_close = |limit: f64| match (left.duration_delta, right.duration_delta) {
+        (Some(left), Some(right)) => left <= limit && right <= limit,
+        _ => false,
+    };
+    // The same Persian words in another Latin spelling ("Gheseh Eshgh" and "Ghesseyeh
+    // Eshgh") count as the same title when both lengths match the file.
+    let same_title = text_similarity(&left.title, &right.title) >= 0.90
+        || (crate::domain::names::same_loose_title(&left.title, &right.title) && both_close(3.0));
     crate::domain::versions::version_tags(&left.title)
         == crate::domain::versions::version_tags(&right.title)
-        && text_similarity(&left.title, &right.title) >= 0.90
+        && same_title
         && text_similarity(&left.artist, &right.artist).max(
             crate::domain::versions::artists_similarity(&left.artist, &right.artist),
         ) >= 0.82
@@ -552,6 +562,122 @@ fn fill_from_release<T: Copy>(
         *target = Some(found);
         enriched.push(name.to_owned());
     }
+}
+
+/// Sources spell Persian titles in Latin letters their own way. When the matches for this
+/// song differ only in spelling ("Gheseh Eshgh" on Apple Music, Radio Javan and Audiomack,
+/// "Ghesseyeh Eshgh" on MusicBrainz), the spelling most sources use wins. A tie keeps the
+/// chosen match's spelling.
+fn use_the_most_common_spelling(
+    selected: &mut Candidate,
+    agreeing: &[&Candidate],
+    enriched: &mut Vec<String>,
+) {
+    let key = |title: &str| crate::domain::names::match_key(title);
+    let mut votes: HashMap<String, (usize, String)> = HashMap::new();
+    let mut vote = |candidate: &Candidate| {
+        let entry = votes
+            .entry(key(&candidate.title))
+            .or_insert((0, candidate.title.clone()));
+        entry.0 += crate::application::smart_approval::source_count(candidate);
+    };
+    vote(selected);
+    for candidate in agreeing {
+        let itself = candidate.id.is_some() && candidate.id == selected.id;
+        if !itself && crate::domain::names::same_loose_title(&candidate.title, &selected.title) {
+            vote(candidate);
+        }
+    }
+    let own = votes
+        .get(&key(&selected.title))
+        .map_or(0, |(count, _)| *count);
+    let Some((_, (count, title))) = votes.into_iter().max_by_key(|(_, (count, _))| *count) else {
+        return;
+    };
+    if count > own {
+        selected.title = title;
+        enriched.push("title spelling".into());
+    }
+}
+
+/// Stores list an old album under the year it went digital: Ebi's "Koohe Yakh" is 2008 on
+/// Apple Music and 1991 on MusicBrainz. Another listing of the same album with an earlier
+/// year is closer to when it really came out, so that year wins. Only the same album counts:
+/// a single or EP usually comes out before its album, and a compilation is another release.
+fn take_earliest_album_year(
+    selected: &mut Candidate,
+    donors: &[&Candidate],
+    enriched: &mut Vec<String>,
+) {
+    let Some(current) = release_year(selected) else {
+        return;
+    };
+    let Some(album) = nonempty(selected.album.as_deref()) else {
+        return;
+    };
+    if !is_plain_album(selected) {
+        return;
+    }
+    let earliest = donors
+        .iter()
+        .copied()
+        .filter(|donor| is_plain_album(donor))
+        .filter(|donor| {
+            donor.album.as_deref().is_some_and(|other| {
+                comparable_release_title(album) == comparable_release_title(other)
+                    || crate::domain::names::same_loose_title(album, other)
+            })
+        })
+        .filter_map(|donor| release_year(donor).map(|year| (year, donor)))
+        .filter(|(year, _)| (1900..current).contains(year))
+        .min_by_key(|(year, _)| *year);
+    let Some((year, donor)) = earliest else {
+        return;
+    };
+    let year = year.to_string();
+    selected.release_date = donor
+        .release_date
+        .clone()
+        .filter(|date| date.starts_with(&year));
+    selected.year = Some(year);
+    enriched.push("original year".into());
+}
+
+fn release_year(candidate: &Candidate) -> Option<i32> {
+    nonempty(candidate.year.as_deref())
+        .or(nonempty(candidate.release_date.as_deref()))
+        .and_then(|value| value.get(..4))
+        .and_then(|year| year.parse().ok())
+}
+
+/// A normal studio album: not a single, EP, compilation or live album.
+fn is_plain_album(candidate: &Candidate) -> bool {
+    let album = candidate
+        .album
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let secondary = candidate
+        .release_secondary_types
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
+    candidate
+        .release_type
+        .as_deref()
+        .is_none_or(|kind| kind.trim().eq_ignore_ascii_case("album"))
+        && !candidate.is_compilation
+        && !candidate
+            .album_artist
+            .as_deref()
+            .is_some_and(|artist| artist.trim().eq_ignore_ascii_case("various artists"))
+        && !album.ends_with(" - single")
+        && !album.ends_with(" - ep")
+        && !secondary.contains("compilation")
+        && !secondary.contains("live")
+        // Apple: a single has 1-3 songs.
+        && candidate.track_total.is_none_or(|total| total > 3)
 }
 
 fn fill_release_string(
@@ -737,6 +863,53 @@ mod tests {
             selected.cover_url.as_deref(),
             Some("https://example.test/farangis.jpg")
         );
+    }
+
+    #[test]
+    fn an_old_album_keeps_its_earliest_year_not_the_store_upload_date() {
+        // Apple Music lists Ebi's "Koohe Yakh" under 2008, when it went digital; MusicBrainz
+        // spells the song another way and has the album in 1991.
+        let ebi = |provider: &str, title: &str, year: &str, date: &str| Candidate {
+            provider: provider.into(),
+            title: title.into(),
+            artist: "Ebi".into(),
+            album: Some("Koohe Yakh".into()),
+            year: Some(year.into()),
+            release_date: Some(date.into()),
+            track_total: Some(12),
+            duration_delta: Some(0.5),
+            score: 95.0,
+            ..Default::default()
+        };
+        let mut selected = ebi("itunes", "Gheseh Eshgh", "2008", "2008-07-25");
+        let musicbrainz = ebi("musicbrainz", "Ghesseyeh Eshgh", "1991", "1991-02-20");
+        complete(&mut selected, &[musicbrainz], None);
+        assert_eq!(selected.year.as_deref(), Some("1991"));
+        assert_eq!(selected.release_date.as_deref(), Some("1991-02-20"));
+
+        // The year comes from MusicBrainz, but the spelling from the three other sources.
+        let sources = |names: &[&str]| Some(serde_json::json!({ "sources": names }).to_string());
+        let mut selected = ebi("musicbrainz", "Ghesseyeh Eshgh", "1991", "1991-02-20");
+        selected.score_breakdown = sources(&["musicbrainz"]);
+        let mut apple = ebi("itunes", "Gheseh Eshgh", "2008", "2008-07-25");
+        apple.score_breakdown = sources(&["itunes", "radiojavan", "audiomack"]);
+        complete(&mut selected, &[apple], None);
+        assert_eq!(selected.title, "Gheseh Eshgh");
+        assert_eq!(selected.year.as_deref(), Some("1991"));
+
+        // A single, an EP or a compilation that came out earlier is another release.
+        for other in ["single", "compilation"] {
+            let mut selected = ebi("itunes", "Gheseh Eshgh", "2008", "2008-07-25");
+            let mut earlier = ebi("deezer", "Gheseh Eshgh", "1977", "1977-01-01");
+            if other == "single" {
+                earlier.release_type = Some("single".into());
+                earlier.album = Some("Koohe Yakh - Single".into());
+            } else {
+                earlier.is_compilation = true;
+            }
+            complete(&mut selected, &[earlier], None);
+            assert_eq!(selected.year.as_deref(), Some("2008"), "{other}");
+        }
     }
 
     #[test]

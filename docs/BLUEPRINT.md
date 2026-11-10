@@ -226,11 +226,15 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
   within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
   the audio's length. Other releases of the same recording (the single and the album, a store
-  that lists fewer singers with the same length) are not rivals. When the chosen release has no
+  that lists fewer singers with the same length, a Persian title in another Latin spelling
+  with the same length) are not rivals. When the chosen release has no
   cover, another release of the same recording is tried (never a compilation). Review says in
   plain words what is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
-  existing values are never replaced.
+  existing values are never replaced, with two exceptions. A Persian title spelled differently
+  by the sources takes the spelling most sources use. An old album takes the earliest year
+  another listing of the same album gives, because stores show the year it went digital (a
+  single, EP or compilation never sets an album's year).
 - **The file decides who is the main singer.** Sources disagree about duets and featured
   songs: a release by the featured artist, Radio Javan or a YouTube channel list that artist
   first, and some list only the featured singers. When the file's own artist tag names a main

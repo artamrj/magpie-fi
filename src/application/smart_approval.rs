@@ -442,9 +442,20 @@ fn same_recording(left: &Evaluated<'_>, right: &Evaluated<'_>) -> bool {
     {
         return true;
     }
-    if left.variants != right.variants
-        || title_similarity(&left.candidate.title, &right.candidate.title) < 0.90
-    {
+    let matches_file = |candidate: &Candidate| {
+        candidate
+            .duration_delta
+            .is_some_and(|delta| delta <= SAME_SONG_MAX_DURATION_GAP_SECONDS)
+    };
+    let same_title = title_similarity(&left.candidate.title, &right.candidate.title) >= 0.90;
+    // Sources spell Persian titles in Latin letters their own way ("Gheseh Eshgh" on Apple
+    // Music, "Ghesseyeh Eshgh" on MusicBrainz). The same words in another spelling are the
+    // same song when both lengths match the file too.
+    let same_spelling = !same_title
+        && crate::domain::names::same_loose_title(&left.candidate.title, &right.candidate.title)
+        && matches_file(left.candidate)
+        && matches_file(right.candidate);
+    if left.variants != right.variants || !(same_title || same_spelling) {
         return false;
     }
     if artist_similarity(&left.candidate.artist, &right.candidate.artist).max(
@@ -456,11 +467,6 @@ fn same_recording(left: &Evaluated<'_>, right: &Evaluated<'_>) -> bool {
     // One store credits only some of the singers ("54 Ultra" for "ANOTR feat.
     // 54 Ultra"). With the same title and both lengths matching the file, it is
     // the same song listed with a shorter credit, not a rival recording.
-    let matches_file = |candidate: &Candidate| {
-        candidate
-            .duration_delta
-            .is_some_and(|delta| delta <= SAME_SONG_MAX_DURATION_GAP_SECONDS)
-    };
     matches_file(left.candidate)
         && matches_file(right.candidate)
         && versions::credit_within(&left.candidate.artist, &right.candidate.artist)
@@ -1219,6 +1225,43 @@ mod tests {
         let decision = rank(evidence, &[album, single, hits]).unwrap();
         assert_eq!(decision.candidate_index, 0);
         assert_eq!(decision.alternates, vec![1]);
+    }
+
+    #[test]
+    fn another_latin_spelling_of_a_persian_title_is_not_a_rival() {
+        // Apple Music writes "Gheseh Eshgh", MusicBrainz "Ghesseyeh Eshgh": the same song on
+        // the same album with the same length, so the song is filed without asking.
+        let evidence = || TrackEvidence {
+            filename: "Ebi - Gheseh Eshgh.mp3",
+            title: Some("Gheseh Eshgh"),
+            artist: Some("Ebi"),
+            album: Some("Koohe Yakh"),
+            isrc: None,
+        };
+        let apple = performed(1, "itunes", "Gheseh Eshgh", "Ebi", "Koohe Yakh", 0.3);
+        // MusicBrainz comes from the audio fingerprint, so it is supported on its own.
+        let mut musicbrainz = performed(
+            2,
+            "musicbrainz",
+            "Ghesseyeh Eshgh",
+            "Ebi",
+            "Koohe Yakh",
+            0.3,
+        );
+        musicbrainz.score_breakdown =
+            Some(serde_json::json!({"acoustid": 0.95, "sources": ["musicbrainz"]}).to_string());
+        assert!(
+            rank(evidence(), &[apple.clone(), musicbrainz.clone()]).is_some(),
+            "one song in two spellings"
+        );
+
+        // With a length that does not match the file, the other spelling is another song.
+        let mut far = musicbrainz;
+        far.duration_delta = Some(9.0);
+        assert!(!same_recording(
+            &evaluate_all(&evidence(), &[apple])[0],
+            &evaluate_all(&evidence(), &[far])[0],
+        ));
     }
 
     #[test]
