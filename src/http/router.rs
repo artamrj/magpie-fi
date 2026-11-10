@@ -28,6 +28,8 @@ pub fn router() -> Router<Arc<AppState>> {
             "/files/song",
             get(handlers::song_details).put(handlers::save_song),
         )
+        .route("/files/songs", axum::routing::put(handlers::save_songs))
+        .route("/files/folder-tags", get(handlers::folder_tags))
         .route("/files/artwork", get(handlers::song_artwork))
         .route("/files/audio", get(handlers::song_audio))
         .route(

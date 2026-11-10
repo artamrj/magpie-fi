@@ -3,7 +3,7 @@
 use super::tracks::{artwork_response, audio_mime, stream_audio};
 use super::*;
 use crate::application::file_browser::{
-    self, BrowseError, Folder, Saved, SearchResult, SongChanges, SongDetails,
+    self, BrowseError, Folder, FolderTags, Saved, SavedMany, SearchResult, SongDetails, SongEdit,
 };
 use axum::{extract::Query, http::HeaderMap};
 
@@ -66,14 +66,6 @@ pub async fn song_details(
     Ok(Json(file_browser::song(&library(&s), &query.path).await?))
 }
 
-#[derive(Deserialize)]
-pub struct SongEdit {
-    path: String,
-    /// The `version` the page read; a file changed since then is not overwritten.
-    version: String,
-    changes: SongChanges,
-}
-
 /// `PUT /api/files/song` — writes the changed fields into the file. Runs in the
 /// workflow slot, so no scan or filing touches the library meanwhile.
 pub async fn save_song(
@@ -98,6 +90,41 @@ pub async fn save_song(
     .await;
     s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
     Ok(Json(result?))
+}
+
+#[derive(Deserialize)]
+pub struct SongEdits {
+    edits: Vec<SongEdit>,
+}
+
+/// `PUT /api/files/songs` — saves several songs: "Edit all songs" for a
+/// folder, or the undo of it. All are checked before any is written.
+pub async fn save_songs(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<SongEdits>,
+) -> ApiResult<Json<SavedMany>> {
+    if !s
+        .try_claim_workflow(WorkflowPhase::Apply, "Saving tags of several songs")
+        .await
+    {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+    let result = file_browser::edit_songs(&s.pool, &library(&s), &body.edits).await;
+    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+    Ok(Json(result?))
+}
+
+/// `GET /api/files/folder-tags?path=` — the songs directly in a folder and
+/// what they say for the fields "Edit all songs" offers.
+pub async fn folder_tags(
+    State(s): State<Arc<AppState>>,
+    Query(query): Query<PathQuery>,
+) -> ApiResult<Json<FolderTags>> {
+    Ok(Json(
+        file_browser::folder_tags(&library(&s), &query.path).await?,
+    ))
 }
 
 /// `GET /api/files/artwork?path=` — the cover inside the song.

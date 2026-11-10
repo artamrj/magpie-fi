@@ -173,9 +173,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     sound and path with a player. The tags (title, artist, album, album artist, track, disc,
     year, genre, composer, label, ISRC) can be edited: only changed fields are written, a file
     that changed since it was opened is not overwritten, and the toast's Undo writes the old
-    values back. Folders and files are never renamed there, so a new album name or year does
-    not move the song (Navidrome goes by the tags). Hidden folders (`.magpie-fi`, `@eaDir`) and
-    anything outside `library/` are never shown.
+    values back. "Edit all songs" (on an album folder; the pencil in the desktop tree) sets
+    album, album artist, artist, year or genre for every song directly in that folder, with
+    "Different" shown where the songs disagree; it writes nothing when one song changed since
+    the folder was opened. Folders and files are never renamed there, so a new album name or
+    year does not move the song (Navidrome goes by the tags). Hidden folders (`.magpie-fi`,
+    `@eaDir`) and anything outside `library/` are never shown.
   A browser window wider than 1024 px shows a sidebar, the list and the song side by side
   (Enter uses the match, → goes to the next song). Telegram's panel is never that wide.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the

@@ -3,6 +3,7 @@ import { busyPhases } from "../app/trackUtils";
 import { api } from "./client";
 import type {
   ArtistSummary,
+  FolderTags,
   LibraryFolder,
   LibrarySearch,
   Me,
@@ -130,5 +131,14 @@ export function useSongDetailsQuery(path: string) {
   return useQuery({
     queryKey: [...queryKeys.files, "song", path],
     queryFn: () => api<SongDetails>(`/files/song?path=${pathParam(path)}`),
+  });
+}
+
+/** What the songs directly in a folder say, for "Edit all songs". Read fresh each time. */
+export function useFolderTagsQuery(path: string) {
+  return useQuery({
+    queryKey: [...queryKeys.files, "folder-tags", path],
+    queryFn: () => api<FolderTags>(`/files/folder-tags?path=${pathParam(path)}`),
+    staleTime: 0,
   });
 }

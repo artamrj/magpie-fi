@@ -1244,6 +1244,38 @@ button.cell:active {
   color: var(--hint);
   font-size: 14px;
 }
+.sheet-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+.sheet-actions .action-button {
+  flex: 1;
+}
+/* A tree folder row, with "Edit all songs" at its end for an album folder. */
+.tree-line {
+  display: flex;
+  align-items: center;
+}
+.tree-line .tree-row {
+  flex: 1;
+  min-width: 0;
+}
+.tree-edit {
+  width: 32px;
+  height: 30px;
+  margin-inline-end: 6px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--hint);
+  flex: none;
+}
+.tree-edit:hover,
+.tree-edit:focus-visible {
+  background: var(--fill);
+  color: var(--accent);
+}
 .tree {
   margin-top: 14px;
   background: var(--section);

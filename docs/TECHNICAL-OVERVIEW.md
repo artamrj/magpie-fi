@@ -284,6 +284,13 @@ also replaces a release date of another year; an empty field removes the tag. Th
 the old values of the changed fields, and the page's Undo saves them again. WAV and AIFF are not
 edited, and no file or folder is renamed.
 
+"Edit all songs" reads `GET /files/folder-tags` (every song directly in the folder with its
+version, and per field the value they share or how many different values there are), then sends
+one `PUT /files/songs` with an edit per song (at most 500). `file_browser::edit_songs` checks
+every song first (version, values, no song twice) and writes nothing when one fails; then it
+writes them one by one and reports any song that failed on disk. Undo sends each song's own old
+values through the same route.
+
 ---
 
 ## 9. Smart auto-selection
@@ -490,6 +497,8 @@ All routes are under `/api` (`src/http/router.rs`).
 | `GET /files/search?q=&in=` | Songs and folders matching every word, optionally inside one folder |
 | `GET /files/song?path=` | Every tag of one song, read from the file, with its `version` |
 | `PUT /files/song` | Write changed tags `{path, version, changes}`; returns `{changed, before, song}` |
+| `PUT /files/songs` | Write several songs `{edits: [{path, version, changes}]}`; returns `{saved, failed}` |
+| `GET /files/folder-tags?path=` | The songs directly in a folder with versions, and per field the shared value or a count |
 | `GET /files/artwork?path=` | The cover inside one song |
 | `GET /files/audio?path=` | Stream one song (range requests) |
 | `POST /requests` | Read a link and queue its songs |
@@ -514,7 +523,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | Cover worker | `src/application/artwork.rs` |
 | Filing | `src/application/apply.rs` |
 | Library layout, index, trash, playlists | `src/application/library.rs` |
-| Files tab (browse, search, song details, tag editing) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |
+| Files tab (browse, search, song details, tag editing, whole folders) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |
 | Getting music from links | `src/acquire/` |
 | Telegram bot | `src/telegram/` |
 | Tracks and candidates in the database | `src/infrastructure/db/` |

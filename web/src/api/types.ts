@@ -229,3 +229,14 @@ export type SongChanges = Partial<
 >;
 /** After a save: how many fields changed, their old values (for Undo), and the song now. */
 export type SongSaved = { changed: number; before: SongChanges; song: SongDetails };
+/** After saving several songs: each saved song, and the few that failed. */
+export type SongsSaved = { saved: SongSaved[]; failed: Array<{ path: string; error: string }> };
+/** "Edit all songs": the songs directly in a folder and what they say per field. */
+export type FolderTags = {
+  path: string;
+  songs: Array<{ path: string; version: string; editable: boolean }>;
+  fields: Record<
+    "album" | "album_artist" | "artist" | "year" | "genre",
+    { value?: string | null; values: number }
+  >;
+};

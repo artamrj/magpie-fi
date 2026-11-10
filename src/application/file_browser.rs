@@ -152,33 +152,7 @@ pub async fn list_folder(pool: &SqlitePool, root: &Path, folder: &str) -> Result
         return Err(BrowseError::NotFound);
     }
     let folder = folder.trim_matches('/').to_owned();
-    let mut folder_names = Vec::new();
-    let mut file_names = Vec::new();
-    let mut entries = tokio::fs::read_dir(&directory)
-        .await
-        .map_err(|error| BrowseError::Other(error.into()))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|error| BrowseError::Other(error.into()))?
-    {
-        // Names that are not UTF-8 cannot be sent back by the page; links are not
-        // followed, like the library scan.
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Ok(kind) = entry.file_type().await else {
-            continue;
-        };
-        if is_hidden(&name) {
-            continue;
-        }
-        if kind.is_dir() {
-            folder_names.push(name);
-        } else if kind.is_file() && crate::domain::audio::is_supported(Path::new(&name)) {
-            file_names.push(name);
-        }
-    }
+    let (folder_names, file_names) = entries(&directory).await?;
 
     let start = prefix(&directory);
     let inside: Vec<String> = sqlx::query_scalar(
@@ -235,6 +209,38 @@ pub async fn list_folder(pool: &SqlitePool, root: &Path, folder: &str) -> Result
         songs,
         songs_inside: inside.len(),
     })
+}
+
+/// The visible folders and songs directly in `directory`, by name.
+async fn entries(directory: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let mut folders = Vec::new();
+    let mut songs = Vec::new();
+    let mut reader = tokio::fs::read_dir(directory)
+        .await
+        .map_err(|error| BrowseError::Other(error.into()))?;
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|error| BrowseError::Other(error.into()))?
+    {
+        // Names that are not UTF-8 cannot be sent back by the page; links are not
+        // followed, like the library scan.
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(kind) = entry.file_type().await else {
+            continue;
+        };
+        if is_hidden(&name) {
+            continue;
+        }
+        if kind.is_dir() {
+            folders.push(name);
+        } else if kind.is_file() && crate::domain::audio::is_supported(Path::new(&name)) {
+            songs.push(name);
+        }
+    }
+    Ok((folders, songs))
 }
 
 fn sort_key(name: &str) -> String {
@@ -675,24 +681,57 @@ fn check(written: &tag_writer::SongTags, edit: &TagEdit) -> anyhow::Result<()> {
     }
 }
 
-/// Writes the changed fields of one song. The caller holds the workflow slot,
-/// so no scan or filing touches the library meanwhile.
-pub async fn edit_song(
-    pool: &SqlitePool,
-    root: &Path,
-    path: &str,
-    expected_version: &str,
-    changes: &SongChanges,
-) -> Result<Saved> {
-    let file = song_file(root, path)?;
-    if version(&file).await? != expected_version {
+/// Songs one batch may change: an album, or a large box set folder.
+pub const MAX_BATCH: usize = 500;
+
+/// One song of a batch: the `version` the page read and the typed changes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SongEdit {
+    pub path: String,
+    pub version: String,
+    pub changes: SongChanges,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Failed {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SavedMany {
+    pub saved: Vec<Saved>,
+    /// Songs that could not be written after the batch was checked (a disk
+    /// error, say); every other song was saved.
+    pub failed: Vec<Failed>,
+}
+
+/// A song checked and ready to write: nothing is on disk yet.
+struct Prepared {
+    path: String,
+    file: PathBuf,
+    edit: TagEdit,
+    before: SongChanges,
+    changed: usize,
+}
+
+/// Checks one song's changes against its file without writing anything.
+async fn prepare(root: &Path, request: &SongEdit) -> Result<Prepared> {
+    let file = song_file(root, &request.path)?;
+    if version(&file).await? != request.version {
         return Err(BrowseError::Changed);
     }
     let reading = file.clone();
     let now = tokio::task::spawn_blocking(move || tag_writer::read_details(&reading))
         .await
         .map_err(|error| BrowseError::Other(error.into()))??;
-    let (edit, before) = plan(changes, &now)?;
+    let (edit, before) = plan(&request.changes, &now)?;
+    if !edit.is_empty() && !editable(&file) {
+        return Err(BrowseError::Invalid(
+            "Tags of WAV and AIFF files are not edited here".into(),
+        ));
+    }
     let changed = [
         edit.title.is_some(),
         edit.artist.is_some(),
@@ -711,6 +750,24 @@ pub async fn edit_song(
     .into_iter()
     .filter(|changed| *changed)
     .count();
+    Ok(Prepared {
+        path: request.path.trim_matches('/').to_owned(),
+        file,
+        edit,
+        before,
+        changed,
+    })
+}
+
+/// Writes a checked song on a copy, swaps it in and updates the index.
+async fn write(pool: &SqlitePool, root: &Path, prepared: Prepared) -> Result<Saved> {
+    let Prepared {
+        path,
+        file,
+        edit,
+        before,
+        changed,
+    } = prepared;
     if !edit.is_empty() {
         let writing = file.clone();
         tokio::task::spawn_blocking(move || {
@@ -734,7 +791,154 @@ pub async fn edit_song(
     Ok(Saved {
         changed,
         before,
-        song: song(root, path).await?,
+        song: song(root, &path).await?,
+    })
+}
+
+/// Writes the changed fields of one song. The caller holds the workflow slot,
+/// so no scan or filing touches the library meanwhile.
+pub async fn edit_song(
+    pool: &SqlitePool,
+    root: &Path,
+    path: &str,
+    expected_version: &str,
+    changes: &SongChanges,
+) -> Result<Saved> {
+    let request = SongEdit {
+        path: path.to_owned(),
+        version: expected_version.to_owned(),
+        changes: changes.clone(),
+    };
+    write(pool, root, prepare(root, &request).await?).await
+}
+
+/// Writes several songs (a whole album, or an undo). Every song is checked
+/// first: when one changed on disk or a value is wrong, nothing is written.
+pub async fn edit_songs(pool: &SqlitePool, root: &Path, edits: &[SongEdit]) -> Result<SavedMany> {
+    if edits.is_empty() {
+        return Err(BrowseError::Invalid("No songs to save".into()));
+    }
+    if edits.len() > MAX_BATCH {
+        return Err(BrowseError::Invalid(format!(
+            "At most {MAX_BATCH} songs can be saved at once"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(edits.len());
+    for request in edits {
+        if !seen.insert(request.path.trim_matches('/')) {
+            return Err(BrowseError::Invalid("A song is listed twice".into()));
+        }
+        prepared.push(prepare(root, request).await?);
+    }
+    let mut result = SavedMany {
+        saved: Vec::new(),
+        failed: Vec::new(),
+    };
+    for song in prepared {
+        let path = song.path.clone();
+        match write(pool, root, song).await {
+            Ok(saved) => result.saved.push(saved),
+            Err(error) => result.failed.push(Failed {
+                path,
+                error: error.to_string(),
+            }),
+        }
+    }
+    Ok(result)
+}
+
+fn editable(file: &Path) -> bool {
+    !matches!(
+        file.extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+            .as_deref(),
+        Some("wav" | "aiff" | "aif")
+    )
+}
+
+/// The fields "Edit all songs" offers, and what the songs say for each.
+#[derive(Debug, Serialize)]
+pub struct FolderTags {
+    pub path: String,
+    pub songs: Vec<FolderSong>,
+    pub fields: BTreeMap<&'static str, Shared>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FolderSong {
+    pub path: String,
+    pub version: String,
+    pub editable: bool,
+}
+
+/// `value` when every editable song says the same; else how many values there are.
+#[derive(Debug, Default, Serialize)]
+pub struct Shared {
+    pub value: Option<String>,
+    pub values: usize,
+}
+
+/// Reads every song directly in `folder` (not in its subfolders).
+pub async fn folder_tags(root: &Path, folder: &str) -> Result<FolderTags> {
+    let directory = resolve(root, folder)?;
+    if !directory.is_dir() {
+        return Err(BrowseError::NotFound);
+    }
+    let folder = folder.trim_matches('/').to_owned();
+    let (_, mut names) = entries(&directory).await?;
+    names.sort_by_key(|name| sort_key(name));
+    if names.len() > MAX_BATCH {
+        return Err(BrowseError::Invalid(format!(
+            "This folder has more than {MAX_BATCH} songs; edit them in smaller folders"
+        )));
+    }
+    let mut songs = Vec::new();
+    let mut seen: BTreeMap<&'static str, BTreeSet<Option<String>>> = BTreeMap::new();
+    for name in names {
+        let file = directory.join(&name);
+        let song_editable = editable(&file);
+        songs.push(FolderSong {
+            path: join(&folder, &name),
+            version: version(&file).await?,
+            editable: song_editable,
+        });
+        if !song_editable {
+            continue;
+        }
+        let tags = tokio::task::spawn_blocking(move || tag_writer::read_details(&file))
+            .await
+            .map_err(|error| BrowseError::Other(error.into()))??;
+        for (field, value) in [
+            ("album", tags.album),
+            ("album_artist", tags.album_artist),
+            ("artist", tags.artist),
+            ("year", tags.year),
+            ("genre", tags.genre),
+        ] {
+            seen.entry(field).or_default().insert(value);
+        }
+    }
+    let fields = seen
+        .into_iter()
+        .map(|(field, values)| {
+            let shared = match values.len() {
+                1 => Shared {
+                    values: usize::from(values.first().is_some_and(Option::is_some)),
+                    value: values.into_iter().next().flatten(),
+                },
+                count => Shared {
+                    value: None,
+                    values: count,
+                },
+            };
+            (field, shared)
+        })
+        .collect();
+    Ok(FolderTags {
+        path: folder,
+        songs,
+        fields,
     })
 }
 
@@ -1091,6 +1295,121 @@ mod tests {
             .unwrap();
         assert_eq!(same.changed, 0);
         assert_eq!(same.song.version, undone.song.version);
+    }
+
+    #[tokio::test]
+    async fn a_whole_folder_is_checked_first_then_saved_and_undone() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (_directory, root, pool) = library().await;
+        let folder = "Massive Attack/Mezzanine (1998)";
+        std::fs::create_dir_all(root.join(folder)).unwrap();
+        for (name, genre) in [
+            ("01 - Angel.flac", "Trip Hop"),
+            ("02 - Risingson.flac", "Electronic"),
+        ] {
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=1")
+                .args([
+                    "-metadata",
+                    "artist=Massive Attack",
+                    "-metadata",
+                    "album=Mezanine",
+                    "-metadata",
+                ])
+                .arg(format!("genre={genre}"))
+                .args(["-metadata", "title=Song"])
+                .arg(root.join(folder).join(name))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let summary = folder_tags(&root, folder).await.unwrap();
+        assert_eq!(summary.songs.len(), 2);
+        assert_eq!(summary.fields["album"].value.as_deref(), Some("Mezanine"));
+        assert_eq!(summary.fields["genre"].value, None);
+        assert_eq!(summary.fields["genre"].values, 2);
+        assert_eq!(summary.fields["year"].values, 0);
+
+        let fix = SongChanges {
+            album: Some("Mezzanine".into()),
+            year: Some("1998".into()),
+            ..SongChanges::default()
+        };
+        let edits = |versions: [&str; 2]| -> Vec<SongEdit> {
+            summary
+                .songs
+                .iter()
+                .zip(versions)
+                .map(|(song, version)| SongEdit {
+                    path: song.path.clone(),
+                    version: version.to_owned(),
+                    changes: fix.clone(),
+                })
+                .collect()
+        };
+        // One song changed on disk: nothing is written, not even the other song.
+        let first = summary.songs[0].version.as_str();
+        assert!(matches!(
+            edit_songs(&pool, &root, &edits([first, "0-0"])).await,
+            Err(BrowseError::Changed)
+        ));
+        assert_eq!(
+            folder_tags(&root, folder).await.unwrap().fields["album"]
+                .value
+                .as_deref(),
+            Some("Mezanine")
+        );
+        let mut twice = edits([first, first]);
+        twice[1].path = twice[0].path.clone();
+        assert!(matches!(
+            edit_songs(&pool, &root, &twice).await,
+            Err(BrowseError::Invalid(_))
+        ));
+
+        let second = summary.songs[1].version.as_str();
+        let saved = edit_songs(&pool, &root, &edits([first, second]))
+            .await
+            .unwrap();
+        assert!(saved.failed.is_empty());
+        assert_eq!(saved.saved.len(), 2);
+        assert!(saved.saved.iter().all(|song| song.changed == 2));
+        let after = folder_tags(&root, folder).await.unwrap();
+        assert_eq!(after.fields["album"].value.as_deref(), Some("Mezzanine"));
+        assert_eq!(after.fields["year"].value.as_deref(), Some("1998"));
+        // Each song keeps its own genre.
+        assert_eq!(after.fields["genre"].values, 2);
+
+        // The undo puts each song's own old values back.
+        let undo: Vec<SongEdit> = saved
+            .saved
+            .iter()
+            .map(|song| SongEdit {
+                path: song.song.path.clone(),
+                version: song.song.version.clone(),
+                changes: song.before.clone(),
+            })
+            .collect();
+        edit_songs(&pool, &root, &undo).await.unwrap();
+        let undone = folder_tags(&root, folder).await.unwrap();
+        assert_eq!(undone.fields["album"].value.as_deref(), Some("Mezanine"));
+        assert_eq!(undone.fields["year"].values, 0);
+
+        assert!(matches!(
+            edit_songs(&pool, &root, &[]).await,
+            Err(BrowseError::Invalid(_))
+        ));
+        assert!(matches!(
+            folder_tags(&root, "../").await,
+            Err(BrowseError::Outside)
+        ));
     }
 
     #[tokio::test]

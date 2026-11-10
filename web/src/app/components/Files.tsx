@@ -1,18 +1,21 @@
 import { Fragment, useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../../api/client";
 import {
   queryKeys,
   useFileSearchQuery,
   useFolderQuery,
+  useFolderTagsQuery,
   useSongDetailsQuery,
 } from "../../api/queries";
 import type {
+  FolderTags,
   LibraryFolderEntry,
   LibrarySong,
   SongChanges,
   SongDetails,
   SongSaved,
+  SongsSaved,
 } from "../../api/types";
 import { Icon } from "../Icons";
 import { haptic } from "../telegram";
@@ -21,7 +24,7 @@ import { LibraryCover } from "./Cover";
 import { EmptyState, ListSkeleton } from "./EmptyStates";
 import { Player } from "./SongScreen";
 import type { Feedback } from "./ReviewList";
-import { BottomActions, Callout, Cell, PageTitle, Section, Tag } from "./ui";
+import { BottomActions, Callout, Cell, PageTitle, Section, Sheet, Spinner, Tag } from "./ui";
 
 /** What the app shell needs from the Files tab on a phone. */
 export type FilesNav = { back?: () => void; song: boolean };
@@ -45,6 +48,15 @@ export function Files({
   const [search, setSearch] = useState("");
   const [onlyHere, setOnlyHere] = useState(false);
   const [open, setOpen] = useState<Set<string>>(() => new Set());
+  const [editFolder, setEditFolder] = useState<string>();
+  const folderEditor = editFolder !== undefined && (
+    <FolderEditor
+      key={editFolder}
+      path={editFolder}
+      feedback={feedback}
+      onClose={() => setEditFolder(undefined)}
+    />
+  );
   const query = useDebounced(search.trim(), 250);
   const within = !wide && onlyHere ? folder : "";
 
@@ -168,6 +180,7 @@ export function Files({
                     });
                   }}
                   onSong={openSong}
+                  onEditFolder={setEditFolder}
                 />
               </div>
             )}
@@ -186,6 +199,7 @@ export function Files({
             )}
           </div>
         </aside>
+        {folderEditor}
       </>
     );
 
@@ -210,8 +224,15 @@ export function Files({
           {results}
         </>
       ) : (
-        <FolderView folder={folder} searchBox={searchBox} onFolder={openFolder} onSong={openSong} />
+        <FolderView
+          folder={folder}
+          searchBox={searchBox}
+          onFolder={openFolder}
+          onSong={openSong}
+          onEditAll={() => setEditFolder(folder)}
+        />
       )}
+      {folderEditor}
     </main>
   );
 }
@@ -222,11 +243,13 @@ function FolderView({
   searchBox,
   onFolder,
   onSong,
+  onEditAll,
 }: {
   folder: string;
   searchBox: React.ReactNode;
   onFolder: (path: string) => void;
   onSong: (path: string) => void;
+  onEditAll: () => void;
 }) {
   const listing = useFolderQuery(folder);
   const data = listing.data;
@@ -279,6 +302,21 @@ function FolderView({
       ) : (
         data && (
           <>
+            {folder && data.songs.length > 1 && (
+              <Section>
+                <Cell
+                  tone="link"
+                  lead={<Icon name="edit" />}
+                  title={`Edit all ${data.songs.length} songs…`}
+                  subtitle="Album, album artist, artist, year, genre"
+                  chevron
+                  onClick={() => {
+                    haptic.tap();
+                    onEditAll();
+                  }}
+                />
+              </Section>
+            )}
             {data.folders.length > 0 && (
               <Section
                 title="Folders"
@@ -451,6 +489,7 @@ function TreeFolder({
   selected,
   onToggle,
   onSong,
+  onEditFolder,
 }: {
   path: string;
   depth: number;
@@ -458,6 +497,7 @@ function TreeFolder({
   selected?: string;
   onToggle: (path: string) => void;
   onSong: (path: string) => void;
+  onEditFolder: (path: string) => void;
 }) {
   const listing = useFolderQuery(path);
   const indent = { paddingInlineStart: 12 + depth * 18 };
@@ -486,21 +526,34 @@ function TreeFolder({
         const expanded = open.has(entry.path);
         return (
           <div key={entry.path} role="group">
-            <button
-              type="button"
-              className="tree-row"
-              style={indent}
-              role="treeitem"
-              aria-expanded={expanded}
-              onClick={() => onToggle(entry.path)}
-            >
-              <Icon name="chevron" size={14} className={`twisty ${expanded ? "open" : ""}`} />
-              <Icon name="folder" size={18} className="tree-folder" />
-              <span className="tree-name" dir="auto">
-                {entry.name}
-              </span>
-              <small>{entry.songs}</small>
-            </button>
+            <div className="tree-line">
+              <button
+                type="button"
+                className="tree-row"
+                style={indent}
+                role="treeitem"
+                aria-expanded={expanded}
+                onClick={() => onToggle(entry.path)}
+              >
+                <Icon name="chevron" size={14} className={`twisty ${expanded ? "open" : ""}`} />
+                <Icon name="folder" size={18} className="tree-folder" />
+                <span className="tree-name" dir="auto">
+                  {entry.name}
+                </span>
+                <small>{entry.songs}</small>
+              </button>
+              {entry.folders === 0 && entry.songs > 1 && (
+                <button
+                  type="button"
+                  className="tree-edit"
+                  aria-label={`Edit all songs in ${entry.name}`}
+                  title="Edit all songs in this folder"
+                  onClick={() => onEditFolder(entry.path)}
+                >
+                  <Icon name="edit" size={15} />
+                </button>
+              )}
+            </div>
             {expanded && (
               <TreeFolder
                 path={entry.path}
@@ -509,6 +562,7 @@ function TreeFolder({
                 selected={selected}
                 onToggle={onToggle}
                 onSong={onSong}
+                onEditFolder={onEditFolder}
               />
             )}
           </div>
@@ -640,13 +694,7 @@ function SongInfo({ song, feedback }: { song: SongDetails; feedback: Feedback })
       body: JSON.stringify({ path: song.path, version, changes }),
     });
     queryClient.setQueryData([...queryKeys.files, "song", song.path], saved.song);
-    // Lists, search and the Artists page show the new tags.
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: [...queryKeys.files, "folder"] }),
-      queryClient.invalidateQueries({ queryKey: [...queryKeys.files, "search"] }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.artists }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.recent }),
-    ]);
+    await refreshAfterSave(queryClient);
     return saved;
   };
 
@@ -810,6 +858,161 @@ function SongInfo({ song, feedback }: { song: SongDetails; feedback: Feedback })
         }
       />
     </>
+  );
+}
+
+/** Lists, search, open songs and the Artists page show the new tags. */
+function refreshAfterSave(queryClient: QueryClient) {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: queryKeys.files }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.artists }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.recent }),
+  ]);
+}
+
+type FolderField = keyof FolderTags["fields"];
+const folderFields: Array<[FolderField, string]> = [
+  ["album", "Album"],
+  ["album_artist", "Album artist"],
+  ["artist", "Artist"],
+  ["year", "Year"],
+  ["genre", "Genre"],
+];
+
+/** "Edit all songs": the album-level fields of every song directly in a folder. */
+function FolderEditor({
+  path,
+  feedback,
+  onClose,
+}: {
+  path: string;
+  feedback: Feedback;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const summary = useFolderTagsQuery(path);
+  const [typed, setTyped] = useState<Partial<Record<FolderField, string>>>({});
+  const [busy, setBusy] = useState(false);
+  const data = summary.data;
+  const songs = data?.songs.filter((song) => song.editable) ?? [];
+  const skipped = (data?.songs.length ?? 0) - songs.length;
+  const shared = (field: FolderField) => data?.fields[field] ?? { value: null, values: 0 };
+  const initial = (field: FolderField) => shared(field).value ?? "";
+  const changed = folderFields
+    .map(([field]) => field)
+    .filter((field) => typed[field] !== undefined && typed[field]!.trim() !== initial(field));
+
+  const put = (edits: Array<{ path: string; version: string; changes: SongChanges }>) =>
+    api<SongsSaved>("/files/songs", { method: "PUT", body: JSON.stringify({ edits }) });
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const changes = Object.fromEntries(changed.map((field) => [field, typed[field]!.trim()]));
+      const result = await put(
+        songs.map((song) => ({ path: song.path, version: song.version, changes })),
+      );
+      await refreshAfterSave(queryClient);
+      const done = result.saved.filter((song) => song.changed > 0);
+      if (result.failed.length) {
+        haptic.error();
+        feedback.fail(
+          `${count(result.failed.length, "song", "songs")} could not be saved: ${result.failed[0].error}`,
+        );
+      } else haptic.success();
+      if (done.length)
+        feedback.notify(`Saved to ${count(done.length, "song", "songs")}`, async () => {
+          await put(
+            done.map((song) => ({
+              path: song.song.path,
+              version: song.song.version,
+              changes: song.before,
+            })),
+          );
+          await refreshAfterSave(queryClient);
+          haptic.success();
+          feedback.notify("Changes undone");
+        });
+      else if (!result.failed.length)
+        feedback.notify("Nothing to save: the songs already say that");
+      onClose();
+    } catch (reason) {
+      haptic.error();
+      feedback.fail((reason as Error).message);
+      if (reason instanceof ApiError && reason.status === 409) void summary.refetch();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet
+      title={`Edit all ${count(songs.length, "song", "songs")}`}
+      subtitle={nameOf(path)}
+      onClose={onClose}
+    >
+      {summary.isPending ? (
+        <ListSkeleton rows={3} />
+      ) : summary.error ? (
+        <Callout tone="bad" icon="alert">
+          {summary.error.message}
+        </Callout>
+      ) : (
+        <>
+          <Section
+            footer={[
+              "Only the fields you change are written, to every song directly in this folder. “Different” means the songs disagree; leave it to keep each song’s own value.",
+              skipped > 0 &&
+                `${count(skipped, "WAV or AIFF song is", "WAV or AIFF songs are")} left as they are.`,
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            {folderFields.map(([field, label]) => {
+              const isChanged = changed.includes(field);
+              const { value, values } = shared(field);
+              return (
+                <label className={`field-row ${isChanged ? "changed" : ""}`} key={field}>
+                  <span>{label}</span>
+                  <input
+                    id={`folder-${field}`}
+                    dir="auto"
+                    value={typed[field] ?? initial(field)}
+                    placeholder={values > 1 ? `Different (${values} values)` : "Empty"}
+                    inputMode={field === "year" ? "numeric" : undefined}
+                    autoComplete="off"
+                    disabled={busy}
+                    onChange={(event) => setTyped({ ...typed, [field]: event.target.value })}
+                  />
+                  {isChanged && (
+                    <small className="was">
+                      {values > 1
+                        ? `replaces ${values} different values`
+                        : value
+                          ? `was “${value}”`
+                          : "was empty"}
+                    </small>
+                  )}
+                </label>
+              );
+            })}
+          </Section>
+          <div className="sheet-actions">
+            <button type="button" className="action-button secondary" onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="action-button primary"
+              disabled={!changed.length || !songs.length || busy}
+              onClick={() => void save()}
+            >
+              {busy ? <Spinner size={18} /> : `Save to ${count(songs.length, "song", "songs")}`}
+            </button>
+          </div>
+        </>
+      )}
+    </Sheet>
   );
 }
 
