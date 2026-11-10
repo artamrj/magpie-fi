@@ -10,7 +10,7 @@ use std::{
 
 const DURATION_TOLERANCE_SECONDS: f64 = 3.0;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RecordingEvidence {
     pub path: PathBuf,
     pub format: String,
@@ -18,6 +18,23 @@ pub struct RecordingEvidence {
     pub duration: Option<f64>,
     pub content_key: Option<String>,
     pub isrc: Option<String>,
+    /// The Chromaprint fingerprint (compressed, as `fpcalc` prints it), so two
+    /// encodes of one recording can be compared by how similar they sound.
+    pub fingerprint: Option<String>,
+}
+
+/// Same recording by sound: fingerprints at least [`SAME_RECORDING`]
+/// similar and lengths within 3 s (parts of one song can sound alike).
+///
+/// [`SAME_RECORDING`]: crate::domain::fingerprint::SAME_RECORDING
+pub fn sounds_the_same(left: (&[u32], Option<f64>), right: (&[u32], Option<f64>)) -> bool {
+    let close = match (left.1, right.1) {
+        (Some(a), Some(b)) => (a - b).abs() <= DURATION_TOLERANCE_SECONDS,
+        _ => false,
+    };
+    close
+        && crate::domain::fingerprint::similarity(left.0, right.0)
+            >= crate::domain::fingerprint::SAME_RECORDING
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +89,7 @@ pub fn group_recordings(recordings: &[RecordingEvidence]) -> Vec<DuplicateGroup>
     for indices in fingerprints.values_mut().chain(isrcs.values_mut()) {
         union_duration_clusters(&mut sets, recordings, indices);
     }
+    union_similar_sound(&mut sets, recordings);
 
     let mut groups = HashMap::<usize, Vec<usize>>::new();
     for index in 0..recordings.len() {
@@ -93,6 +111,32 @@ pub fn group_recordings(recordings: &[RecordingEvidence]) -> Vec<DuplicateGroup>
             .cmp(&recordings[right.representative].path)
     });
     groups
+}
+
+/// Two encodes of one recording (a YouTube download and a FLAC) have different
+/// fingerprint strings but sound the same. Only songs within 3 s of each other
+/// are compared, so this stays cheap for large inbox batches.
+fn union_similar_sound(sets: &mut DisjointSet, recordings: &[RecordingEvidence]) {
+    let mut decoded = recordings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, recording)| {
+            let duration = recording.duration?;
+            let raw = crate::domain::fingerprint::decode(recording.fingerprint.as_deref()?)?;
+            Some((index, duration, raw))
+        })
+        .collect::<Vec<_>>();
+    decoded.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
+    for (position, (index, duration, raw)) in decoded.iter().enumerate() {
+        for (other, other_duration, other_raw) in &decoded[position + 1..] {
+            if other_duration - duration > DURATION_TOLERANCE_SECONDS {
+                break;
+            }
+            if sounds_the_same((raw, Some(*duration)), (other_raw, Some(*other_duration))) {
+                sets.union(*index, *other);
+            }
+        }
+    }
 }
 
 fn union_duration_clusters(
@@ -228,6 +272,7 @@ mod tests {
             duration: Some(duration),
             content_key: content_key.map(str::to_owned),
             isrc: isrc.map(str::to_owned),
+            fingerprint: None,
         }
     }
 

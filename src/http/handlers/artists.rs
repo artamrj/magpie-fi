@@ -1,0 +1,51 @@
+//! The Artists page: every artist in the library and the owner's fixes.
+
+use super::*;
+use crate::application::artist_changes::{self, ArtistSummary, Changed};
+
+/// `GET /api/artists`
+pub async fn list_artists(State(s): State<Arc<AppState>>) -> ApiResult<Json<Vec<ArtistSummary>>> {
+    Ok(Json(artist_changes::list(&s.pool).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ArtistChange {
+    /// A better name for the tags and the folder.
+    Rename { name: String },
+    /// This artist is the same as `into`.
+    Merge { into: i64 },
+    /// This name means several artists.
+    Split { parts: Vec<String> },
+    /// One artist although the name has "&" or "," (a band or duo).
+    OneArtist,
+}
+
+/// `POST /api/artists/{id}`: rename, merge, split or mark as one artist.
+/// Songs are retagged and moved, so nothing else may run meanwhile.
+pub async fn change_artist(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(change): Json<ArtistChange>,
+) -> ApiResult<Json<Changed>> {
+    if !s
+        .try_claim_workflow(WorkflowPhase::Apply, "Updating an artist in the library")
+        .await
+    {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+    let result = match change {
+        ArtistChange::Rename { name } => artist_changes::rename(&s, id, &name).await,
+        ArtistChange::Merge { into } => artist_changes::merge(&s, id, into).await,
+        ArtistChange::Split { parts } => artist_changes::split(&s, id, &parts).await,
+        ArtistChange::OneArtist => artist_changes::mark_one_artist(&s.pool, id)
+            .await
+            .map(|()| Changed::default()),
+    };
+    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+    result
+        .map(Json)
+        .map_err(|error| ApiError::validation(format!("{error:#}")))
+}

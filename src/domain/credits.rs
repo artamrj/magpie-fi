@@ -8,6 +8,9 @@ pub struct ArtistCredit {
     pub join_phrase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub musicbrainz_id: Option<String>,
+    /// The artist identity (`artists.id`) this credit was resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<i64>,
 }
 
 impl ArtistCredit {
@@ -16,6 +19,7 @@ impl ArtistCredit {
             name: clean_text(&name.into()),
             join_phrase: join_phrase.into(),
             musicbrainz_id: None,
+            artist_id: None,
         }
     }
 }
@@ -36,11 +40,9 @@ pub fn clean_text(value: &str) -> String {
         .join(" ")
 }
 
+/// Two spellings with the same key are the same name (see [`super::names::match_key`]).
 pub fn identity_key(value: &str) -> String {
-    clean_text(value)
-        .chars()
-        .flat_map(char::to_lowercase)
-        .collect()
+    super::names::match_key(value)
 }
 
 pub fn prefer_latin_alias(value: &str) -> String {

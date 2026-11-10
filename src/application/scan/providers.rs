@@ -96,7 +96,13 @@ pub(crate) async fn identify(
     }
     out.extend(query_discogs(state, limits, catalog_info, filename).await);
     out.extend(query_lastfm(state, limits, catalog_info, filename).await);
-    crate::application::canonical_names::canonicalize_candidates(&state.pool, &mut out).await?;
+    crate::application::canonical_names::canonicalize_candidates(
+        &state.pool,
+        None,
+        &mut out,
+        crate::application::artists::Mode::Lookup,
+    )
+    .await?;
     apply_source_agreement(&mut out)?;
     enrich_artwork_fallbacks(&mut out);
     apply_artwork_override(&state.pool, path, &mut out).await?;

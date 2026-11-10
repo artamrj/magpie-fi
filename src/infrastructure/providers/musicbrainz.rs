@@ -109,6 +109,86 @@ pub async fn artist_aliases(
     Ok(aliases)
 }
 
+/// One artist as MusicBrainz knows it, with every spelling it lists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ArtistIdentity {
+    pub id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    /// MusicBrainz says this is a group (a band or duo), not a person.
+    pub group: bool,
+}
+
+/// The artist this exact name belongs to, only when MusicBrainz is sure: its
+/// best search result scores 95+ and has this name or alias (same match key).
+/// Several artists with the same name, or a weak match, give `None`.
+pub async fn artist_identity(
+    pool: &SqlitePool,
+    client: &Client,
+    artist: &str,
+) -> Result<Option<ArtistIdentity>> {
+    let query = format!("artist:{}", lucene_phrase(artist));
+    let raw = provider_cache::cached(
+        pool,
+        "musicbrainz",
+        &format!("artist-aliases:{}", search_key(&query)),
+        ChronoDuration::days(30),
+        || {
+            request_json(client.get("https://musicbrainz.org/ws/2/artist").query(&[
+                ("fmt", "json"),
+                ("limit", "3"),
+                ("query", &query),
+            ]))
+        },
+    )
+    .await?;
+    Ok(identity_from_search(&raw, artist))
+}
+
+fn identity_from_search(raw: &Value, artist: &str) -> Option<ArtistIdentity> {
+    let wanted = crate::domain::names::match_key(artist);
+    let names_of = |found: &Value| {
+        std::iter::once(found["name"].as_str())
+            .chain(found["sort-name"].as_str().map(Some))
+            .chain(
+                found["aliases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|alias| alias["name"].as_str()),
+            )
+            .flatten()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let matching = raw["artists"]
+        .as_array()?
+        .iter()
+        .filter(|found| found["score"].as_i64().unwrap_or(0) >= 95)
+        .filter(|found| {
+            names_of(found)
+                .iter()
+                .any(|name| crate::domain::names::match_key(name) == wanted)
+        })
+        .collect::<Vec<_>>();
+    // Two different artists with this exact name: MusicBrainz cannot tell which.
+    let [found] = matching.as_slice() else {
+        return None;
+    };
+    let mut aliases = names_of(found);
+    aliases.retain(|alias| !alias.trim().is_empty());
+    aliases.sort();
+    aliases.dedup();
+    Some(ArtistIdentity {
+        id: found["id"].as_str()?.to_owned(),
+        name: found["name"].as_str()?.to_owned(),
+        aliases,
+        group: found["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("group")),
+    })
+}
+
 fn candidate_from_recording(raw: &Value, id: &str) -> Candidate {
     let release = best_recording_release(raw, id);
     let release_group = release.and_then(|v| v.get("release-group"));
@@ -313,6 +393,7 @@ fn parse_artist_credits(value: &Value) -> Vec<ArtistCredit> {
                 name: name.to_owned(),
                 join_phrase: credit["joinphrase"].as_str().unwrap_or_default().to_owned(),
                 musicbrainz_id: credit["artist"]["id"].as_str().map(str::to_owned),
+                artist_id: None,
             })
         })
         .collect()
@@ -415,6 +496,29 @@ mod tests {
         );
         assert!(candidate.is_compilation);
         assert_eq!(candidate.duration_delta, Some(180.0));
+    }
+
+    #[test]
+    fn an_artist_identity_needs_one_sure_match() {
+        let raw = serde_json::json!({"artists": [
+            {"id": "mb-googoosh", "name": "Googoosh", "sort-name": "Googoosh", "score": 100,
+             "type": "Person",
+             "aliases": [{"name": "گوگوش"}, {"name": "Gugush"}, {"name": "Faegheh Atashin"}]},
+            {"id": "mb-other", "name": "Googoosh Tribute Band", "score": 70}
+        ]});
+        let found = identity_from_search(&raw, "گوگوش").unwrap();
+        assert_eq!(found.id, "mb-googoosh");
+        assert!(found.aliases.contains(&"Gugush".to_owned()));
+        assert!(!found.group);
+        // A name MusicBrainz does not list for that artist gives nothing.
+        assert_eq!(identity_from_search(&raw, "Ebi"), None);
+
+        // Two artists with exactly this name: not sure which one.
+        let ambiguous = serde_json::json!({"artists": [
+            {"id": "a", "name": "Sara", "score": 100},
+            {"id": "b", "name": "Sara", "score": 100}
+        ]});
+        assert_eq!(identity_from_search(&ambiguous, "Sara"), None);
     }
 
     #[tokio::test]

@@ -234,18 +234,26 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 **Library index.** `library_items` (`src/application/library.rs`) keeps one row per audio file in
 the library: path, size, mtime, duration, content key (fingerprint or SHA-256), ISRC, MusicBrainz
-recording ID, format and bitrate. It is filled when magpie-fi files a song and by
+recording ID, format, bitrate, the Chromaprint fingerprint, the title key and the artist
+identities (`|3|17|`, primary first). It is filled when magpie-fi files a song and by
 `library::index_library` (at start and every six hours), which also indexes music added by hand
-and forgets deleted files. A new song is the same recording as a library file when the content
-is identical, or when the fingerprint, ISRC or MusicBrainz recording ID match **and** the durations
-are within 3 seconds.
+and forgets deleted files; rows from before these columns are filled 500 per pass. A new song is
+the same recording as a library file when the content is identical, or when the fingerprint
+string, ISRC or MusicBrainz recording ID match **and** the durations are within 3 seconds, or
+when the fingerprints **sound the same** (`domain::fingerprint::similarity` ≥ 0.85, best of ±15 s
+offsets; re-encodes score 0.95–1.0, different songs 0.45–0.69) with durations within 3 seconds.
+
+**Possible duplicates.** Without that proof, a song with the same title key (`feat.` removed,
+spelling unified), a length within 3 s and an overlapping primary artist (in any order or
+spelling) goes back to Review as "Possible duplicate" before filing. **File anyway** files it.
 
 **Duplicates inside the inbox.** `input_dedup::group_recordings` groups files by proof only, never
 by title:
 
 - same SHA-256 — always;
 - same Chromaprint fingerprint — only when durations are within ±3 s;
-- same ISRC — only when durations are within ±3 s.
+- same ISRC — only when durations are within ±3 s;
+- fingerprints that sound the same (≥ 0.85) — only when durations are within ±3 s.
 
 The best-quality file of each group (lossless first, then bitrate, then path) is identified
 online; the others become `duplicate/skipped` and are trashed when it is filed. Remixes, live

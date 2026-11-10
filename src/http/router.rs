@@ -20,6 +20,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/inbox/check", post(handlers::check_inbox))
         .route("/stop", post(handlers::stop_scan))
         .route("/tracks", get(handlers::list_tracks))
+        .route("/artists", get(handlers::list_artists))
+        .route("/artists/{id}", post(handlers::change_artist))
         .route(
             "/tracks/{id}",
             axum::routing::delete(handlers::remove_track),
@@ -30,6 +32,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/source/resolve", post(handlers::resolve_source))
         .route("/tracks/{id}/choose", post(handlers::select_candidate))
         .route("/tracks/{id}/review", post(handlers::return_to_review))
+        .route("/tracks/{id}/file-anyway", post(handlers::file_anyway))
         .route(
             "/tracks/{id}/manual",
             axum::routing::put(handlers::manual_candidate),

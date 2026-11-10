@@ -244,10 +244,14 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 | Single / EP | `Dua Lipa/Houdini (2023) [Single]/01 - Houdini.m4a` |
 | Compilation | `Various Artists/Drive (2011)/02 - Kavinsky - Nightcall.m4a` |
 | Featured artists | only in tags, never in folder names |
+| Several artists (`Ebi & Shadmehr Aghili`) | `Ebi/Song (2024) [Single]/01 - Song.m4a`; both in `ARTISTS` |
 | Unknown album | does not enter `library/`; stays in Review |
 
 - **Singles are albums**: a one-track release folder, keeping the song's own title as album name.
-- Folder artist = **album artist**, never the track artist.
+- Folder artist = **the first album artist's identity**, never the track artist and never a
+  combined `A & B` name. Every spelling of an artist (`گوگوش`, `Googoosh`, `GOOGOOSH`) has one
+  identity, so one folder (§5.4).
+- Songs of one new album filed together get one year, so the album never splits.
 - A song whose year differs from an album folder that already exists joins that folder, so an
   album never splits in two.
 - Every name is Unicode **NFC**; `/ \ : * ? " < > |` and control characters are replaced,
@@ -273,7 +277,22 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 Tags are written and verified on a temporary copy **before** the file enters `library/`, so
 Navidrome never sees a half-tagged file and never sees a retag and a move in one scan.
 
-### 5.4 Navidrome
+### 5.4 Artists
+
+One identity per artist (`artists`, every spelling in `artist_names`), so all spellings share one
+name in `ARTISTS` / `ALBUMARTISTS` and one folder:
+
+- Spellings match by a key that unifies Persian and Arabic letters, ZWNJ, accents, `&`/`and` and
+  a leading `the`; Latin transliterations (`Yeganeh`/`Yegane`) match when only one artist fits.
+  A new Persian-script name is looked up on MusicBrainz and joins its Latin spelling.
+- `A & B`, `A x B`, `A, B`, `A و B` become separate artists only when each part is a known artist
+  and the whole is not known as one (a band or duo with an MBID, or marked by you).
+- New artists are learned only when a song is filed or the library is indexed, never from search
+  results.
+- The **Artists** page lists them with their spellings: rename, join two, split a duet, or mark
+  "one artist". The songs are retagged and moved; Navidrome may then see them as new songs.
+
+### 5.5 Navidrome
 
 Recommended Navidrome settings: file watcher on, playlists auto-imported from `Playlists`,
 `Scanner.PurgeMissing = "never"`. Navidrome uses the cover and lyrics inside each song (it reads

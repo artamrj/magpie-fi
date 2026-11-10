@@ -156,9 +156,13 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
                 .unwrap_or_default(),
             track.current_album.as_deref(),
         );
+        // Filing is where new artists are learned (with MusicBrainz for
+        // Persian-script names, so they join their Latin spelling).
         crate::application::canonical_names::canonicalize_candidates(
             &s.pool,
+            Some(&s.client),
             std::slice::from_mut(candidate),
+            crate::application::artists::Mode::Learn,
         )
         .await?;
         db::candidates::update(&s.pool, candidate).await?;
@@ -196,6 +200,7 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
                 .candidate
                 .as_ref()
                 .and_then(|candidate| candidate.isrc.clone()),
+            fingerprint: None,
         });
     }
 
@@ -244,9 +249,52 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
             }
         }
     }
+    align_planned_albums(&s.config.output_dir, &mut prepared.items);
     prepared.outputs = prepared.items.len();
     prepared.duplicates_skipped = prepared.selected_count.saturating_sub(prepared.outputs);
     Ok(prepared)
+}
+
+/// Songs of one new album filed in the same batch get the year of the first
+/// one, so they share one folder and Navidrome never splits the album.
+fn align_planned_albums(output_dir: &str, items: &mut [PreviewItem]) {
+    let library = Path::new(output_dir);
+    let mut first_year = std::collections::HashMap::<(PathBuf, String, &str), String>::new();
+    for item in items {
+        let destination = PathBuf::from(&item.destination_path);
+        let (Some(artist_folder), Some(album), Some(year)) = (
+            destination.parent().and_then(Path::parent),
+            item.candidate.album.as_deref(),
+            library::release_year(&item.candidate),
+        ) else {
+            continue;
+        };
+        let key = (
+            artist_folder.to_path_buf(),
+            crate::domain::names::match_key(album),
+            library::release_suffix(&item.candidate),
+        );
+        let first = first_year.entry(key).or_insert_with(|| year.clone());
+        if *first == year {
+            continue;
+        }
+        item.candidate.year = Some(first.clone());
+        if item
+            .candidate
+            .release_date
+            .as_deref()
+            .is_some_and(|date| !date.starts_with(first.as_str()))
+        {
+            item.candidate.release_date = None;
+        }
+        let extension = destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mp3");
+        item.destination_path = library::destination(library, &item.candidate, extension)
+            .to_string_lossy()
+            .into_owned();
+    }
 }
 
 /// One output per group of duplicate inputs: the best available file carries
@@ -442,9 +490,10 @@ async fn recording_evidence(
     candidate: Option<&Candidate>,
 ) -> Result<RecordingEvidence> {
     let path = Path::new(&track.path);
+    let cached = fingerprint_cache::cached(pool, path).await?;
     let content_key = if track.content_fingerprint.is_some() {
         track.content_fingerprint.clone()
-    } else if let Some(value) = fingerprint_cache::cached(pool, path).await? {
+    } else if let Some(value) = &cached {
         input_dedup::fingerprint_key(&value.fingerprint)
     } else {
         Some(input_dedup::hash_key(
@@ -458,6 +507,7 @@ async fn recording_evidence(
         duration: track.duration,
         content_key,
         isrc: candidate.and_then(|candidate| candidate.isrc.clone()),
+        fingerprint: cached.map(|value| value.fingerprint),
     })
 }
 
@@ -768,6 +818,24 @@ async fn file_item(
         Some(existing) => Some(PathBuf::from(existing.path)),
         None => None,
     };
+    let artist_ids = candidate
+        .artist_credits
+        .iter()
+        .filter_map(|credit| credit.artist_id)
+        .collect::<Vec<_>>();
+    if replaces.is_none()
+        && let Some(existing) = library::find_possible_duplicate(
+            &s.pool,
+            &candidate.title,
+            item.evidence.duration,
+            &artist_ids,
+        )
+        .await?
+        && !duplicate_allowed(s, item.track_id).await?
+    {
+        return_track_as_possible_duplicate(s, item.track_id, &existing).await?;
+        return Ok(Filing::NotFiled);
+    }
 
     let artwork = match resolve_artwork(s, &item.filename, candidate).await {
         Ok(artwork) => artwork,
@@ -829,6 +897,7 @@ async fn file_item(
             library::move_to_trash(&cfg.trash_dir, Path::new(&cfg.output_dir), &file).await?;
         }
         library::forget(&s.pool, &old).await?;
+        crate::acquire::library_file_moved(s, &old, &final_path).await;
         tracing::info!(
             file = item.filename,
             replaced = %old.display(),
@@ -849,6 +918,8 @@ async fn file_item(
             format: item.evidence.format.clone(),
             bitrate: item.evidence.bitrate,
             source: "inbox".into(),
+            fingerprint: item.evidence.fingerprint.clone(),
+            artist_ids,
         },
     )
     .await?;
@@ -1036,6 +1107,46 @@ async fn finish_batch(touched_albums: &BTreeSet<PathBuf>) {
     }
 }
 
+/// Start of the Review message for a possible duplicate (the web page looks for it).
+pub const POSSIBLE_DUPLICATE: &str = "Possible duplicate: you may already have this song as ";
+
+async fn duplicate_allowed(s: &AppState, track_id: TrackId) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, bool>("SELECT allow_duplicate FROM tracks WHERE id=?")
+            .bind(track_id.0)
+            .fetch_optional(&s.pool)
+            .await?
+            .unwrap_or(false),
+    )
+}
+
+/// Probably already in the library under another spelling: the owner decides
+/// ("File anyway" files it; otherwise remove it from the inbox).
+async fn return_track_as_possible_duplicate(
+    s: &AppState,
+    track_id: TrackId,
+    existing: &str,
+) -> Result<()> {
+    let shown = Path::new(existing)
+        .strip_prefix(&s.config.output_dir)
+        .map_or_else(|_| existing.to_owned(), |path| path.display().to_string());
+    let detail = format!("{POSSIBLE_DUPLICATE}{shown}");
+    sqlx::query(
+        "UPDATE tracks SET status='needs_review',stage='review',stage_message=?,error=NULL,updated_at=? WHERE id=?",
+    )
+    .bind(&detail)
+    .bind(Utc::now().to_rfc3339())
+    .bind(track_id.0)
+    .execute(&s.pool)
+    .await?;
+    tracing::info!(
+        track_id = track_id.0,
+        existing,
+        "possible duplicate returned to review"
+    );
+    Ok(())
+}
+
 /// The cover failed at the last check. The match stays chosen, but its cover is
 /// marked as missing (or as a temporary failure that "Check & fix" retries), so
 /// the page asks for a cover instead of showing a verified one that is stuck.
@@ -1199,6 +1310,43 @@ mod tests {
             .write_to(&mut output, image::ImageFormat::Png)
             .unwrap();
         output.into_inner()
+    }
+
+    #[test]
+    fn one_new_album_in_one_batch_gets_one_year() {
+        let item = |title: &str, year: &str| {
+            let candidate = Candidate {
+                title: title.into(),
+                artist: "Ebi".into(),
+                album: Some("Khalij".into()),
+                album_artist: Some("Ebi".into()),
+                year: Some(year.into()),
+                ..Default::default()
+            };
+            PreviewItem {
+                track_id: TrackId(1),
+                filename: format!("{title}.mp3"),
+                current_path: format!("/inbox/{title}.mp3"),
+                destination_path: library::destination(Path::new("/lib"), &candidate, "mp3")
+                    .to_string_lossy()
+                    .into_owned(),
+                candidate,
+                evidence: RecordingEvidence::default(),
+                duplicates: Vec::new(),
+            }
+        };
+        // One catalog says 1999, another 2001 for a later track of the same album.
+        let mut items = vec![item("Khalij", "1999"), item("Shabe Eshgh", "2001-05-01")];
+        align_planned_albums("/lib", &mut items);
+        assert_eq!(items[1].candidate.year.as_deref(), Some("1999"));
+        assert_eq!(items[1].candidate.release_date, None);
+        assert!(
+            items[1]
+                .destination_path
+                .starts_with("/lib/Ebi/Khalij (1999)/"),
+            "{}",
+            items[1].destination_path
+        );
     }
 
     #[tokio::test]

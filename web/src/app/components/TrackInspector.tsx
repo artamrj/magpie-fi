@@ -14,6 +14,7 @@ import {
   friendlyTrackError,
   googleMetadataUrl,
   hasRetryableArtwork,
+  isPossibleDuplicate,
   isProblem,
   isReview,
   metadataAudit,
@@ -37,6 +38,7 @@ export function TrackInspector({
   const [editing, setEditing] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [undoing, setUndoing] = useState(false);
+  const [filingAnyway, setFilingAnyway] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [searchingCover, setSearchingCover] = useState(false);
   const [savingCover, setSavingCover] = useState(false);
@@ -86,6 +88,8 @@ export function TrackInspector({
     }
   };
   const undoIdentification = () => act(setUndoing, () => post(`/tracks/${track.id}/review`));
+  const fileAnyway = () => act(setFilingAnyway, () => post(`/tracks/${track.id}/file-anyway`));
+  const possibleDuplicate = isPossibleDuplicate(track);
   const acceptCandidate = async (candidateId: number) => {
     setChoosingId(candidateId);
     setActionError("");
@@ -195,19 +199,39 @@ export function TrackInspector({
             <b>
               {isProblem(track)
                 ? problemTitle(track)
-                : track.stage === "skipped"
-                  ? "Duplicate input"
-                  : hasRetryableArtwork(track)
-                    ? "Cover download temporarily unavailable"
-                    : coverNeeded
-                      ? "A verified cover is required"
-                      : "Your review is needed"}
+                : possibleDuplicate
+                  ? "Possibly already in your library"
+                  : track.stage === "skipped"
+                    ? "Duplicate input"
+                    : hasRetryableArtwork(track)
+                      ? "Cover download temporarily unavailable"
+                      : coverNeeded
+                        ? "A verified cover is required"
+                        : "Your review is needed"}
             </b>
             <p>
               {track.stage_message ||
                 friendlyTrackError(track) ||
                 "The available matches are too close to choose safely."}
             </p>
+            {possibleDuplicate && (
+              <div className="cover-search-actions">
+                <div>
+                  <button
+                    className="compact-button accent"
+                    disabled={filingAnyway}
+                    onClick={() => void fileAnyway()}
+                  >
+                    {filingAnyway ? <span className="spinner" /> : <Icon name="check" size={15} />}
+                    File anyway
+                  </button>
+                </div>
+                <p>
+                  A different version or song? File it. The same song? Remove it from the inbox
+                  below.
+                </p>
+              </div>
+            )}
             {coverNeeded && (
               <div className="cover-search-actions">
                 <div>

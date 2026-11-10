@@ -129,6 +129,7 @@ pub async fn remove_track(
                     duration: duplicate.duration,
                     content_key: duplicate.content_fingerprint.clone(),
                     isrc: None,
+                    fingerprint: None,
                 },
             )
             .collect::<Vec<_>>();
@@ -497,6 +498,36 @@ pub async fn return_to_review(
         ));
     }
     Ok(Json(serde_json::json!({"returned_to_review": true})))
+}
+
+/// `POST /api/tracks/{id}/file-anyway`: the owner checked a possible duplicate
+/// and wants this song filed too.
+pub async fn file_anyway(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if s.workflow_running().await {
+        return Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        ));
+    }
+    let changed = sqlx::query(
+        "UPDATE tracks SET allow_duplicate=1,status='selected',stage='ready',
+           stage_message='Will be filed although a similar song is in your library',updated_at=?
+         WHERE id=? AND selected_candidate_id IS NOT NULL AND stage='review'",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id.0)
+    .execute(&s.pool)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::validation(
+            "Only a chosen song waiting in Review can be filed anyway",
+        ));
+    }
+    s.notify_automation_scheduler();
+    Ok(Json(serde_json::json!({"ready": true})))
 }
 
 pub async fn manual_candidate(

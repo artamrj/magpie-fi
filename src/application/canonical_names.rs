@@ -1,7 +1,4 @@
-use crate::{
-    domain::credits::{display_artist, identity_key},
-    infrastructure::providers::{ArtistCredit, Candidate},
-};
+use crate::{domain::credits::identity_key, infrastructure::providers::Candidate};
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -13,23 +10,20 @@ struct Canonical {
     authority: i64,
 }
 
-/// Gives every artist and title the most trusted spelling seen so far, across
-/// these candidates and earlier scans. Expects credits already normalized
-/// (see [`normalize_credits`]).
+/// Resolves every artist to its identity (see [`crate::application::artists`])
+/// and gives every title the most trusted spelling seen so far, across these
+/// candidates and earlier scans. Expects credits already normalized (see
+/// [`normalize_credits`]). `Mode::Learn` (filing) also creates new artists.
 pub async fn canonicalize_candidates(
     pool: &SqlitePool,
+    client: Option<&reqwest::Client>,
     candidates: &mut [Candidate],
+    mode: crate::application::artists::Mode,
 ) -> Result<()> {
+    crate::application::artists::resolve_candidates(pool, client, candidates, mode).await?;
     let mut winners = HashMap::<(String, String), Canonical>::new();
     for candidate in candidates.iter() {
         let authority = provider_authority(&candidate.provider);
-        collect_credits(&mut winners, "artist", &candidate.artist_credits, authority);
-        collect_credits(
-            &mut winners,
-            "artist",
-            &candidate.album_artist_credits,
-            authority,
-        );
         winners
             .entry(("title".into(), title_identity(candidate)))
             .and_modify(|current| {
@@ -69,14 +63,6 @@ pub async fn canonicalize_candidates(
     transaction.commit().await?;
 
     for candidate in candidates {
-        apply_credits(&mut candidate.artist_credits, &winners);
-        apply_credits(&mut candidate.album_artist_credits, &winners);
-        if !candidate.artist_credits.is_empty() {
-            candidate.artist = display_artist(&candidate.artist_credits);
-        }
-        if !candidate.album_artist_credits.is_empty() {
-            candidate.album_artist = Some(display_artist(&candidate.album_artist_credits));
-        }
         if let Some(canonical) = winners.get(&("title".into(), title_identity(candidate))) {
             candidate.title = canonical.value.clone();
         }
@@ -108,50 +94,6 @@ pub fn normalize_credits(candidate: &mut Candidate) {
     }
 }
 
-fn collect_credits(
-    winners: &mut HashMap<(String, String), Canonical>,
-    kind: &str,
-    credits: &[ArtistCredit],
-    authority: i64,
-) {
-    for credit in credits {
-        for key in artist_identities(credit) {
-            winners
-                .entry((kind.to_owned(), key))
-                .and_modify(|current| {
-                    if authority > current.authority {
-                        current.value = credit.name.clone();
-                        current.authority = authority;
-                    }
-                })
-                .or_insert_with(|| Canonical {
-                    value: credit.name.clone(),
-                    authority,
-                });
-        }
-    }
-}
-
-fn apply_credits(credits: &mut [ArtistCredit], winners: &HashMap<(String, String), Canonical>) {
-    for credit in credits {
-        if let Some(canonical) = artist_identities(credit)
-            .into_iter()
-            .filter_map(|key| winners.get(&("artist".into(), key)))
-            .max_by_key(|canonical| canonical.authority)
-        {
-            credit.name = canonical.value.clone();
-        }
-    }
-}
-
-fn artist_identities(credit: &ArtistCredit) -> Vec<String> {
-    let mut keys = vec![format!("name:{}", identity_key(&credit.name))];
-    if let Some(id) = credit.musicbrainz_id.as_deref() {
-        keys.insert(0, format!("mbid:{}", id.trim().to_ascii_lowercase()));
-    }
-    keys
-}
-
 fn title_identity(candidate: &Candidate) -> String {
     if let Some(id) = candidate.recording_id.as_deref() {
         return format!("mbid:{}", id.trim().to_ascii_lowercase());
@@ -180,6 +122,7 @@ fn provider_authority(provider: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::providers::ArtistCredit;
 
     #[tokio::test]
     async fn trusted_spelling_wins_and_persists() {
@@ -206,9 +149,14 @@ mod tests {
                 ..Default::default()
             },
         ];
-        canonicalize_candidates(&pool, &mut candidates)
-            .await
-            .unwrap();
+        canonicalize_candidates(
+            &pool,
+            None,
+            &mut candidates,
+            crate::application::artists::Mode::Lookup,
+        )
+        .await
+        .unwrap();
         assert!(
             candidates
                 .iter()
@@ -234,9 +182,14 @@ mod tests {
             ..Default::default()
         }];
 
-        canonicalize_candidates(&pool, &mut candidates)
-            .await
-            .unwrap();
+        canonicalize_candidates(
+            &pool,
+            None,
+            &mut candidates,
+            crate::application::artists::Mode::Lookup,
+        )
+        .await
+        .unwrap();
 
         let candidate = &candidates[0];
         assert_eq!(candidate.artist, "Selena Gomez & the Scene");

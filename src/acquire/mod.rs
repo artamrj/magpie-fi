@@ -32,6 +32,15 @@ pub async fn downloaded_file_done(
     }
 }
 
+/// A library file moved: songs and playlists that pointed at it follow.
+pub async fn library_file_moved(state: &Arc<AppState>, old: &Path, new: &Path) {
+    match store::library_file_moved(&state.pool, old, new).await {
+        Ok(requests) if !requests.is_empty() => refresh_playlists(state, &requests).await,
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not update songs for a moved library file"),
+    }
+}
+
 /// Rewrites the playlist files of these requests. Navidrome's file watcher
 /// picks up the change.
 pub async fn refresh_playlists(state: &Arc<AppState>, requests: &[i64]) {

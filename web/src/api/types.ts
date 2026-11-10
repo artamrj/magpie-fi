@@ -16,6 +16,20 @@ export type Setup = {
   sources: Record<string, boolean>;
 };
 /** Who is using the page (GET /api/me). */
+/** An artist in the library: one name for all its spellings. */
+export type ArtistSummary = {
+  id: number;
+  name: string;
+  spellings: string[];
+  songs: number;
+  musicbrainz_id?: string | null;
+  single_entity: boolean;
+  looks_like_several: boolean;
+};
+
+/** What an artist change did to the songs. */
+export type ArtistChanged = { retagged: number; moved: number };
+
 export type Me = {
   role: "owner" | "guest";
   via: "telegram" | "session" | "local";

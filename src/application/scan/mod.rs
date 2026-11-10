@@ -324,6 +324,7 @@ async fn prepare_input_jobs(
             duration: input.info.as_ref().map(|info| info.duration),
             content_key: input.content_key.clone(),
             isrc: None,
+            fingerprint: input.fingerprint.clone(),
         })
         .collect::<Vec<_>>();
     Ok(input_dedup::group_recordings(&evidence)
@@ -350,29 +351,36 @@ async fn prepare_input(state: &AppState, limits: &PipelineLimits, path: PathBuf)
         integrity,
         Some(IntegrityCheck::Healthy | IntegrityCheck::Unavailable(_))
     );
-    let content_key = if healthy {
+    let (content_key, fingerprint) = if healthy {
         match limits.fingerprint.acquire().await {
             Ok(_permit) => match fingerprint_cache::get_or_calculate(&state.pool, &path, || async {
                 fingerprint::calculate(&path).await
             })
             .await
             {
-                Ok(value) => input_dedup::fingerprint_key(&value.fingerprint),
-                Err(_) => input_dedup::sha256_cached(&state.pool, &path)
-                    .await
-                    .ok()
-                    .map(|hash| input_dedup::hash_key(&hash)),
+                Ok(value) => (
+                    input_dedup::fingerprint_key(&value.fingerprint),
+                    Some(value.fingerprint),
+                ),
+                Err(_) => (
+                    input_dedup::sha256_cached(&state.pool, &path)
+                        .await
+                        .ok()
+                        .map(|hash| input_dedup::hash_key(&hash)),
+                    None,
+                ),
             },
-            Err(_) => None,
+            Err(_) => (None, None),
         }
     } else {
-        None
+        (None, None)
     };
     PreparedInput {
         path,
         info,
         integrity,
         content_key,
+        fingerprint,
     }
 }
 
@@ -424,6 +432,7 @@ pub(super) struct PreparedInput {
     pub(super) info: Option<audio::AudioInfo>,
     pub(super) integrity: Option<IntegrityCheck>,
     pub(super) content_key: Option<String>,
+    pub(super) fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug)]

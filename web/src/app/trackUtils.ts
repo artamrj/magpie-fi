@@ -343,3 +343,8 @@ export function metadataAudit(candidate: Candidate) {
     missing: fields.filter(([, present]) => !present).map(([name]) => name),
   };
 }
+
+/** Filing stopped because the library probably has this song already. */
+export const isPossibleDuplicate = (track: Track) =>
+  track.stage === "review" &&
+  (track.stage_message ?? "").startsWith("Possible duplicate: you may already have this song as ");

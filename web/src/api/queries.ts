@@ -1,7 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { busyPhases } from "../app/trackUtils";
 import { api } from "./client";
-import type { Me, MusicRequest, RecentSong, Setup, Track, WantedSong, Workflow } from "./types";
+import type {
+  ArtistSummary,
+  Me,
+  MusicRequest,
+  RecentSong,
+  Setup,
+  Track,
+  WantedSong,
+  Workflow,
+} from "./types";
 
 export const queryKeys = {
   me: ["me"] as const,
@@ -10,7 +19,15 @@ export const queryKeys = {
   tracks: ["tracks"] as const,
   requests: ["requests"] as const,
   recent: ["library", "recent"] as const,
+  artists: ["artists"] as const,
 };
+
+export function useArtistsQuery() {
+  return useQuery({
+    queryKey: queryKeys.artists,
+    queryFn: () => api<ArtistSummary[]>("/artists"),
+  });
+}
 
 export function useMeQuery() {
   return useQuery({

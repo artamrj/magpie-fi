@@ -8,6 +8,7 @@ import { ViewTabs } from "./components/ViewTabs";
 import { TrackRow } from "./components/TrackRow";
 import { TrackInspector, InspectorEmpty } from "./components/TrackInspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
+import { Artists } from "./components/Artists";
 import { GetMusic } from "./components/GetMusic";
 import { askConfirm, startView, telegram } from "./telegram";
 import { ProcessingDock } from "./components/ProcessingDock";
@@ -59,7 +60,7 @@ export function App() {
   const [selectedId, setSelectedId] = useState<number>();
   // Links from the bot open straight on Review (?view=review).
   const [filter, setFilter] = useState<QueueFilter>(startView === "review" ? "review" : "all");
-  const [view, setView] = useState<"get" | "queue">("queue");
+  const [view, setView] = useState<"get" | "queue" | "artists">("queue");
   const [queueOrder, setQueueOrder] = useState<QueueOrder>("queue");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -303,6 +304,7 @@ export function App() {
     counts,
     total: tracks.length,
     onGet: () => setView("get"),
+    onArtists: () => setView("artists"),
     onFilter: changeFilter,
   };
   // Review offers to retry covers that failed to download; Issues offers to check and fix.
@@ -418,6 +420,8 @@ export function App() {
 
       {view === "get" ? (
         <GetMusic onError={setError} />
+      ) : view === "artists" ? (
+        <Artists onError={setError} onNotice={setNotice} />
       ) : (
         <main className="workspace" id="workspace">
           <section className="queue-panel" aria-labelledby="queue-title">

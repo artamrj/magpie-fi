@@ -8,14 +8,16 @@ export function ViewTabs({
   counts,
   total,
   onGet,
+  onArtists,
   onFilter,
 }: {
   className: string;
-  view: "get" | "queue";
+  view: "get" | "queue" | "artists";
   filter: QueueFilter;
   counts: { review: number; problems: number; ready: number };
   total: number;
   onGet: () => void;
+  onArtists: () => void;
   onFilter: (filter: QueueFilter) => void;
 }) {
   const tab = (filterValue: QueueFilter, label: string, count: number, tabClass = "") => (
@@ -36,6 +38,7 @@ export function ViewTabs({
         {tab("problems", "Issues", counts.problems)}
         {tab("ready", "Ready", counts.ready)}
       </div>
+      <Tab active={view === "artists"} onClick={onArtists} label="Artists" />
     </nav>
   );
 }

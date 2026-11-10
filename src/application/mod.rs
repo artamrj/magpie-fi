@@ -1,4 +1,6 @@
 pub mod apply;
+pub mod artist_changes;
+pub mod artists;
 pub mod artwork;
 pub mod canonical_names;
 pub mod files;
@@ -31,7 +33,13 @@ pub async fn finalize_selection(
     if let Some(donors) = donors {
         metadata_completion::complete(candidate, donors.candidates, donors.existing_album);
     }
-    canonical_names::canonicalize_candidates(&state.pool, std::slice::from_mut(candidate)).await?;
+    canonical_names::canonicalize_candidates(
+        &state.pool,
+        None,
+        std::slice::from_mut(candidate),
+        artists::Mode::Lookup,
+    )
+    .await?;
     {
         let _permit = state.artwork_downloads.acquire().await?;
         artwork::ensure_usable_cover(&state.pool, &state.client, candidate).await;

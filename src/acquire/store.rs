@@ -303,6 +303,23 @@ pub async fn retry_failed(pool: &SqlitePool, request_id: i64) -> Result<u64> {
     .rows_affected())
 }
 
+/// A library file moved (replaced by a better copy, or its artist renamed):
+/// the songs that pointed at it follow. Returns the requests whose playlists
+/// must be rewritten.
+pub async fn library_file_moved(pool: &SqlitePool, old: &Path, new: &Path) -> Result<Vec<i64>> {
+    let mut requests: Vec<i64> = sqlx::query_scalar(
+        "UPDATE wanted SET library_path=?,updated_at=? WHERE library_path=? RETURNING request_id",
+    )
+    .bind(new.to_string_lossy().as_ref())
+    .bind(Utc::now().to_rfc3339())
+    .bind(old.to_string_lossy().as_ref())
+    .fetch_all(pool)
+    .await?;
+    requests.sort_unstable();
+    requests.dedup();
+    Ok(requests)
+}
+
 /// The playlist file of a request, with its songs in order.
 pub async fn playlist_for_request(
     pool: &SqlitePool,
@@ -714,6 +731,17 @@ mod tests {
         let summary = &list_requests(&pool, 10).await.unwrap()[0];
         assert_eq!((summary.total, summary.done), (2, 2));
         assert_eq!(summary.title.as_deref(), Some("Road Trip"));
+
+        // A lossless copy replaces B: the playlist follows it.
+        let lossless_b = directory.path().join("B.flac");
+        assert_eq!(
+            library_file_moved(&pool, &library_b, &lossless_b)
+                .await
+                .unwrap(),
+            vec![request]
+        );
+        let (_, paths) = playlist_for_request(&pool, request).await.unwrap().unwrap();
+        assert_eq!(paths[1], lossless_b.to_str().unwrap());
     }
 
     #[tokio::test]

@@ -1,7 +1,9 @@
 pub mod audio;
 pub mod credits;
+pub mod fingerprint;
 pub mod genre;
 pub mod matcher;
+pub mod names;
 
 /// How a provider id is shown to people ("itunes" → "Apple Music").
 /// Unknown ids are shown as they are.

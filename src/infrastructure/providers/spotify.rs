@@ -220,6 +220,7 @@ fn spotify_credits(value: &Value) -> Vec<ArtistCredit> {
                 name: artist["name"].as_str()?.to_owned(),
                 join_phrase: String::new(),
                 musicbrainz_id: None,
+                artist_id: None,
             })
         })
         .collect::<Vec<_>>();

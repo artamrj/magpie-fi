@@ -178,6 +178,52 @@ All thresholds and weights are in one place and covered by tests built from real
 - Folders come from the identity, so they never fork. When the display name changes, the
   artist's files are moved (no retag in the same step, so Navidrome keeps play counts).
 
+### 2.4b Songs with several artists
+
+**Today.** Text from a source is only split at ` / `, `feat.`, `ft.` and `;`. `&`, `x`, `,` and
+`و` stay inside one name on purpose (`Simon & Garfunkel` is one band). So `Ebi & Shadmehr Aghili`
+from iTunes becomes one artist: its own folder, its own artist in Navidrome, and the song is
+missing from both singers' pages. Only sources that list artists separately (MusicBrainz, Spotify)
+give two artists. The folder uses the album artist text as written, so `Ebi & Shadmehr Aghili/`,
+`Shadmehr Aghili & Ebi/` and `Ebi/` can all appear for one duet.
+
+**Like Spotify and Apple Music.** A song has an ordered list of artists, each a real artist
+identity; the title never carries `(feat. …)`; the song shows on every artist's page; the album
+belongs to its album artist(s). Navidrome (since 0.55) works the same way when the tags say so:
+
+| Tag | Example | Navidrome uses it for |
+|---|---|---|
+| `ARTIST` | `Ebi & Shadmehr Aghili` | the display text, exactly as credited |
+| `ARTISTS` (one value per artist) | `Ebi`, `Shadmehr Aghili` | linking the song to each artist |
+| `ALBUMARTIST` / `ALBUMARTISTS` | `Ebi` | which artist the album belongs to |
+| `MUSICBRAINZ_ARTISTID` (one per artist) | two IDs, same order | stable artist identity |
+
+**The rules**
+
+1. **Split by identity, not by character.** A credit is split at `&`, `x`, `,`, `و`, `،`, `with`,
+   `vs.` only when every part is a known artist identity (§2.4) and the whole is not one (a band
+   such as `Simon & Garfunkel` or `Earth, Wind & Fire`, known from MusicBrainz or the owner).
+   Structured lists from a source are used as given.
+2. **One folder per primary artist.** The folder is the first album artist's identity folder:
+   `Ebi/Song (2024) [Single]/01 - Song.m4a`, never `Ebi & Shadmehr Aghili/`. The second singer
+   gets the song through `ARTISTS`, not through a folder. Compilations stay in `Various Artists/`.
+3. **Featured artists** are moved out of the title into `ARTISTS` (`feat.` stays in the `ARTIST`
+   display text).
+4. **The owner can fix it once**: "these are two artists" or "this is one band" in the web page,
+   stored in the identity table, so it applies to every later song.
+
+**Duplicates with several artists.** A recording is the same when:
+
+- the audio says so: AcoustID or fingerprint *similarity* (step C replaces the exact hash), ISRC,
+  or MusicBrainz recording ID; credits play no part in this; or
+- without that proof: the **set** of artist identities overlaps on the primary artist, the title
+  key (without `feat.` and version noise) matches, and the length is within 3 s. Order and
+  spelling do not matter, so `Ebi & Shadmehr – Song`, `Shadmehr feat. Ebi – Song` and
+  `Ebi – Song (feat. Shadmehr)` are one song. This rule only sends the new copy to Review as a
+  possible duplicate; it never deletes anything by itself.
+- A version word (`Remix`, `Live`, `Acoustic`, a different featured artist on a remix) keeps them
+  apart, as today.
+
 ### 2.5 Covers: separate, explained, never lost
 
 - A cover that comes **with the winning record** (same provider, same record) is accepted
@@ -230,9 +276,14 @@ lose the many small lessons already in the code (Persian tags, YouTube quirks, s
 |---|---|---|---|
 | A | Mini App buttons and warnings; cover bug (own-record covers, release-aware album compare, one check for preview and filing); stuck tracks; sources pause instead of switching off; iTunes rate limit | 1, most of 3 | **built** |
 | B | One file per song (embedded lyrics, keep existing lyrics, optional sidecars, tidy step) | 4 | **built** |
-| C | Names module and artist identity; folders from identity; batch-aware album/year; better duplicate detection; playlist update on replace | 2 | next |
+| C | Names module and artist identity; several artists per song (§2.4b); folders from the primary artist's identity; batch-aware album/year; better duplicate detection; playlist update on replace; Artists page | 2 | **built** |
 | D | Provider layer: abilities, rate limits, breakers, single-flight cache, parallel with deadline | 3 (speed, reliability) | |
 | E | Claims, resolver and item state machine with optimistic locking; Review shows the reason; automatic retry of "waiting for source" | 3 (smart, stable) | |
+
+Notes on C: a duet whose singers are both unknown when it is filed is learned as one artist; it
+splits automatically for later songs once both are known, and the Artists page splits the ones
+already filed. Fingerprints only cover a song's first 2 minutes (fpcalc's default), and a
+sped-up or pitch-shifted upload does not match by sound.
 
 Notes on A: a refused cover's URL is still cleared from `cover_url`, but every option stays in the
 candidate's cover list, so nothing is lost. Songs scanned while a source was paused are not yet

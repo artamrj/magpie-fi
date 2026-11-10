@@ -179,6 +179,70 @@ pub fn embed_lyrics(path: &Path, text: &str) -> Result<()> {
     verify_lyrics(path, text)
 }
 
+/// Replaces one artist with `new` (one or more artists) in the artist and
+/// album-artist tags of a filed song, leaving every other tag alone. Returns
+/// whether anything changed. Used when the owner renames, merges or splits an
+/// artist.
+pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
+    use crate::domain::names::match_key;
+    let mut file = Probe::open(path)?.guess_file_type()?.read()?;
+    let Some(tag) = file.primary_tag_mut() else {
+        return Ok(false);
+    };
+    let old_key = match_key(old);
+    let joined = new.join(" & ");
+    let mut changed = false;
+    for (display_key, list_key) in [
+        (ItemKey::TrackArtist, ItemKey::TrackArtists),
+        (ItemKey::AlbumArtist, ItemKey::AlbumArtists),
+    ] {
+        let values = tag
+            .get_strings(list_key)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let display = tag.get_string(display_key).map(str::to_owned);
+        let names_old = values.iter().any(|value| match_key(value) == old_key)
+            || (values.is_empty()
+                && display
+                    .as_deref()
+                    .is_some_and(|value| match_key(value) == old_key));
+        if names_old {
+            let mut replaced = Vec::new();
+            for value in if values.is_empty() {
+                vec![old.to_owned()]
+            } else {
+                values
+            } {
+                if match_key(&value) == old_key {
+                    replaced.extend(new.iter().cloned());
+                } else {
+                    replaced.push(value);
+                }
+            }
+            tag.remove_key(list_key);
+            push_text_values(tag, list_key, replaced);
+            changed = true;
+        }
+        if let Some(display) = display {
+            let updated = if match_key(&display) == old_key {
+                joined.clone()
+            } else if display.contains(old) {
+                display.replace(old, &joined)
+            } else {
+                display.clone()
+            };
+            if updated != display {
+                set(tag, display_key, &updated);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        file.save_to_path(path, WriteOptions::default())?;
+    }
+    Ok(changed)
+}
+
 pub fn verify_lyrics(path: &Path, expected: &str) -> Result<()> {
     let written = read_lyrics(path)?.unwrap_or_default();
     if written.trim() != expected.trim() {
@@ -653,6 +717,63 @@ mod tests {
     }
 
     #[test]
+    fn an_artist_is_replaced_in_the_tags_only() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for (name, codec) in [
+            ("duet.mp3", "libmp3lame"),
+            ("duet.flac", "flac"),
+            ("duet.m4a", "aac"),
+        ] {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.2")
+                .args(["-c:a", codec])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let candidate = Candidate {
+                title: "Song".into(),
+                artist: "Ebi & Shadmehr Aghili".into(),
+                album: Some("Song".into()),
+                album_artist: Some("Ebi & Shadmehr Aghili".into()),
+                ..Default::default()
+            };
+            write(&path, &candidate, None, None).unwrap();
+
+            // The owner splits the combined artist into two.
+            let parts = ["Ebi".to_owned(), "Shadmehr Aghili".to_owned()];
+            assert!(replace_artist(&path, "Ebi & Shadmehr Aghili", &parts).unwrap());
+            let file = Probe::open(&path).unwrap().read().unwrap();
+            let tag = file.primary_tag().unwrap();
+            let artists = tag.get_strings(ItemKey::TrackArtists).collect::<Vec<_>>();
+            assert_eq!(artists, ["Ebi", "Shadmehr Aghili"], "{name}");
+            assert_eq!(tag.artist().as_deref(), Some("Ebi & Shadmehr Aghili"));
+            assert_eq!(tag.title().as_deref(), Some("Song"));
+
+            // Renaming one of them changes only that one.
+            assert!(replace_artist(&path, "Ebi", &["Ebi (Ebrahim Hamedi)".to_owned()]).unwrap());
+            let file = Probe::open(&path).unwrap().read().unwrap();
+            let tag = file.primary_tag().unwrap();
+            let artists = tag.get_strings(ItemKey::TrackArtists).collect::<Vec<_>>();
+            assert_eq!(
+                artists,
+                ["Ebi (Ebrahim Hamedi)", "Shadmehr Aghili"],
+                "{name}"
+            );
+            assert!(!replace_artist(&path, "Googoosh", &["X".to_owned()]).unwrap());
+        }
+    }
+
+    #[test]
     fn lyrics_go_inside_every_format_and_are_kept_on_retag() {
         if std::process::Command::new("ffmpeg")
             .arg("-version")
@@ -868,11 +989,13 @@ mod tests {
                         name: "Alice".into(),
                         join_phrase: " & ".into(),
                         musicbrainz_id: Some("mbid-alice".into()),
+                        artist_id: None,
                     },
                     crate::domain::credits::ArtistCredit {
                         name: "Bob".into(),
                         join_phrase: String::new(),
                         musicbrainz_id: Some("mbid-bob".into()),
+                        artist_id: None,
                     },
                 ],
                 album: Some("Compilation".into()),

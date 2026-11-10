@@ -31,19 +31,27 @@ pub fn destination(library: &Path, candidate: &Candidate, extension: &str) -> Pa
     let track_artist = safe_name(&names.artist, "Unknown Artist");
     let compilation = is_compilation(candidate);
 
+    // One folder per primary artist: the first album artist's identity name, so
+    // a duet goes to `Ebi/…`, never `Ebi & Shadmehr Aghili/`. The other singers
+    // get the song through the ARTISTS tag, not through a folder.
     let album_artist = if compilation {
         VARIOUS_ARTISTS.to_owned()
     } else {
         let declared = candidate
-            .album_artist
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
+            .album_artist_credits
+            .first()
+            .map(|credit| credit.name.clone())
             .or_else(|| {
                 candidate
-                    .album_artist_credits
-                    .first()
-                    .map(|credit| credit.name.clone())
+                    .album_artist
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| {
+                        credits::normalize_featured(value, "")
+                            .artists
+                            .first()
+                            .map_or_else(|| value.to_owned(), |credit| credit.name.clone())
+                    })
             })
             .or_else(|| names.artists.first().map(|credit| credit.name.clone()))
             .unwrap_or_else(|| names.artist.clone());
@@ -93,6 +101,15 @@ enum ReleaseKind {
     Album,
     Single,
     Ep,
+}
+
+/// The folder-name suffix of a release kind: ` [Single]`, ` [EP]` or nothing.
+pub(crate) fn release_suffix(candidate: &Candidate) -> &'static str {
+    match release_kind(candidate) {
+        ReleaseKind::Single => " [Single]",
+        ReleaseKind::Ep => " [EP]",
+        ReleaseKind::Album => "",
+    }
 }
 
 fn release_kind(candidate: &Candidate) -> ReleaseKind {
@@ -162,7 +179,8 @@ pub fn align_with_existing_release(library: &Path, candidate: &mut Candidate) {
             continue;
         }
         if let (existing_album, Some(year)) = strip_year(rest)
-            && existing_album == album
+            && crate::domain::names::match_key(existing_album)
+                == crate::domain::names::match_key(&album)
         {
             candidate.year = Some(year.to_owned());
             if candidate
@@ -190,7 +208,7 @@ fn strip_year(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
-fn release_year(candidate: &Candidate) -> Option<String> {
+pub(crate) fn release_year(candidate: &Candidate) -> Option<String> {
     [candidate.year.as_deref(), candidate.release_date.as_deref()]
         .into_iter()
         .flatten()
@@ -284,7 +302,7 @@ pub async fn move_to_trash(trash: &Path, base: &Path, file: &Path) -> Result<Pat
 }
 
 /// Removes folders left empty after a move, up to (not including) `base`.
-async fn remove_empty_parents(file: &Path, base: &Path) {
+pub(crate) async fn remove_empty_parents(file: &Path, base: &Path) {
     let mut current = file.parent();
     while let Some(folder) = current {
         if folder == base || !folder.starts_with(base) {
@@ -333,6 +351,16 @@ pub struct LibraryEntry {
     pub format: String,
     pub bitrate: Option<u32>,
     pub source: String,
+    /// Compressed Chromaprint fingerprint, for "sounds the same" checks.
+    pub fingerprint: Option<String>,
+    /// Artist identities of the song, primary first.
+    pub artist_ids: Vec<i64>,
+}
+
+/// The title as compared for "probably the same song": no `feat.` part, and
+/// the same key for every spelling.
+pub fn title_key(title: &str) -> String {
+    crate::domain::names::match_key(&credits::release_title_without_featured(title))
 }
 
 /// Saves (or refreshes) one library file in the index.
@@ -341,14 +369,16 @@ pub async fn remember(pool: &SqlitePool, entry: &LibraryEntry) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO library_items(path,file_size,file_mtime_ns,duration,content_key,isrc,
-           recording_id,title,artist,album,format,bitrate,source,added_at,checked_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           recording_id,title,artist,album,format,bitrate,source,added_at,checked_at,
+           fingerprint,title_key,artist_ids)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(path) DO UPDATE SET
            file_size=excluded.file_size, file_mtime_ns=excluded.file_mtime_ns,
            duration=excluded.duration, content_key=excluded.content_key, isrc=excluded.isrc,
            recording_id=excluded.recording_id, title=excluded.title, artist=excluded.artist,
            album=excluded.album, format=excluded.format, bitrate=excluded.bitrate,
-           checked_at=excluded.checked_at",
+           checked_at=excluded.checked_at, fingerprint=excluded.fingerprint,
+           title_key=excluded.title_key, artist_ids=excluded.artist_ids",
     )
     .bind(&entry.path)
     .bind(size)
@@ -365,6 +395,9 @@ pub async fn remember(pool: &SqlitePool, entry: &LibraryEntry) -> Result<()> {
     .bind(&entry.source)
     .bind(&now)
     .bind(&now)
+    .bind(&entry.fingerprint)
+    .bind(entry.title.as_deref().map(title_key))
+    .bind(crate::application::artists::ids_text(&entry.artist_ids))
     .execute(pool)
     .await?;
     Ok(())
@@ -446,6 +479,95 @@ pub async fn find_same_recording(
             ..LibraryEntry::default()
         }));
     }
+    find_same_sound(pool, evidence).await
+}
+
+/// path, duration, content key, format, bitrate, fingerprint.
+type SoundRow = (
+    String,
+    Option<f64>,
+    Option<String>,
+    String,
+    Option<i64>,
+    String,
+);
+
+/// A library file that sounds the same (another encode of this recording),
+/// with a length within 3 s.
+async fn find_same_sound(
+    pool: &SqlitePool,
+    evidence: &RecordingEvidence,
+) -> Result<Option<LibraryEntry>> {
+    let (Some(duration), Some(raw)) = (
+        evidence.duration,
+        evidence
+            .fingerprint
+            .as_deref()
+            .and_then(crate::domain::fingerprint::decode),
+    ) else {
+        return Ok(None);
+    };
+    let rows: Vec<SoundRow> = sqlx::query_as(
+        "SELECT path,duration,content_key,format,bitrate,fingerprint FROM library_items
+             WHERE fingerprint IS NOT NULL AND duration BETWEEN ? AND ? ORDER BY path",
+    )
+    .bind(duration - DURATION_TOLERANCE_SECONDS)
+    .bind(duration + DURATION_TOLERANCE_SECONDS)
+    .fetch_all(pool)
+    .await?;
+    for (path, row_duration, content_key, format, bitrate, fingerprint) in rows {
+        let Some(row_raw) = crate::domain::fingerprint::decode(&fingerprint) else {
+            continue;
+        };
+        if !input_dedup::sounds_the_same((&raw, Some(duration)), (&row_raw, row_duration)) {
+            continue;
+        }
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            forget(pool, Path::new(&path)).await?;
+            continue;
+        }
+        return Ok(Some(LibraryEntry {
+            path,
+            duration: row_duration,
+            content_key,
+            format,
+            bitrate: bitrate.and_then(|value| u32::try_from(value).ok()),
+            ..LibraryEntry::default()
+        }));
+    }
+    Ok(None)
+}
+
+/// A library song that is probably the same as this one although nothing
+/// proves it: the same title (without `feat.`), lengths within 3 s, and the
+/// primary artist of one among the artists of the other. Spelling and order of
+/// the artists do not matter. Used to ask the owner, never to skip by itself.
+pub async fn find_possible_duplicate(
+    pool: &SqlitePool,
+    title: &str,
+    duration: Option<f64>,
+    artist_ids: &[i64],
+) -> Result<Option<String>> {
+    let (Some(duration), Some(primary)) = (duration, artist_ids.first()) else {
+        return Ok(None);
+    };
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path,artist_ids FROM library_items
+         WHERE title_key=? AND artist_ids IS NOT NULL AND duration BETWEEN ? AND ? ORDER BY path",
+    )
+    .bind(title_key(title))
+    .bind(duration - DURATION_TOLERANCE_SECONDS)
+    .bind(duration + DURATION_TOLERANCE_SECONDS)
+    .fetch_all(pool)
+    .await?;
+    for (path, ids) in rows {
+        let ids = crate::application::artists::ids_from_text(&ids);
+        let overlap =
+            ids.contains(primary) || ids.first().is_some_and(|id| artist_ids.contains(id));
+        if overlap && tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(Some(path));
+        }
+    }
     Ok(None)
 }
 
@@ -462,13 +584,19 @@ pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
     let root = library.to_path_buf();
     let (files, _) = tokio::task::spawn_blocking(move || files::audio_files(&root)).await?;
 
-    let known: Vec<(String, i64, i64)> =
-        sqlx::query_as("SELECT path,file_size,file_mtime_ns FROM library_items")
-            .fetch_all(pool)
-            .await?;
-    let known: std::collections::HashMap<String, (i64, i64)> = known
+    // Rows from before artist identities and sound checks are described again,
+    // a few hundred per pass so the inbox is never held up for long.
+    let known: Vec<(String, i64, i64, bool)> = sqlx::query_as(
+        "SELECT path,file_size,file_mtime_ns,
+                (title_key IS NULL OR (fingerprint IS NULL AND content_key LIKE 'fp:%'))
+         FROM library_items",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut backfill_left = 500_usize;
+    let known: std::collections::HashMap<String, ((i64, i64), bool)> = known
         .into_iter()
-        .map(|(path, size, modified)| (path, (size, modified)))
+        .map(|(path, size, modified, incomplete)| (path, ((size, modified), incomplete)))
         .collect();
     let present: std::collections::HashSet<String> = files
         .iter()
@@ -484,8 +612,13 @@ pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
         let Ok(identity) = files::stamp(&path).await else {
             continue;
         };
-        if known.get(&text) == Some(&identity) {
-            continue;
+        if let Some((stamp, incomplete)) = known.get(&text)
+            && *stamp == identity
+        {
+            if !*incomplete || backfill_left == 0 {
+                continue;
+            }
+            backfill_left -= 1;
         }
         match describe_file(pool, &path).await {
             Ok(entry) => {
@@ -508,15 +641,28 @@ async fn describe_file(pool: &SqlitePool, path: &Path) -> Result<LibraryEntry> {
         Ok::<_, anyhow::Error>((info, read_identifiers(&owned)))
     })
     .await??;
-    let content_key = match fingerprint_cache::get_or_calculate(pool, path, || {
+    let (content_key, fingerprint) = match fingerprint_cache::get_or_calculate(pool, path, || {
         fingerprint::calculate(path)
     })
     .await
     {
-        Ok(result) => input_dedup::fingerprint_key(&result.fingerprint),
-        Err(_) => Some(input_dedup::hash_key(
-            &input_dedup::sha256_cached(pool, path).await?,
-        )),
+        Ok(result) => (
+            input_dedup::fingerprint_key(&result.fingerprint),
+            Some(result.fingerprint),
+        ),
+        Err(_) => (
+            Some(input_dedup::hash_key(
+                &input_dedup::sha256_cached(pool, path).await?,
+            )),
+            None,
+        ),
+    };
+    let artist_ids = match info.artist.as_deref() {
+        Some(artist) => {
+            let names = credits::normalize_featured(artist, info.title.as_deref().unwrap_or(""));
+            crate::application::artists::resolve_names(pool, names.artists).await?
+        }
+        None => Vec::new(),
     };
     Ok(LibraryEntry {
         path: path.to_string_lossy().into_owned(),
@@ -530,6 +676,8 @@ async fn describe_file(pool: &SqlitePool, path: &Path) -> Result<LibraryEntry> {
         format: info.format,
         bitrate: info.bitrate,
         source: "existing".into(),
+        fingerprint,
+        artist_ids,
     })
 }
 
@@ -694,6 +842,26 @@ mod tests {
     }
 
     #[test]
+    fn a_duet_is_filed_under_its_first_artist() {
+        let mut value = candidate();
+        value.title = "Song".into();
+        value.artist = "Ebi & Shadmehr Aghili".into();
+        value.album = Some("Song".into());
+        value.album_artist = Some("Ebi & Shadmehr Aghili".into());
+        value.album_artist_credits = vec![
+            crate::domain::credits::ArtistCredit::new("Ebi", " & "),
+            crate::domain::credits::ArtistCredit::new("Shadmehr Aghili", ""),
+        ];
+        value.year = Some("2024".into());
+        value.track_number = Some(1);
+        value.release_type = Some("Single".into());
+        assert_eq!(
+            path(&value, "m4a"),
+            "/lib/Ebi/Song (2024) [Single]/01 - Song.m4a"
+        );
+    }
+
+    #[test]
     fn featured_artists_stay_out_of_folder_names() {
         let mut value = candidate();
         value.artist = "Daft Punk feat. Romanthony".into();
@@ -834,6 +1002,7 @@ mod tests {
             duration: Some(duration),
             content_key: key.map(str::to_owned),
             isrc: isrc.map(str::to_owned),
+            fingerprint: None,
         };
         let hit = |evidence: RecordingEvidence, mbid: Option<&'static str>| {
             let pool = pool.clone();
@@ -861,6 +1030,131 @@ mod tests {
         assert_eq!(rows, 0);
     }
 
+    async fn test_pool(directory: &Path) -> SqlitePool {
+        crate::infrastructure::db::connect(directory.join("library.sqlite").to_str().unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn another_encode_of_a_library_song_is_found_by_sound() {
+        let installed = |tool: &str| {
+            std::process::Command::new(tool)
+                .arg("-version")
+                .output()
+                .is_ok()
+        };
+        if !installed("ffmpeg") || !installed("fpcalc") {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pool = test_pool(directory.path()).await;
+        let encode = |name: &str, source: &str, codec: &[&str]| {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg(source)
+                .args(codec)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let song = "aevalsrc=0.4*sin(2*PI*t*220*pow(2\\,mod(floor(t*3)*5\\,12)/12))\
+                    *(0.6+0.4*sin(3*PI*t))+0.3*sin(1250*2*PI*t*(1+0.2*sin(0.7*t)))\
+                    +0.25*sin(2*PI*t*110*pow(2\\,mod(floor(t/2)*7\\,12)/12)):s=44100:d=30";
+        let other = "aevalsrc=0.4*sin(2*PI*t*196*pow(2\\,mod(floor(t*2.3)*3\\,12)/12))\
+                     *(0.6+0.4*sin(5*PI*t))+0.3*sin(880*2*PI*t*(1+0.1*sin(1.3*t))):s=44100:d=30";
+        let filed = encode("filed.flac", song, &["-c:a", "flac"]);
+        let download = encode("download.opus", song, &["-c:a", "libopus", "-b:a", "64k"]);
+        let different = encode("different.opus", other, &["-c:a", "libopus", "-b:a", "64k"]);
+        let (filed_print, filed_length) = fingerprint::calculate(&filed).await.unwrap();
+        remember(
+            &pool,
+            &LibraryEntry {
+                path: filed.to_string_lossy().into_owned(),
+                duration: Some(filed_length),
+                content_key: input_dedup::fingerprint_key(&filed_print),
+                format: "flac".into(),
+                source: "inbox".into(),
+                fingerprint: Some(filed_print),
+                ..LibraryEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let probe = |path: &Path| {
+            let path = path.to_path_buf();
+            async move {
+                let (print, length) = fingerprint::calculate(&path).await.unwrap();
+                RecordingEvidence {
+                    path,
+                    format: "opus".into(),
+                    duration: Some(length),
+                    content_key: input_dedup::fingerprint_key(&print),
+                    fingerprint: Some(print),
+                    ..RecordingEvidence::default()
+                }
+            }
+        };
+        let same = probe(&download).await;
+        // Different fingerprint strings: the old exact check alone would miss it.
+        assert_ne!(
+            same.content_key,
+            input_dedup::fingerprint_key(&{ fingerprint::calculate(&filed).await.unwrap().0 })
+        );
+        let found = find_same_recording(&pool, &same, None).await.unwrap();
+        assert_eq!(found.unwrap().path, filed.to_string_lossy());
+        let unrelated = probe(&different).await;
+        assert!(
+            find_same_recording(&pool, &unrelated, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_duet_in_another_spelling_is_a_possible_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = test_pool(directory.path()).await;
+        let filed = directory.path().join("Ebi - Song.m4a");
+        tokio::fs::write(&filed, b"audio").await.unwrap();
+        // Filed as "Ebi feat. Shadmehr Aghili – Song (feat. Shadmehr Aghili)".
+        remember(
+            &pool,
+            &LibraryEntry {
+                path: filed.to_string_lossy().into_owned(),
+                duration: Some(200.0),
+                title: Some("Song (feat. Shadmehr Aghili)".into()),
+                format: "m4a".into(),
+                source: "inbox".into(),
+                artist_ids: vec![1, 2],
+                ..LibraryEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+        let possible = |title: &'static str, length: f64, ids: Vec<i64>| {
+            let pool = pool.clone();
+            async move {
+                find_possible_duplicate(&pool, title, Some(length), &ids)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+        // "Shadmehr Aghili & Ebi – SONG": other order, other spelling of the title.
+        assert!(possible("SONG", 201.5, vec![2, 1]).await);
+        assert!(possible("Song", 199.0, vec![1]).await);
+        // A remix, another length or other artists are different songs.
+        assert!(!possible("Song (Remix)", 200.0, vec![1, 2]).await);
+        assert!(!possible("Song", 230.0, vec![1, 2]).await);
+        assert!(!possible("Song", 200.0, vec![7]).await);
+    }
+
     #[test]
     fn only_lossless_replaces_lossy() {
         let new = |format: &str| RecordingEvidence {
@@ -870,6 +1164,7 @@ mod tests {
             duration: None,
             content_key: None,
             isrc: None,
+            fingerprint: None,
         };
         let existing = |format: &str| LibraryEntry {
             format: format.into(),
