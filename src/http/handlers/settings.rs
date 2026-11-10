@@ -3,13 +3,20 @@ use super::*;
 /// Read-only view of the configuration. Settings come from `MAGPIE_*`
 /// environment variables; the web page shows them but cannot change them.
 pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let cfg = s.config.read().await;
-    let fpcalc = std::process::Command::new("fpcalc")
-        .arg("-version")
-        .output()
-        .is_ok();
-    let ffmpeg = crate::infrastructure::media::replaygain::available();
-    let songrec = crate::infrastructure::providers::songrec::available();
+    let cfg = &s.config;
+    // The tool checks start processes, so they run off the async runtime.
+    let ytdlp_config = cfg.clone();
+    let (fpcalc, ffmpeg, songrec, rsgain, ytdlp) = tokio::task::spawn_blocking(move || {
+        (
+            crate::infrastructure::process::available("fpcalc", "-version"),
+            crate::infrastructure::media::integrity::available(),
+            crate::infrastructure::providers::songrec::available(),
+            crate::infrastructure::media::rsgain::available(),
+            crate::acquire::ytdlp::available(&ytdlp_config),
+        )
+    })
+    .await
+    .unwrap_or_default();
     let guests: i64 = sqlx::query_scalar("SELECT count(*) FROM telegram_guests")
         .fetch_one(&s.pool)
         .await
@@ -35,8 +42,8 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "lyrics": cfg.lyrics,
         "telegram": telegram,
         "library_songs": library_songs,
-        "rsgain": crate::infrastructure::media::rsgain::available(),
-        "ytdlp": crate::acquire::ytdlp::available(&cfg),
+        "rsgain": rsgain,
+        "ytdlp": ytdlp,
         "audio_format": match cfg.audio_format {
             crate::config::AudioFormat::M4a => "m4a",
             crate::config::AudioFormat::Opus => "opus",
@@ -49,13 +56,12 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "itunes": true,
             "deezer": true,
             "radiojavan": true,
-            "wikidata": true,
             "cover_art_archive": true,
             "fpcalc": fpcalc,
             "ffmpeg": ffmpeg,
             "songrec": songrec,
             "shazam": true,
-            "integrity_check": crate::infrastructure::media::integrity::available(),
+            "integrity_check": ffmpeg,
             "acoustid": !cfg.acoustid_key.is_empty(),
             "audd": !cfg.audd_token.is_empty(),
             "spotify": !cfg.spotify_client_id.is_empty() && !cfg.spotify_client_secret.is_empty(),
@@ -64,8 +70,7 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "youtube": !cfg.youtube_api_key.is_empty(),
             "discogs": !cfg.discogs_token.is_empty(),
             "lastfm": !cfg.lastfm_key.is_empty(),
-            "genius": true,
-            "theaudiodb": !cfg.theaudiodb_key.is_empty()
+            "genius": true
         }
     }))
 }

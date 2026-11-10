@@ -1,14 +1,14 @@
-import { useQuery } from "@tanstack/react-query";
-import { api } from "@/api/client";
-import type { Me, Setup } from "@/api/types";
+import { post } from "../../api/client";
+import { useMeQuery } from "../../api/queries";
+import type { Setup } from "../../api/types";
 import { Icon } from "../Icons";
 import { providerName } from "../trackUtils";
 
 /** Read-only status. Settings live in the server's .env file (MAGPIE_*). */
 export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () => void }) {
-  const me = useQuery({ queryKey: ["me"], queryFn: () => api<Me>("/me"), staleTime: Infinity });
+  const me = useMeQuery();
   const logOut = async () => {
-    await api("/logout", { method: "POST", body: "{}" }).catch(() => undefined);
+    await post("/logout").catch(() => undefined);
     window.location.reload();
   };
   return (
@@ -96,7 +96,7 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
 function ProviderStatus({ sources }: { sources: Record<string, boolean> }) {
   const available = Object.values(sources).filter(Boolean).length;
   return (
-    <section className="provider-settings">
+    <section>
       <div className="section-heading">
         <div>
           <h3>Recognition tools</h3>

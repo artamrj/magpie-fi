@@ -1,15 +1,14 @@
 use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, fingerprint_key};
+use crate::infrastructure::{
+    file_stamp::FileStamp,
+    process,
+    provider_cache::{self, fingerprint_key},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::{
-    path::Path,
-    process::Stdio,
-    sync::OnceLock,
-    time::{Duration, UNIX_EPOCH},
-};
+use std::{path::Path, sync::OnceLock, time::Duration};
 use tokio::process::Command;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,8 +36,8 @@ pub async fn recognize(
     path: &Path,
     fingerprint: &str,
 ) -> Result<Vec<Candidate>> {
-    let cache_key = cache_key(path, fingerprint)?;
-    let raw = if let Some(value) = ProviderCache::get(pool, "songrec", &cache_key).await? {
+    let cache_key = cache_key(path, fingerprint).await?;
+    let raw = if let Some(value) = provider_cache::get(pool, "songrec", &cache_key).await? {
         value
     } else {
         let spec = command_spec().ok_or_else(|| {
@@ -47,8 +46,9 @@ pub async fn recognize(
             )
         })?;
         let value = run(&spec, path).await?;
+        // A miss is asked again sooner: SongRec's catalog grows.
         let matched = parse_result(&value).is_some();
-        ProviderCache::put(
+        provider_cache::put(
             pool,
             "songrec",
             &cache_key,
@@ -102,13 +102,7 @@ fn kind_from_name(executable: &str) -> CliKind {
 }
 
 fn command_responds(executable: &str) -> bool {
-    std::process::Command::new(executable)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    process::available(executable, "--version")
 }
 
 async fn run(spec: &CommandSpec, path: &Path) -> Result<Value> {
@@ -124,15 +118,7 @@ async fn run(spec: &CommandSpec, path: &Path) -> Result<Value> {
                 .args(["--format", "json", "--quiet"]);
         }
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(45), command.output())
-        .await
-        .context("SongRec recognition timed out")?
-        .with_context(|| format!("could not start {}", spec.executable))?;
+    let output = process::run(command, Duration::from_secs(45)).await?;
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     if is_no_match(&diagnostic) {
         return Ok(serde_json::json!({"matches": []}));
@@ -172,22 +158,18 @@ fn parse_json_output(output: &[u8]) -> Result<Value> {
     serde_json::from_str(&text[start..=end]).context("SongRec returned invalid JSON")
 }
 
-fn cache_key(path: &Path, fingerprint: &str) -> Result<String> {
+async fn cache_key(path: &Path, fingerprint: &str) -> Result<String> {
     if !fingerprint.trim().is_empty() {
         return Ok(fingerprint_key(fingerprint));
     }
-    let metadata = std::fs::metadata(path)
+    let stamp = FileStamp::of(path)
+        .await
         .with_context(|| format!("could not inspect {} for SongRec cache", path.display()))?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
     Ok(fingerprint_key(&format!(
-        "file:{}:{}:{modified}",
+        "file:{}:{}:{}",
         path.display(),
-        metadata.len()
+        stamp.size,
+        stamp.mtime_ns
     )))
 }
 

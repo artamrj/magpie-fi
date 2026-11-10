@@ -1,4 +1,7 @@
-use crate::{domain::audio::AudioInfo, infrastructure::providers::Candidate};
+use crate::{
+    domain::{audio::AudioInfo, provider_name},
+    infrastructure::providers::Candidate,
+};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -319,19 +322,11 @@ fn similar(left: &str, right: &str, threshold: f64) -> bool {
     if left.trim().is_empty() || right.trim().is_empty() {
         return false;
     }
-    let left = normalize(left);
-    let right = normalize(right);
+    let left = crate::domain::matcher::normalize_match_key(left);
+    let right = crate::domain::matcher::normalize_match_key(right);
     left.starts_with(&right)
         || right.starts_with(&left)
         || strsim::normalized_levenshtein(&left, &right) >= threshold
-}
-
-fn normalize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn provider_weight(provider: &str) -> f64 {
@@ -339,7 +334,6 @@ fn provider_weight(provider: &str) -> f64 {
         "discogs" => 0.88,
         "itunes" => 0.84,
         "musicbrainz" => 0.78,
-        "theaudiodb" => 0.76,
         "lastfm" => 0.72,
         "radiojavan" => 0.70,
         "songrec" => 0.72,
@@ -348,24 +342,6 @@ fn provider_weight(provider: &str) -> f64 {
         "genius" => 0.68,
         "soundcloud" => 0.68,
         _ => 0.64,
-    }
-}
-
-fn provider_name(provider: &str) -> &str {
-    match provider {
-        "itunes" => "Apple Music",
-        "musicbrainz" => "MusicBrainz",
-        "discogs" => "Discogs",
-        "theaudiodb" => "TheAudioDB",
-        "lastfm" => "Last.fm",
-        "radiojavan" => "Radio Javan",
-        "songrec" => "SongRec / Shazam",
-        "audiomack" => "Audiomack",
-        "navahang" => "Navahang",
-        "shazam" => "Shazam",
-        "genius" => "Genius",
-        "soundcloud" => "SoundCloud",
-        _ => provider,
     }
 }
 

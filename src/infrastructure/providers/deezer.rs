@@ -1,7 +1,7 @@
-use super::{ArtistCredit, Candidate};
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::{ArtistCredit, Candidate, phrase, request_json};
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -13,27 +13,28 @@ pub async fn search(
     artist: Option<&str>,
 ) -> Result<Vec<Candidate>> {
     let query = match artist.filter(|value| !value.trim().is_empty()) {
-        Some(artist) => format!("artist:\"{artist}\" track:\"{title}\""),
-        None => format!("track:\"{title}\""),
+        Some(artist) => format!("artist:{} track:{}", phrase(artist), phrase(title)),
+        None => format!("track:{}", phrase(title)),
     };
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, "deezer", &key).await? {
-        value
-    } else {
-        let value = client
-            .get("https://api.deezer.com/search")
-            .query(&[("q", query.as_str()), ("limit", "10")])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
+    let raw = cached(
+        pool,
+        "deezer",
+        &search_key(&query),
+        Duration::days(7),
+        || async {
+            let value = request_json(
+                client
+                    .get("https://api.deezer.com/search")
+                    .query(&[("q", query.as_str()), ("limit", "10")]),
+            )
             .await?;
-        if let Some(message) = value["error"]["message"].as_str() {
-            bail!("Deezer API error: {message}");
-        }
-        ProviderCache::put(pool, "deezer", &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+            if let Some(message) = value["error"]["message"].as_str() {
+                bail!("Deezer API error: {message}");
+            }
+            Ok(value)
+        },
+    )
+    .await?;
     Ok(parse_results(&raw))
 }
 
@@ -44,19 +45,10 @@ pub async fn lookup_isrc(
 ) -> Result<Option<Candidate>> {
     let isrc = isrc.trim().to_ascii_uppercase();
     let key = search_key(&format!("isrc:{isrc}"));
-    let raw = if let Some(value) = ProviderCache::get(pool, "deezer", &key).await? {
-        value
-    } else {
-        let value = client
-            .get(format!("https://api.deezer.com/track/isrc:{isrc}"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        ProviderCache::put(pool, "deezer", &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+    let raw = cached(pool, "deezer", &key, Duration::days(7), || {
+        request_json(client.get(format!("https://api.deezer.com/track/isrc:{isrc}")))
+    })
+    .await?;
     if raw["error"].is_object() {
         return Ok(None);
     }

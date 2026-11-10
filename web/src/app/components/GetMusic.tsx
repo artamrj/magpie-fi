@@ -1,8 +1,16 @@
 import { useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/api/client";
-import type { MusicRequest, RecentSong, WantedSong } from "@/api/types";
+import { useQueryClient } from "@tanstack/react-query";
+import { post } from "../../api/client";
+import {
+  isActiveRequest,
+  queryKeys,
+  useRecentSongsQuery,
+  useRequestSongsQuery,
+  useRequestsQuery,
+} from "../../api/queries";
+import type { MusicRequest } from "../../api/types";
 import { Icon } from "../Icons";
+import { EmptyState } from "./EmptyStates";
 
 const statusLabels: Record<string, string> = {
   pending: "Waiting",
@@ -14,33 +22,23 @@ const statusLabels: Record<string, string> = {
   failed: "Failed",
 };
 
-const isActive = (request: MusicRequest) => request.status === "reading" || request.working > 0;
-
 /** Paste a song, album or playlist link; follow every request until it is in the library. */
 export function GetMusic({ onError }: { onError: (message: string) => void }) {
   const queryClient = useQueryClient();
   const [url, setUrl] = useState("");
   const [sending, setSending] = useState(false);
   const [open, setOpen] = useState<number>();
-  const requests = useQuery({
-    queryKey: ["requests"],
-    queryFn: () => api<MusicRequest[]>("/requests"),
-    refetchInterval: (query) => (query.state.data?.some(isActive) ? 2000 : 15000),
-    refetchIntervalInBackground: true,
-  });
+  const requests = useRequestsQuery();
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!url.trim()) return;
     setSending(true);
     try {
-      const created = await api<{ id: number }>("/requests", {
-        method: "POST",
-        body: JSON.stringify({ url: url.trim() }),
-      });
+      const created = await post<{ id: number }>("/requests", { url: url.trim() });
       setUrl("");
       setOpen(created.id);
-      await queryClient.invalidateQueries({ queryKey: ["requests"] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.requests });
     } catch (reason) {
       onError((reason as Error).message);
     } finally {
@@ -50,8 +48,8 @@ export function GetMusic({ onError }: { onError: (message: string) => void }) {
 
   const retry = async (id: number) => {
     try {
-      await api(`/requests/${id}/retry`, { method: "POST", body: "{}" });
-      await queryClient.invalidateQueries({ queryKey: ["requests"] });
+      await post(`/requests/${id}/retry`);
+      await queryClient.invalidateQueries({ queryKey: queryKeys.requests });
     } catch (reason) {
       onError((reason as Error).message);
     }
@@ -87,13 +85,11 @@ export function GetMusic({ onError }: { onError: (message: string) => void }) {
       <RecentlyAdded />
 
       {list.length === 0 ? (
-        <div className="empty-state">
-          <span>
-            <Icon name="music" size={28} />
-          </span>
-          <h2>Nothing requested yet</h2>
-          <p>Songs you ask for appear here until they are in your library.</p>
-        </div>
+        <EmptyState
+          icon="music"
+          title="Nothing requested yet"
+          description="Songs you ask for appear here until they are in your library."
+        />
       ) : (
         <ul className="request-list">
           {list.map((request) => (
@@ -123,10 +119,12 @@ function RequestCard({
   onRetry: () => void;
 }) {
   const percent = request.total ? Math.round((request.done / request.total) * 100) : 0;
-  // Songs and uploaded files are named after their song; albums and playlists have a title.
+  // Several sent files are counted; otherwise the server names a request after its first song.
   const title =
-    request.title ??
-    (request.kind === "album" || request.kind === "playlist" ? request.url : undefined);
+    request.kind === "upload" && request.total > 1
+      ? `${request.total} files`
+      : (request.title ??
+        (request.kind === "album" || request.kind === "playlist" ? request.url : "Song"));
   return (
     <li className={`request-card ${request.status}`}>
       <button className="request-summary" onClick={onToggle} aria-expanded={open}>
@@ -134,14 +132,7 @@ function RequestCard({
           {request.kind === "upload" ? "Telegram" : request.kind}
         </span>
         <span className="request-title">
-          <b>
-            {title ??
-              (request.kind === "upload" && request.total > 1 ? (
-                `${request.total} files`
-              ) : (
-                <SongTitle requestId={request.id} />
-              ))}
-          </b>
+          <b>{title}</b>
           <small>
             {request.status === "reading"
               ? "Reading the link…"
@@ -157,7 +148,7 @@ function RequestCard({
                     .join(" · ")}
           </small>
         </span>
-        {isActive(request) && <span className="spinner" />}
+        {isActiveRequest(request) && <span className="spinner" />}
         <Icon name="chevron" size={16} />
       </button>
       {request.status !== "failed" && request.total > 0 && (
@@ -168,23 +159,8 @@ function RequestCard({
   );
 }
 
-/** A song request has no title of its own: show its song. */
-function SongTitle({ requestId }: { requestId: number }) {
-  const songs = useSongs(requestId, false);
-  const song = songs.data?.[0];
-  return <>{song ? [song.artist, song.title].filter(Boolean).join(" – ") : "Song"}</>;
-}
-
-function useSongs(requestId: number, live: boolean) {
-  return useQuery({
-    queryKey: ["requests", requestId],
-    queryFn: () => api<WantedSong[]>(`/requests/${requestId}`),
-    refetchInterval: live ? 3000 : false,
-  });
-}
-
 function RequestSongs({ request, onRetry }: { request: MusicRequest; onRetry: () => void }) {
-  const songs = useSongs(request.id, isActive(request));
+  const songs = useRequestSongsQuery(request);
   return (
     <div className="request-songs">
       {request.failed > 0 && (
@@ -218,11 +194,7 @@ function RequestSongs({ request, onRetry }: { request: MusicRequest; onRetry: ()
 
 /** The last songs that went into the library, newest first. */
 function RecentlyAdded() {
-  const recent = useQuery({
-    queryKey: ["library", "recent"],
-    queryFn: () => api<RecentSong[]>("/library/recent"),
-    refetchInterval: 15000,
-  });
+  const recent = useRecentSongsQuery();
   const songs = recent.data ?? [];
   if (songs.length === 0) return null;
   return (

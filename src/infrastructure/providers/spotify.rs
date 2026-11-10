@@ -1,20 +1,11 @@
-use super::{ArtistCredit, Candidate};
+use super::{ArtistCredit, Candidate, ClientCredentials, phrase, request_json};
 use anyhow::{Result, bail};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use serde_json::Value;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
-#[derive(Default)]
-pub struct SpotifyAuth {
-    token: Mutex<Option<CachedToken>>,
-}
+pub type SpotifyAuth = ClientCredentials;
 
-struct CachedToken {
-    value: String,
-    expires_at: Instant,
-}
+const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 
 pub async fn search(
     client: &Client,
@@ -25,7 +16,9 @@ pub async fn search(
     artist: Option<&str>,
     isrcs: &[String],
 ) -> Result<Vec<Candidate>> {
-    let token = access_token(client, auth, client_id, client_secret).await?;
+    let token = auth
+        .token(client, TOKEN_URL, client_id, client_secret)
+        .await?;
     let mut queries = isrcs
         .iter()
         .filter(|isrc| !isrc.trim().is_empty())
@@ -33,23 +26,21 @@ pub async fn search(
         .collect::<Vec<_>>();
     if queries.is_empty() {
         queries.push(match artist.filter(|value| !value.trim().is_empty()) {
-            Some(artist) => format!("track:\"{title}\" artist:\"{artist}\""),
-            None => format!("track:\"{title}\""),
+            Some(artist) => format!("track:{} artist:{}", phrase(title), phrase(artist)),
+            None => format!("track:{}", phrase(title)),
         });
     }
     queries.sort();
     queries.dedup();
     let mut candidates = Vec::new();
     for query in queries.into_iter().take(3) {
-        let raw = client
-            .get("https://api.spotify.com/v1/search")
-            .bearer_auth(&token)
-            .query(&[("q", query.as_str()), ("type", "track"), ("limit", "10")])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        let raw = request_json(
+            client
+                .get("https://api.spotify.com/v1/search")
+                .bearer_auth(&token)
+                .query(&[("q", query.as_str()), ("type", "track"), ("limit", "10")]),
+        )
+        .await?;
         candidates.extend(parse_results(&raw));
     }
     let mut seen = std::collections::HashSet::new();
@@ -87,16 +78,10 @@ pub async fn lookup_url(
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Spotify track link has no track ID"))?;
-    if !client_id.trim().is_empty()
-        && !client_secret.trim().is_empty()
-        && let Ok(candidate) = lookup_api_track(
-            client,
-            auth,
-            client_id.trim(),
-            client_secret.trim(),
-            track_id,
-        )
-        .await
+    if !client_id.is_empty()
+        && !client_secret.is_empty()
+        && let Ok(candidate) =
+            lookup_api_track(client, auth, client_id, client_secret, track_id).await
     {
         return Ok(candidate);
     }
@@ -110,15 +95,15 @@ async fn lookup_api_track(
     client_secret: &str,
     track_id: &str,
 ) -> Result<Candidate> {
-    let token = access_token(client, auth, client_id, client_secret).await?;
-    let raw = client
-        .get(format!("https://api.spotify.com/v1/tracks/{track_id}"))
-        .bearer_auth(token)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
+    let token = auth
+        .token(client, TOKEN_URL, client_id, client_secret)
         .await?;
+    let raw = request_json(
+        client
+            .get(format!("https://api.spotify.com/v1/tracks/{track_id}"))
+            .bearer_auth(token),
+    )
+    .await?;
     let mut candidate = candidate_from_track(&raw)
         .ok_or_else(|| anyhow::anyhow!("Spotify returned incomplete track metadata"))?;
     candidate.score = 97.0;
@@ -175,40 +160,6 @@ async fn lookup_oembed(client: &Client, url: &str) -> Result<Candidate> {
 pub fn upgrade_artwork_url(url: &str) -> String {
     url.replace("ab67616d00001e02", "ab67616d0000b273")
         .replace("ab67616d00004851", "ab67616d0000b273")
-}
-
-async fn access_token(
-    client: &Client,
-    auth: &SpotifyAuth,
-    client_id: &str,
-    client_secret: &str,
-) -> Result<String> {
-    let mut cached = auth.token.lock().await;
-    if let Some(token) = cached.as_ref()
-        && token.expires_at > Instant::now() + Duration::from_secs(30)
-    {
-        return Ok(token.value.clone());
-    }
-    let authorization = STANDARD.encode(format!("{client_id}:{client_secret}"));
-    let raw = client
-        .post("https://accounts.spotify.com/api/token")
-        .header("Authorization", format!("Basic {authorization}"))
-        .form(&[("grant_type", "client_credentials")])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-    let value = raw["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Spotify token response had no access token"))?
-        .to_owned();
-    let lifetime = raw["expires_in"].as_u64().unwrap_or(3600).max(60);
-    *cached = Some(CachedToken {
-        value: value.clone(),
-        expires_at: Instant::now() + Duration::from_secs(lifetime),
-    });
-    Ok(value)
 }
 
 fn parse_results(raw: &Value) -> Vec<Candidate> {

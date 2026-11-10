@@ -1,8 +1,9 @@
 import { memo } from "react";
+import type { Track } from "../../api/types";
 import { Icon } from "../Icons";
-import type { Track } from "@/api/types";
-import { fileStem, isCompleted, outputFilename, selectedCandidate } from "../trackUtils";
-import { Artwork, OriginalArtwork, TrackStatus } from "./TrackInspector";
+import { fileStem, outputFilename, selectedCandidate } from "../trackUtils";
+import { ChosenCover, OriginalCover } from "./Cover";
+import { TrackStatus } from "./TrackInspector";
 
 function TrackRowBase({
   track,
@@ -26,9 +27,9 @@ function TrackRowBase({
       aria-current={active ? "true" : undefined}
     >
       {chosen ? (
-        <Artwork candidate={chosen} trackId={track.id} size="small" />
+        <ChosenCover track={track} candidate={chosen} size="small" />
       ) : (
-        <OriginalArtwork track={track} size="small" />
+        <OriginalCover track={track} size="small" />
       )}
       <span className="row-identity">
         <b>{displayTitle}</b>
@@ -39,9 +40,7 @@ function TrackRowBase({
         </small>
       </span>
       <span className={`row-file ${chosen ? "chosen" : ""}`}>
-        <small>
-          {chosen ? (isCompleted(track) ? "Written file" : "New filename") : "Original file"}
-        </small>
+        <small>{chosen ? "New filename" : "Original file"}</small>
         <b title={filename}>{filename}</b>
       </span>
       <TrackStatus track={track} />

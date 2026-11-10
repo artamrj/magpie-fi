@@ -3,17 +3,17 @@
 //! recording in the library so the same song is never filed twice.
 
 use crate::{
-    application::input_dedup::{self, RecordingEvidence},
+    application::{
+        files,
+        input_dedup::{self, RecordingEvidence},
+    },
     domain::{audio, credits},
     infrastructure::{fingerprint_cache, media::fingerprint, providers::Candidate},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
 const DURATION_TOLERANCE_SECONDS: f64 = 3.0;
@@ -264,13 +264,13 @@ pub async fn move_to_trash(trash: &Path, base: &Path, file: &Path) -> Result<Pat
     let mut candidate = target.clone();
     let mut number = 2;
     while tokio::fs::try_exists(&candidate).await? {
-        candidate = numbered(&target, number);
+        candidate = files::numbered(&target, number);
         number += 1;
     }
     match tokio::fs::rename(file, &candidate).await {
         Ok(()) => {}
         // A different filesystem (should not happen with the recommended layout).
-        Err(error) if error.raw_os_error() == Some(libc_exdev()) => {
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
             tokio::fs::copy(file, &candidate).await?;
             tokio::fs::remove_file(file).await?;
         }
@@ -281,22 +281,6 @@ pub async fn move_to_trash(trash: &Path, base: &Path, file: &Path) -> Result<Pat
     }
     remove_empty_parents(file, base).await;
     Ok(candidate)
-}
-
-const fn libc_exdev() -> i32 {
-    18
-}
-
-fn numbered(path: &Path, number: usize) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match path.extension() {
-        Some(extension) => format!("{stem} ({number}).{}", extension.to_string_lossy()),
-        None => format!("{stem} ({number})"),
-    };
-    path.with_file_name(name)
 }
 
 /// Removes folders left empty after a move, up to (not including) `base`.
@@ -353,7 +337,7 @@ pub struct LibraryEntry {
 
 /// Saves (or refreshes) one library file in the index.
 pub async fn remember(pool: &SqlitePool, entry: &LibraryEntry) -> Result<()> {
-    let (size, modified) = file_identity(Path::new(&entry.path)).await?;
+    let (size, modified) = files::stamp(Path::new(&entry.path)).await?;
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO library_items(path,file_size,file_mtime_ns,duration,content_key,isrc,
@@ -476,23 +460,7 @@ pub fn is_upgrade(new: &RecordingEvidence, existing: &LibraryEntry) -> bool {
 /// rewritten). Entries for deleted files are removed.
 pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
     let root = library.to_path_buf();
-    let files = tokio::task::spawn_blocking(move || {
-        walkdir::WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with('.') || name.starts_with('@'))
-            })
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file() && audio::is_supported(entry.path()))
-            .map(walkdir::DirEntry::into_path)
-            .collect::<Vec<_>>()
-    })
-    .await?;
+    let (files, _) = tokio::task::spawn_blocking(move || files::audio_files(&root)).await?;
 
     let known: Vec<(String, i64, i64)> =
         sqlx::query_as("SELECT path,file_size,file_mtime_ns FROM library_items")
@@ -513,7 +481,7 @@ pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
     let mut indexed = 0;
     for path in files {
         let text = path.to_string_lossy().into_owned();
-        let Ok(identity) = file_identity(&path).await else {
+        let Ok(identity) = files::stamp(&path).await else {
             continue;
         };
         if known.get(&text) == Some(&identity) {
@@ -580,29 +548,15 @@ fn read_identifiers(path: &Path) -> (Option<String>, Option<String>) {
     (get(ItemKey::Isrc), get(ItemKey::MusicBrainzRecordingId))
 }
 
-async fn file_identity(path: &Path) -> Result<(i64, i64)> {
-    let metadata = tokio::fs::metadata(path).await?;
-    let modified = metadata
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos();
-    Ok((
-        i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-        i64::try_from(modified).unwrap_or(i64::MAX),
-    ))
-}
-
 /// Writes `cover.jpg` (or `.png`/`.webp`, matching the image) into the album
 /// folder when the folder has no cover file yet. Navidrome prefers it over
 /// embedded art.
-pub async fn write_folder_cover(album_folder: &Path, image: &[u8]) -> Result<Option<PathBuf>> {
+pub async fn write_folder_cover(album_folder: &Path, image: &[u8]) -> Result<()> {
     let mut entries = tokio::fs::read_dir(album_folder).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         if name.starts_with("cover.") || name.starts_with("folder.") || name.starts_with("front.") {
-            return Ok(None);
+            return Ok(());
         }
     }
     let extension = match image::guess_format(image) {
@@ -615,15 +569,15 @@ pub async fn write_folder_cover(album_folder: &Path, image: &[u8]) -> Result<Opt
     let temporary = album_folder.join(format!(".cover.{extension}.part"));
     tokio::fs::write(&temporary, image).await?;
     tokio::fs::rename(&temporary, &target).await?;
-    Ok(Some(target))
+    Ok(())
 }
 
 // ── Playlists ───────────────────────────────────────────────────────────────
 
 /// Writes `library/Playlists/<name>.m3u8` with paths relative to the playlist
 /// file, which Navidrome imports automatically. Songs outside the library are
-/// left out. Returns true when the file changed.
-pub async fn write_playlist(library: &Path, name: &str, songs: &[String]) -> Result<bool> {
+/// left out. An unchanged playlist is not rewritten.
+pub async fn write_playlist(library: &Path, name: &str, songs: &[String]) -> Result<()> {
     let folder = library.join("Playlists");
     tokio::fs::create_dir_all(&folder).await?;
     let mut content = format!("#EXTM3U\n#PLAYLIST:{}\n", name.replace('\n', " "));
@@ -637,12 +591,12 @@ pub async fn write_playlist(library: &Path, name: &str, songs: &[String]) -> Res
     }
     let target = folder.join(format!("{}.m3u8", safe_name(name, "Playlist")));
     if tokio::fs::read_to_string(&target).await.ok().as_deref() == Some(content.as_str()) {
-        return Ok(false);
+        return Ok(());
     }
     let temporary = folder.join(format!(".{}.m3u8.part", safe_name(name, "Playlist")));
     tokio::fs::write(&temporary, &content).await?;
     tokio::fs::rename(&temporary, &target).await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Removes a file that magpie created itself (a download in staging) or moves
@@ -652,12 +606,13 @@ pub async fn discard_original(
     staging: &Path,
     inbox: &Path,
     file: &Path,
-) -> Result<Option<PathBuf>> {
+) -> Result<()> {
     if file.starts_with(staging) {
         tokio::fs::remove_file(file).await?;
-        return Ok(None);
+    } else {
+        move_to_trash(trash, inbox, file).await?;
     }
-    move_to_trash(trash, inbox, file).await.map(Some)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -940,11 +895,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         ];
-        assert!(
-            write_playlist(&library, "Arta - Road Trip", &songs)
-                .await
-                .unwrap()
-        );
+        write_playlist(&library, "Arta - Road Trip", &songs)
+            .await
+            .unwrap();
         let text = tokio::fs::read_to_string(library.join("Playlists/Arta - Road Trip.m3u8"))
             .await
             .unwrap();
@@ -952,10 +905,14 @@ mod tests {
             text,
             "#EXTM3U\n#PLAYLIST:Arta - Road Trip\n../A/Album (2001)/01 - One.m4a\n../B/Single (2020) [Single]/01 - Three.m4a\n"
         );
-        assert!(
-            !write_playlist(&library, "Arta - Road Trip", &songs)
+        write_playlist(&library, "Arta - Road Trip", &songs)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(library.join("Playlists/Arta - Road Trip.m3u8"))
                 .await
-                .unwrap()
+                .unwrap(),
+            text
         );
     }
 
@@ -974,18 +931,18 @@ mod tests {
         tokio::fs::write(&download, b"d").await.unwrap();
         tokio::fs::write(&dropped, b"m").await.unwrap();
 
-        assert_eq!(
-            discard_original(&trash, &staging, &inbox, &download)
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(!download.exists());
-        let trashed = discard_original(&trash, &staging, &inbox, &dropped)
+        discard_original(&trash, &staging, &inbox, &download)
             .await
-            .unwrap()
             .unwrap();
-        assert!(trashed.starts_with(&trash));
+        assert!(!download.exists());
+        assert!(!trash.exists());
+        discard_original(&trash, &staging, &inbox, &dropped)
+            .await
+            .unwrap();
+        assert!(!dropped.exists());
+        let (trashed, _) = files::audio_files(&trash);
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].ends_with("mine.mp3"));
     }
 
     #[tokio::test]
@@ -999,11 +956,12 @@ mod tests {
                 .unwrap();
             output.into_inner()
         };
-        let written = write_folder_cover(directory.path(), &png).await.unwrap();
-        assert_eq!(written, Some(directory.path().join("cover.png")));
-        assert_eq!(
-            write_folder_cover(directory.path(), &png).await.unwrap(),
-            None
-        );
+        write_folder_cover(directory.path(), &png).await.unwrap();
+        let cover = directory.path().join("cover.png");
+        assert_eq!(std::fs::read(&cover).unwrap(), png);
+        write_folder_cover(directory.path(), b"other")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&cover).unwrap(), png);
     }
 }

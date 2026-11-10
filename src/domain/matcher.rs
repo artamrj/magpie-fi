@@ -170,17 +170,6 @@ pub fn score_candidate(
     }
 }
 
-#[cfg(test)]
-pub fn auto_selectable(
-    top_score: f64,
-    second_score: Option<f64>,
-    duration_delta: Option<f64>,
-) -> bool {
-    top_score >= 90.0
-        && duration_delta.is_some_and(|delta| delta <= 3.0)
-        && second_score.is_none_or(|score| top_score - score >= 10.0)
-}
-
 /// Canonical similarity and duration helpers shared by the scan pipeline,
 /// approval, and completion layers. Keep these in one place so every decision
 /// path measures strings and durations the same way.
@@ -296,16 +285,6 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.score >= 99.0);
-    }
-
-    #[test]
-    fn bad_duration_blocks_auto_select() {
-        assert!(!auto_selectable(96.0, None, Some(12.0)));
-    }
-
-    #[test]
-    fn close_second_result_blocks_auto_select() {
-        assert!(!auto_selectable(96.0, Some(91.0), Some(1.0)));
     }
 
     #[test]

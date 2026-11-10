@@ -1,7 +1,7 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::{Candidate, nonempty, request_json};
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 use percent_encoding::percent_decode_str;
 use reqwest::Client;
 use serde_json::Value;
@@ -25,54 +25,24 @@ pub async fn search(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let value = client
-            .get(format!("{API_BASE}/search"))
-            .header("Accept", "application/json")
-            .header("x-rj-user-agent", RJ_USER_AGENT)
-            .query(&[("query", query.as_str())])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        reject_api_error(&value)?;
-        ProviderCache::put(pool, PROVIDER, &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+    let raw = cached(
+        pool,
+        PROVIDER,
+        &search_key(&query),
+        Duration::days(7),
+        || api(client, "search", ("query", &query)),
+    )
+    .await?;
     Ok(parse_search_results(&raw))
 }
 
 pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result<Candidate> {
     let slug = song_slug(url)?;
     let key = format!("song:{}", slug.to_ascii_lowercase());
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let value = client
-            .get(format!("{API_BASE}/mp3"))
-            .header("Accept", "application/json")
-            .header("x-rj-user-agent", RJ_USER_AGENT)
-            .query(&[("id", slug.as_str())])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        reject_api_error(&value)?;
-        ProviderCache::put(
-            pool,
-            PROVIDER,
-            &key,
-            &value,
-            Utc::now() + Duration::days(14),
-        )
-        .await?;
-        value
-    };
+    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || {
+        api(client, "mp3", ("id", &slug))
+    })
+    .await?;
     let track = raw
         .get("mp3")
         .filter(|value| value.is_object())
@@ -91,6 +61,20 @@ pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result
         .to_string(),
     );
     Ok(candidate)
+}
+
+/// One call to Radio Javan's desktop API.
+async fn api(client: &Client, endpoint: &str, parameter: (&str, &str)) -> Result<Value> {
+    let value = request_json(
+        client
+            .get(format!("{API_BASE}/{endpoint}"))
+            .header("Accept", "application/json")
+            .header("x-rj-user-agent", RJ_USER_AGENT)
+            .query(&[parameter]),
+    )
+    .await?;
+    reject_api_error(&value)?;
+    Ok(value)
 }
 
 fn reject_api_error(raw: &Value) -> Result<()> {
@@ -200,10 +184,6 @@ fn parse_release_date(track: &Value) -> Option<String> {
         .as_str()
         .and_then(|date| NaiveDate::parse_from_str(date, "%b %d, %Y").ok())
         .map(|date| date.format("%Y-%m-%d").to_string())
-}
-
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

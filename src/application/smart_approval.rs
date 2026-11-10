@@ -309,7 +309,7 @@ fn candidates_agree(left: &Candidate, right: &Candidate) -> bool {
         && artist_similarity(&left.artist, &right.artist) >= 0.82
 }
 
-fn has_audio_recognition(candidate: &Candidate) -> bool {
+pub(crate) fn has_audio_recognition(candidate: &Candidate) -> bool {
     candidate
         .score_breakdown
         .as_deref()
@@ -320,7 +320,7 @@ fn has_audio_recognition(candidate: &Candidate) -> bool {
         })
 }
 
-fn source_count(candidate: &Candidate) -> usize {
+pub(crate) fn source_count(candidate: &Candidate) -> usize {
     candidate
         .score_breakdown
         .as_deref()
@@ -381,13 +381,13 @@ fn provider_trust(provider: &str) -> f64 {
         "spotify" | "itunes" | "deezer" | "musicbrainz" | "radiojavan" | "audiomack"
         | "navahang" | "shazam" | "genius" => 5.0,
         "audd" | "acoustid" | "songrec" => 4.0,
-        "discogs" | "theaudiodb" | "soundcloud" => 2.0,
-        "lastfm" | "wikidata" | "youtube" => 1.0,
+        "discogs" | "soundcloud" => 2.0,
+        "lastfm" | "youtube" => 1.0,
         _ => 0.0,
     }
 }
 
-fn version_tags(value: &str) -> BTreeSet<&'static str> {
+pub(crate) fn version_tags(value: &str) -> BTreeSet<&'static str> {
     let normalized = normalized_text(value);
     let words = normalized.split_whitespace().collect::<HashSet<_>>();
     let mut tags = BTreeSet::new();

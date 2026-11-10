@@ -2,7 +2,10 @@
 //! search, video details, playlist listing and audio download. The Docker image
 //! bundles the standalone yt-dlp and Deno (its JavaScript runtime for YouTube).
 
-use crate::config::{AudioFormat, Config};
+use crate::{
+    config::{AudioFormat, Config},
+    infrastructure::providers::text,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::{
@@ -44,10 +47,7 @@ fn updated_copy(config: &Config) -> PathBuf {
 }
 
 pub fn available(config: &Config) -> bool {
-    std::process::Command::new(binary(config))
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    crate::infrastructure::process::available(binary(config), "--version")
 }
 
 /// Keeps a writable copy of the bundled yt-dlp in `data/bin` and updates it to
@@ -325,14 +325,6 @@ fn entry(value: &Value) -> Entry {
             .as_f64()
             .filter(|duration| *duration > 0.0),
     }
-}
-
-fn text(value: &Value, key: &str) -> Option<String> {
-    value[key]
-        .as_str()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]

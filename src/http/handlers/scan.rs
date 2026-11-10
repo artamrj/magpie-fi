@@ -1,5 +1,4 @@
 use super::*;
-use crate::app::ActivityLogEntry;
 
 #[derive(Serialize)]
 pub struct RetryIssuesResult {
@@ -21,25 +20,15 @@ pub async fn run_automatic_cycle(state: Arc<AppState>) -> Result<()> {
     if state.workflow_running().await {
         return Ok(());
     }
-    async {
-        let scanned = scan_pipeline::run_automatic(state.clone()).await?;
-        if state.workflow_cancelled().await {
-            return Ok(());
-        }
-        let written = super::apply::apply_ready_automatically(state.clone()).await?;
-        if scanned == 0 && written == 0 {
-            return Ok(());
-        }
-        state
-            .log_entry(
-                ActivityLogEntry::new("ok", "inbox", "Inbox cycle complete").detail(format!(
-                    "Checked {scanned} new or changed files; filed {written} tracks"
-                )),
-            )
-            .await;
-        Ok(())
+    let scanned = scan_pipeline::run_automatic(state.clone()).await?;
+    if state.workflow_cancelled().await {
+        return Ok(());
     }
-    .await
+    let filed = crate::application::apply::apply_ready_automatically(state).await?;
+    if scanned > 0 || filed > 0 {
+        tracing::info!(scanned, filed, "inbox cycle complete");
+    }
+    Ok(())
 }
 
 pub async fn stop_scan(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -49,7 +38,7 @@ pub async fn stop_scan(State(s): State<Arc<AppState>>) -> Json<serde_json::Value
 
 pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<RetryIssuesResult>> {
     if !s
-        .try_claim_workflow(WorkflowPhase::Fetch, "Checking files with issues", false)
+        .try_claim_workflow(WorkflowPhase::Fetch, "Checking files with issues")
         .await
     {
         return Err(ApiError::conflict(
@@ -80,8 +69,7 @@ pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<Retr
             .is_ok_and(|metadata| metadata.is_file())
         {
             sqlx::query(
-                "UPDATE tracks SET stage_message='Checking and repairing this file',
-                 retry_count=retry_count+1,next_retry_at=NULL,updated_at=? WHERE id=?",
+                "UPDATE tracks SET stage_message='Checking and repairing this file',updated_at=? WHERE id=?",
             )
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(id)
@@ -93,7 +81,7 @@ pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<Retr
             sqlx::query(
                 "UPDATE tracks SET status='failed',stage='failed',is_missing=1,
                  stage_message='Source file is still missing; restore it to its original location and check again',
-                 retry_count=retry_count+1,next_retry_at=NULL,updated_at=? WHERE id=?",
+                 updated_at=? WHERE id=?",
             )
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(id)
@@ -116,7 +104,7 @@ pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<Retr
     tokio::spawn(async move {
         if let Err(error) = recover_issue_files(state.clone(), available).await {
             state
-                .finish_workflow(WorkflowPhase::Failed, "failed", error.to_string())
+                .finish_workflow(WorkflowPhase::Failed, error.to_string())
                 .await;
         }
     });
@@ -143,7 +131,6 @@ async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>)
             state
                 .set_workflow(
                     WorkflowPhase::Fetch,
-                    "repair",
                     "Salvaging damaged audio",
                     index,
                     total,
@@ -167,7 +154,7 @@ async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>)
                     .bind(path.to_string_lossy().as_ref())
                     .execute(&state.pool)
                     .await?;
-                    state.log("ok", "repair", Some(&filename), &message).await;
+                    tracing::info!(file = filename, "{message}");
                     retry_paths.push(path);
                 }
                 Err(error) => {
@@ -182,18 +169,11 @@ async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>)
                     .bind(path.to_string_lossy().as_ref())
                     .execute(&state.pool)
                     .await?;
-                    state.increment_failed().await;
-                    state
-                        .log_entry(
-                            ActivityLogEntry::new(
-                                "error",
-                                "repair",
-                                "Automatic audio repair failed; original preserved",
-                            )
-                            .file(filename)
-                            .error_text(detail),
-                        )
-                        .await;
+                    tracing::error!(
+                        file = filename,
+                        error = detail,
+                        "automatic audio repair failed; original preserved"
+                    );
                 }
             }
         } else {
@@ -211,7 +191,6 @@ async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>)
         state
             .finish_workflow(
                 WorkflowPhase::Preview,
-                "preview",
                 "Issue check complete; damaged originals were preserved",
             )
             .await;
@@ -251,8 +230,8 @@ mod tests {
         assert!(!result.started);
         assert_eq!(result.queued, 0);
         assert_eq!(result.unavailable, 1);
-        let row: (String, String, bool, i64) = sqlx::query_as(
-            "SELECT status,stage_message,is_missing,retry_count FROM tracks WHERE filename='missing.mp3'",
+        let row: (String, String, bool) = sqlx::query_as(
+            "SELECT status,stage_message,is_missing FROM tracks WHERE filename='missing.mp3'",
         )
         .fetch_one(&state.pool)
         .await
@@ -260,7 +239,6 @@ mod tests {
         assert_eq!(row.0, "failed");
         assert!(row.1.contains("still missing"));
         assert!(row.2);
-        assert_eq!(row.3, 1);
     }
 
     #[tokio::test]

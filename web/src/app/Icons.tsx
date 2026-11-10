@@ -13,10 +13,8 @@ export type IconName =
   | "layers"
   | "menu"
   | "moon"
-  | "more"
   | "music"
   | "pause"
-  | "play"
   | "refresh"
   | "search"
   | "settings"
@@ -78,13 +76,6 @@ const paths: Record<IconName, React.ReactNode> = {
   ),
   menu: <path d="M4 7h16M4 12h16M4 17h16" />,
   moon: <path d="M20 15.2A8.5 8.5 0 0 1 8.8 4 8.5 8.5 0 1 0 20 15.2Z" />,
-  more: (
-    <>
-      <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
-      <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
-      <circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" />
-    </>
-  ),
   music: (
     <>
       <path d="M9 18V5l10-2v13" />
@@ -93,7 +84,6 @@ const paths: Record<IconName, React.ReactNode> = {
     </>
   ),
   pause: <path d="M9 5v14M15 5v14" />,
-  play: <path d="m8 5 11 7-11 7Z" />,
   refresh: (
     <>
       <path d="M20 7v5h-5" />

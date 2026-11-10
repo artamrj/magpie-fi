@@ -58,7 +58,7 @@ pub async fn require_login(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let telegram = state.config.read().await.telegram.clone();
+    let telegram = state.config.telegram.clone();
     let identity = match telegram.as_ref() {
         None => Some(Identity {
             user_id: 0,
@@ -111,14 +111,7 @@ async fn identify(
             via: "telegram",
         });
     }
-    let token = cookie(headers, COOKIE)?;
-    let user_id: i64 =
-        sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>?")
-            .bind(hash(&token))
-            .bind(Utc::now().to_rfc3339())
-            .fetch_optional(&state.pool)
-            .await
-            .ok()??;
+    let user_id = session_user(&state.pool, headers).await?;
     let role = role(&state.pool, telegram, user_id).await?;
     Some(Identity {
         user_id,
@@ -126,6 +119,17 @@ async fn identify(
         role,
         via: "session",
     })
+}
+
+/// The user of a valid session cookie, if the request carries one.
+async fn session_user(pool: &SqlitePool, headers: &HeaderMap) -> Option<i64> {
+    let token = cookie(headers, COOKIE)?;
+    sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash=? AND expires_at>?")
+        .bind(hash(&token))
+        .bind(Utc::now().to_rfc3339())
+        .fetch_optional(pool)
+        .await
+        .ok()?
 }
 
 async fn role(pool: &SqlitePool, telegram: &TelegramConfig, user_id: i64) -> Option<Role> {
@@ -311,8 +315,6 @@ async fn start_session(state: &AppState, user_id: i64) -> Result<String> {
         .await?;
     let https = state
         .config
-        .read()
-        .await
         .public_url
         .as_deref()
         .is_some_and(|url| url.starts_with("https://"));
@@ -346,8 +348,9 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 /// `GET /api/me` — who the page is talking to (or that a login is needed).
-/// The Mini App also gets a session cookie here, so cover images and audio
-/// previews (which cannot send the Telegram header) work too.
+/// The Mini App also gets a session cookie here (unless it already has a valid
+/// one), so cover images and audio previews (which cannot send the Telegram
+/// header) work too.
 pub async fn me(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let Some(identity) = request.extensions().get::<Identity>().cloned() else {
         return error(
@@ -358,6 +361,7 @@ pub async fn me(State(state): State<Arc<AppState>>, request: Request) -> Respons
     let mut response = Json(identity.clone()).into_response();
     if identity.via == "telegram"
         && identity.role == Role::Owner
+        && session_user(&state.pool, request.headers()).await != Some(identity.user_id)
         && let Ok(cookie) = start_session(&state, identity.user_id).await
         && let Ok(value) = HeaderValue::from_str(&cookie)
     {
@@ -443,7 +447,6 @@ mod tests {
             config.telegram = Some(TelegramConfig {
                 token: TOKEN.into(),
                 owners: vec![100],
-                api_url: "http://127.0.0.1:9".into(),
             });
         }
         let pool =
@@ -556,7 +559,27 @@ mod tests {
         // /api/me also gives the Mini App a cookie for images and audio.
         let me = get(&router, "/api/me", &[("authorization", &owner)]).await;
         assert_eq!(me.status(), StatusCode::OK);
-        assert!(me.headers().contains_key(header::SET_COOKIE));
+        let session = me.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        // Reloading the Mini App with that cookie keeps the same session.
+        let again = get(
+            &router,
+            "/api/me",
+            &[("authorization", &owner), ("cookie", &session)],
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert!(!again.headers().contains_key(header::SET_COOKIE));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
 
         sqlx::query("INSERT INTO telegram_guests(user_id,name,invited_by,created_at) VALUES(200,'g',100,'now')")
             .execute(&state.pool)

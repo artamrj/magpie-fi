@@ -3,66 +3,65 @@
 
 pub(super) use crate::infrastructure::providers as infra_providers;
 pub(super) use crate::{
-    app::{ActivityLogEntry, AppState},
-    application::input_dedup::{self, RecordingEvidence},
-    domain::audio,
-    domain::matcher::{
-        artist_similarity, normalize_match_key, text_close, text_similarity, title_similarity,
+    app::AppState,
+    application::{
+        canonical_names::normalize_credits,
+        files,
+        input_dedup::{self, RecordingEvidence},
+        smart_approval::{has_audio_recognition, source_count},
     },
-    infrastructure::{fingerprint_cache, media::fingerprint},
+    domain::{
+        audio,
+        matcher::{
+            artist_similarity, normalize_match_key, text_close, text_similarity, title_similarity,
+        },
+        provider_name,
+    },
+    infrastructure::{
+        fingerprint_cache,
+        media::{fingerprint, integrity},
+    },
     types::WorkflowPhase,
 };
-pub(super) use anyhow::{Context, Result, anyhow};
+pub(super) use anyhow::{Context, Result};
 pub(super) use chrono::Utc;
 pub(super) use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub(super) use tokio::{
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex, Semaphore, mpsc},
     task::JoinSet,
 };
-pub(super) use walkdir::WalkDir;
 
 mod persist;
 mod process;
 mod providers;
-mod score;
 
 pub(super) use persist::*;
 pub(super) use process::*;
 pub(super) use providers::*;
-pub(super) use score::*;
 
 pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     if !state
-        .try_claim_workflow(WorkflowPhase::Scan, "Checking the inbox", true)
+        .try_claim_workflow(WorkflowPhase::Scan, "Checking the inbox")
         .await
     {
         return Ok(0);
     }
-    let cfg = state.config.read().await.clone();
-    let (files, walk_errors) = discover_files_in_background(cfg.input_dir.clone()).await?;
-    // magpie's own downloads are complete when they appear in staging, so they
-    // skip the settle wait.
-    let (downloads, _) =
-        discover_files_in_background(cfg.staging_dir.to_string_lossy().into_owned()).await?;
+    let cfg = &state.config;
+    let (files, walk_errors) = discover_files_in_background(PathBuf::from(&cfg.input_dir)).await?;
+    let (downloads, _) = discover_files_in_background(cfg.staging_dir.clone()).await?;
     for error in walk_errors {
-        state
-            .log_entry(
-                ActivityLogEntry::new("error", "inbox", "Inbox folder walk error")
-                    .error_text(error),
-            )
-            .await;
+        tracing::error!(error, "inbox folder walk error");
     }
     let settle = Duration::from_secs(cfg.inbox_settle_seconds);
-    let mut pending = automatic_pending_files(&state.pool, files, settle).await?;
-    pending.extend(automatic_pending_files(&state.pool, downloads, Duration::ZERO).await?);
+    let pending = automatic_pending_files(&state.pool, files, downloads, settle).await?;
     if pending.is_empty() {
         state
-            .finish_workflow(WorkflowPhase::Idle, "idle", "Inbox: nothing new")
+            .finish_workflow(WorkflowPhase::Idle, "Inbox: nothing new")
             .await;
         return Ok(0);
     }
@@ -74,10 +73,11 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
         "Inbox identification complete",
     )
     .await?;
-    if !cancelled {
-        remember_scanned_files(&state.pool, &snapshot_files).await?;
+    if cancelled {
+        return Ok(0);
     }
-    Ok(if cancelled { 0 } else { snapshot_files.len() })
+    remember_scanned_files(&state.pool, &snapshot_files).await?;
+    Ok(snapshot_files.len())
 }
 
 pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()> {
@@ -95,45 +95,31 @@ pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn discover_files(input_dir: &str) -> (Vec<PathBuf>, Vec<String>) {
-    let mut walk_errors = Vec::new();
-    let mut files: Vec<PathBuf> = WalkDir::new(input_dir)
-        .follow_links(false)
+/// Audio files under `root` as real paths (the form every track row uses).
+fn discover_files(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let (files, errors) = files::audio_files(root);
+    let mut files = files
         .into_iter()
-        // Skip hidden and NAS system folders (`.incoming`, `.trash`, `@eaDir`). Other
-        // programs keep unfinished files there, so they must never be scanned.
-        .filter_entry(|entry| entry.depth() == 0 || !is_ignored_name(entry.file_name()))
-        .filter_map(|entry| match entry {
-            Ok(entry) => Some(entry),
-            Err(error) => {
-                tracing::warn!("input folder walk error: {error:#}");
-                walk_errors.push(format!("{error:#}"));
-                None
-            }
-        })
-        .filter(|e| e.file_type().is_file() && audio::is_supported(e.path()))
-        .filter_map(|e| e.path().canonicalize().ok())
-        .collect();
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
     files.sort();
-    (files, walk_errors)
+    (files, errors)
 }
 
-fn is_ignored_name(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.starts_with('.') || name.starts_with('@'))
-}
-
-async fn discover_files_in_background(input_dir: String) -> Result<(Vec<PathBuf>, Vec<String>)> {
-    tokio::task::spawn_blocking(move || discover_files(&input_dir))
+async fn discover_files_in_background(root: PathBuf) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    tokio::task::spawn_blocking(move || discover_files(&root))
         .await
         .context("music folder discovery task failed")
 }
 
-/// Inbox files that are new or changed since the last check. A file that changed
-/// within `settle` is probably still being copied, so it waits for the next check.
+/// Inbox and staging files that are new or changed since the last check. An
+/// inbox file that changed within `settle` is probably still being copied, so
+/// it waits for the next check; magpie's own downloads are complete when they
+/// appear in staging. Files that are gone are forgotten.
 async fn automatic_pending_files(
     pool: &sqlx::SqlitePool,
-    files: Vec<PathBuf>,
+    inbox: Vec<PathBuf>,
+    downloads: Vec<PathBuf>,
     settle: Duration,
 ) -> Result<Vec<PathBuf>> {
     let settled_before = SystemTime::now()
@@ -142,43 +128,46 @@ async fn automatic_pending_files(
         .map_or(i64::MAX, |time| {
             i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
         });
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT path,file_size,file_mtime_ns FROM automatic_scan_files ORDER BY path",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut known = rows.into_iter().peekable();
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT path,file_size,file_mtime_ns FROM automatic_scan_files")
+            .fetch_all(pool)
+            .await?;
+    let mut known = rows
+        .into_iter()
+        .map(|(path, size, modified)| (path, (size, modified)))
+        .collect::<HashMap<_, _>>();
+    let candidates = inbox
+        .into_iter()
+        .map(|path| (path, settled_before))
+        .chain(downloads.into_iter().map(|path| (path, i64::MAX)));
     let mut pending = Vec::new();
-    for path in files {
-        let Some((size, modified)) = file_snapshot(&path).await else {
+    for (path, settled_before) in candidates {
+        let previous = known.remove(path.to_string_lossy().as_ref());
+        let Ok(stamp) = files::stamp(&path).await else {
             continue;
         };
-        if modified > settled_before {
-            continue;
-        }
-        let text = path.to_string_lossy().into_owned();
-        while known
-            .peek()
-            .is_some_and(|(known_path, _, _)| known_path < &text)
-        {
-            known.next();
-        }
-        let unchanged = known
-            .peek()
-            .is_some_and(|(known_path, known_size, known_modified)| {
-                known_path == &text && *known_size == size && *known_modified == modified
-            });
-        if !unchanged {
+        if stamp.1 <= settled_before && previous != Some(stamp) {
             pending.push(path);
         }
+    }
+    if !known.is_empty() {
+        let mut transaction = pool.begin().await?;
+        for path in known.keys() {
+            sqlx::query("DELETE FROM automatic_scan_files WHERE path=?")
+                .bind(path)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
     }
     Ok(pending)
 }
 
 async fn remember_scanned_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
     for path in files {
-        let Some((size, modified)) = file_snapshot(path).await else {
+        let Ok((size, modified)) = files::stamp(path).await else {
             continue;
         };
         sqlx::query(
@@ -192,26 +181,12 @@ async fn remember_scanned_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> R
         .bind(path.to_string_lossy().as_ref())
         .bind(size)
         .bind(modified)
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
         .execute(&mut *transaction)
         .await?;
     }
     transaction.commit().await?;
     Ok(())
-}
-
-async fn file_snapshot(path: &Path) -> Option<(i64, i64)> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let nanos = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    Some((size, i64::try_from(nanos).unwrap_or(i64::MAX)))
 }
 
 async fn run_files(
@@ -220,35 +195,22 @@ async fn run_files(
     starting_message: &'static str,
     completion_message: &'static str,
 ) -> Result<bool> {
-    let cfg = state.config.read().await.clone();
     files.sort();
     files.dedup();
     let total = files.len();
-    state
-        .set_workflow(
-            WorkflowPhase::Fetch,
-            "fetch",
-            starting_message,
-            0,
-            total,
-            None,
-        )
-        .await;
-
     let limits = Arc::new(PipelineLimits {
-        metadata: Arc::new(Semaphore::new(cfg.scan_workers)),
-        fingerprint: Arc::new(Semaphore::new(cfg.fingerprint_workers)),
-        acoustid: Arc::new(Semaphore::new(cfg.lookup_workers)),
+        metadata: Semaphore::new(crate::config::SCAN_WORKERS),
+        fingerprint: Semaphore::new(crate::config::FINGERPRINT_WORKERS),
+        acoustid: Semaphore::new(crate::config::LOOKUP_WORKERS),
         // Two workers keep first-time recognition from serializing the whole
         // library while still avoiding the burst traffic that triggers Shazam
         // rate limits.
-        songrec: Arc::new(Semaphore::new(2)),
-        disabled_providers: Arc::new(Mutex::new(HashSet::new())),
+        songrec: Semaphore::new(2),
+        disabled_providers: Mutex::new(HashSet::new()),
     });
     state
         .set_workflow(
             WorkflowPhase::Fetch,
-            "deduplicate",
             "Analyzing input recordings for duplicates",
             0,
             total,
@@ -260,43 +222,23 @@ async fn run_files(
         return Ok(true);
     }
     state
-        .set_workflow(
-            WorkflowPhase::Fetch,
-            "fetch",
-            starting_message,
-            0,
-            total,
-            None,
-        )
+        .set_workflow(WorkflowPhase::Fetch, starting_message, 0, total, None)
         .await;
-    let (persist_tx, persist_rx) = mpsc::channel(25);
-    let writer = tokio::spawn(db_writer(state.clone(), persist_rx, 25));
-    let scan_workers = cfg.scan_workers.max(1).min(total.max(1));
+    let scan_workers = crate::config::SCAN_WORKERS.min(total.max(1));
     let (file_tx, file_rx) = mpsc::channel::<FileJob>(scan_workers * 2);
     let file_rx = Arc::new(Mutex::new(file_rx));
     let mut tasks = JoinSet::new();
     for _ in 0..scan_workers {
         let state = state.clone();
         let limits = limits.clone();
-        let persist_tx = persist_tx.clone();
         let file_rx = file_rx.clone();
         tasks.spawn(async move {
             loop {
-                let job = {
-                    let mut rx = file_rx.lock().await;
-                    rx.recv().await
-                };
+                let job = file_rx.lock().await.recv().await;
                 let Some(job) = job else {
                     break;
                 };
-                process_file(
-                    state.clone(),
-                    limits.clone(),
-                    persist_tx.clone(),
-                    job,
-                    total,
-                )
-                .await;
+                process_file(&state, &limits, job, total).await;
             }
         });
     }
@@ -307,35 +249,25 @@ async fn run_files(
         file_tx.send(job).await?;
     }
     drop(file_tx);
-    drop(persist_tx);
 
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             tracing::warn!("scan worker task failed: {error:#}");
-            state.increment_failed().await;
         }
         if state.workflow_cancelled().await {
             tasks.abort_all();
         }
     }
-    let writer_result = writer.await?;
-    writer_result?;
     let cancelled = state.workflow_cancelled().await;
-    state
-        .finish_workflow(
-            if cancelled {
-                WorkflowPhase::Idle
-            } else {
-                WorkflowPhase::Preview
-            },
-            if cancelled { "idle" } else { "preview" },
-            if cancelled {
-                "Scan stopped"
-            } else {
-                completion_message
-            },
-        )
-        .await;
+    if cancelled {
+        state
+            .finish_workflow(WorkflowPhase::Idle, "Scan stopped")
+            .await;
+    } else {
+        state
+            .finish_workflow(WorkflowPhase::Preview, completion_message)
+            .await;
+    }
     Ok(cancelled)
 }
 
@@ -361,19 +293,17 @@ async fn prepare_input_jobs(
         let Some(result) = tasks.join_next().await else {
             break;
         };
-        prepared.push(result.context("input duplicate-analysis worker failed")?);
+        let input: PreparedInput = result.context("input duplicate-analysis worker failed")?;
         state
             .set_workflow(
                 WorkflowPhase::Fetch,
-                "deduplicate",
                 "Analyzing input recordings for duplicates",
-                prepared.len(),
+                prepared.len() + 1,
                 total,
-                prepared
-                    .last()
-                    .map(|input| input.path.to_string_lossy().into_owned()),
+                Some(input.path.to_string_lossy().into_owned()),
             )
             .await;
+        prepared.push(Some(input));
         if state.workflow_cancelled().await {
             tasks.abort_all();
             break;
@@ -382,6 +312,7 @@ async fn prepare_input_jobs(
 
     let evidence = prepared
         .iter()
+        .flatten()
         .map(|input| RecordingEvidence {
             path: input.path.clone(),
             format: input
@@ -401,43 +332,26 @@ async fn prepare_input_jobs(
             members: group
                 .members
                 .into_iter()
-                .map(|index| prepared[index].clone())
+                .filter_map(|index| prepared[index].take())
                 .collect(),
         })
         .collect())
 }
 
-async fn prepare_input(
-    state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
-    path: PathBuf,
-) -> PreparedInput {
-    let info = {
-        let permit = limits.metadata.acquire().await;
-        match permit {
-            Ok(_permit) => tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || audio::read(&path)
-            })
-            .await
-            .ok()
-            .and_then(Result::ok),
-            Err(_) => None,
-        }
+/// Reads the tags, checks integrity and computes the content key of one input
+/// file. The results are reused by the identification step.
+async fn prepare_input(state: &AppState, limits: &PipelineLimits, path: PathBuf) -> PreparedInput {
+    let info = read_info(limits, &path).await.ok();
+    let integrity = match info {
+        Some(_) => Some(check_integrity(state, &path).await),
+        None => None,
     };
-    let healthy = if info.is_some() {
-        !matches!(
-            crate::infrastructure::media::integrity::check(&state.pool, &path).await,
-            Ok(crate::infrastructure::media::integrity::Integrity::Corrupt(
-                _
-            ))
-        )
-    } else {
-        false
-    };
+    let healthy = matches!(
+        integrity,
+        Some(IntegrityCheck::Healthy | IntegrityCheck::Unavailable(_))
+    );
     let content_key = if healthy {
-        let permit = limits.fingerprint.acquire().await;
-        match permit {
+        match limits.fingerprint.acquire().await {
             Ok(_permit) => match fingerprint_cache::get_or_calculate(&state.pool, &path, || async {
                 fingerprint::calculate(&path).await
             })
@@ -457,16 +371,34 @@ async fn prepare_input(
     PreparedInput {
         path,
         info,
+        integrity,
         content_key,
     }
 }
 
-async fn finish_scan_progress(state: &Arc<AppState>, total: usize) {
+/// Tags and audio properties, read off the async runtime.
+pub(super) async fn read_info(limits: &PipelineLimits, path: &Path) -> Result<audio::AudioInfo> {
+    let _permit = limits.metadata.acquire().await?;
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || audio::read(&owned))
+        .await
+        .context("metadata reader task failed")?
+        .with_context(|| format!("failed to read metadata from {}", path.display()))
+}
+
+pub(super) async fn check_integrity(state: &AppState, path: &Path) -> IntegrityCheck {
+    match integrity::check(&state.pool, path).await {
+        Ok(integrity::Integrity::Healthy) => IntegrityCheck::Healthy,
+        Ok(integrity::Integrity::Corrupt(diagnostic)) => IntegrityCheck::Corrupt(diagnostic),
+        Err(error) => IntegrityCheck::Unavailable(format!("{error:#}")),
+    }
+}
+
+async fn finish_scan_progress(state: &AppState, total: usize) {
     let processed = state.finish_track(total).await;
     state
         .set_workflow(
             WorkflowPhase::Fetch,
-            "fetch",
             "Matching tracks",
             processed,
             total,
@@ -476,31 +408,30 @@ async fn finish_scan_progress(state: &Arc<AppState>, total: usize) {
 }
 
 pub(super) struct PipelineLimits {
-    pub(super) metadata: Arc<Semaphore>,
-    pub(super) fingerprint: Arc<Semaphore>,
-    pub(super) acoustid: Arc<Semaphore>,
-    pub(super) songrec: Arc<Semaphore>,
-    pub(super) disabled_providers: Arc<Mutex<HashSet<String>>>,
+    pub(super) metadata: Semaphore,
+    pub(super) fingerprint: Semaphore,
+    pub(super) acoustid: Semaphore,
+    pub(super) songrec: Semaphore,
+    pub(super) disabled_providers: Mutex<HashSet<String>>,
 }
 
-#[derive(Clone)]
 pub(super) struct FileJob {
     pub(super) members: Vec<PreparedInput>,
 }
 
-#[derive(Clone)]
 pub(super) struct PreparedInput {
     pub(super) path: PathBuf,
     pub(super) info: Option<audio::AudioInfo>,
+    pub(super) integrity: Option<IntegrityCheck>,
     pub(super) content_key: Option<String>,
 }
 
-pub(super) struct PersistJob {
-    pub(super) path: PathBuf,
-    pub(super) info: audio::AudioInfo,
-    pub(super) candidate: infra_providers::Candidate,
-    pub(super) message: String,
-    pub(super) result: oneshot::Sender<Result<()>>,
+#[derive(Clone, Debug)]
+pub(super) enum IntegrityCheck {
+    Healthy,
+    Corrupt(String),
+    /// The check itself could not run (no FFmpeg, timeout); matching goes on.
+    Unavailable(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,7 +467,7 @@ mod tests {
             std::fs::write(&path, b"audio").unwrap();
         }
 
-        let (files, errors) = discover_files(root.to_str().unwrap());
+        let (files, errors) = discover_files(root);
 
         assert!(errors.is_empty());
         let expected = root
@@ -557,7 +488,7 @@ mod tests {
         tokio::fs::write(&source, b"first version").await.unwrap();
         let source = source.canonicalize().unwrap();
 
-        let pending = automatic_pending_files(&pool, vec![source.clone()], Duration::ZERO)
+        let pending = automatic_pending_files(&pool, vec![source.clone()], vec![], Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(pending, vec![source.clone()]);
@@ -566,7 +497,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            automatic_pending_files(&pool, vec![source.clone()], Duration::ZERO)
+            automatic_pending_files(&pool, vec![source.clone()], vec![], Duration::ZERO)
                 .await
                 .unwrap()
                 .is_empty()
@@ -575,10 +506,20 @@ mod tests {
         tokio::fs::write(&source, b"a changed and longer version")
             .await
             .unwrap();
-        let pending = automatic_pending_files(&pool, vec![source.clone()], Duration::ZERO)
+        let pending = automatic_pending_files(&pool, vec![source.clone()], vec![], Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(pending, vec![source]);
+
+        // A file that left the inbox is forgotten.
+        automatic_pending_files(&pool, vec![], vec![], Duration::ZERO)
+            .await
+            .unwrap();
+        let remembered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automatic_scan_files")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remembered, 0);
     }
 
     #[tokio::test]
@@ -591,10 +532,16 @@ mod tests {
         let source = directory.path().join("copying.flac");
         tokio::fs::write(&source, b"half a file").await.unwrap();
 
-        let pending = automatic_pending_files(&pool, vec![source], Duration::from_secs(60))
+        let pending =
+            automatic_pending_files(&pool, vec![source.clone()], vec![], Duration::from_secs(60))
+                .await
+                .unwrap();
+        assert!(pending.is_empty());
+        // magpie's own downloads skip the wait.
+        let pending = automatic_pending_files(&pool, vec![], vec![source], Duration::from_secs(60))
             .await
             .unwrap();
-        assert!(pending.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -689,42 +636,6 @@ mod tests {
         assert_eq!(row.4, None);
     }
 
-    #[tokio::test]
-    async fn persist_review_stores_candidate_source_evidence() {
-        let pool = test_pool().await;
-        let path = Path::new("/music/input/review.mp3");
-        let info = audio::AudioInfo {
-            title: Some("Song".into()),
-            artist: Some("Artist".into()),
-            duration: 180.0,
-            format: "mp3".into(),
-            ..Default::default()
-        };
-        let candidates = vec![infra_providers::Candidate {
-            provider: "musicbrainz".into(),
-            title: "Song".into(),
-            artist: "Artist".into(),
-            album: Some("Album".into()),
-            recording_id: Some("rec-1".into()),
-            release_id: Some("rel-1".into()),
-            score: 91.0,
-            raw_json: "{}".into(),
-            score_breakdown: Some(serde_json::json!({"acoustid":0.96}).to_string()),
-            ..Default::default()
-        }];
-
-        persist_review(&pool, path, &info, &candidates, "Review required")
-            .await
-            .unwrap();
-
-        let providers: Vec<String> =
-            sqlx::query_scalar("SELECT provider FROM candidate_sources ORDER BY provider")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(providers, ["AcoustID", "MusicBrainz"]);
-    }
-
     #[test]
     fn source_agreement_adds_provider_evidence_and_score() {
         let mut candidates = vec![
@@ -798,17 +709,19 @@ mod tests {
             },
         ];
 
-        enrich_artwork_fallbacks(&mut candidates).unwrap();
+        enrich_artwork_fallbacks(&mut candidates);
 
         assert_eq!(
             candidates[0].cover_url.as_deref(),
             Some("https://example.test/correct.jpg")
         );
-        let details: serde_json::Value =
-            serde_json::from_str(candidates[0].score_breakdown.as_deref().unwrap()).unwrap();
-        let serialized = details["artwork_candidates"].to_string();
-        assert!(serialized.contains("correct.jpg"));
-        assert!(!serialized.contains("wrong.jpg"));
+        let urls = candidates[0]
+            .artwork_candidates
+            .iter()
+            .map(|item| item.url.as_str())
+            .collect::<Vec<_>>();
+        assert!(urls.contains(&"https://example.test/correct.jpg"));
+        assert!(!urls.contains(&"https://example.test/wrong.jpg"));
     }
 
     #[test]
@@ -829,16 +742,9 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!candidate_has_fingerprint(&candidate));
-        assert_eq!(candidate_source_count(&candidate), 1);
-        assert!(!crate::domain::matcher::auto_selectable(
-            candidate.score,
-            None,
-            candidate.duration_delta
-        ));
-        assert!(
-            !(candidate_has_fingerprint(&candidate) || candidate_source_count(&candidate) >= 2)
-        );
+        assert!(!has_audio_recognition(&candidate));
+        assert_eq!(source_count(&candidate), 1);
+        assert_eq!(candidate_trust_tier(&candidate), 0);
     }
 
     #[test]
@@ -874,7 +780,7 @@ mod tests {
         sort_candidates_for_decision(&mut candidates);
 
         assert_eq!(candidates[0].provider, "musicbrainz");
-        assert!(candidate_has_fingerprint(&candidates[0]));
+        assert!(has_audio_recognition(&candidates[0]));
         let decision = crate::application::smart_approval::rank(
             crate::application::smart_approval::TrackEvidence {
                 filename: "The Weeknd - Out of Time.mp3",
@@ -944,62 +850,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(provider, "discogs");
-    }
-
-    #[test]
-    fn equivalent_catalog_releases_are_one_exact_match() {
-        let info = audio::AudioInfo {
-            title: Some("Колыбельная".into()),
-            artist: Some("Jah Khalib".into()),
-            album: Some("@radiop0l".into()),
-            ..Default::default()
-        };
-        let candidates = vec![
-            infra_providers::Candidate {
-                provider: "itunes".into(),
-                title: "Колыбельная".into(),
-                artist: "Jah Khalib".into(),
-                album: Some("E.G.O.".into()),
-                duration_delta: Some(0.14),
-                ..Default::default()
-            },
-            infra_providers::Candidate {
-                provider: "musicbrainz".into(),
-                title: "Колыбельная".into(),
-                artist: "Jah Khalib".into(),
-                album: Some("E.G.O.".into()),
-                duration_delta: Some(0.04),
-                ..Default::default()
-            },
-        ];
-        assert!(unique_exact_catalog_match(
-            &candidates[0],
-            &candidates,
-            &info
-        ));
-    }
-
-    #[test]
-    fn conflicting_existing_album_blocks_unique_text_match() {
-        let info = audio::AudioInfo {
-            title: Some("All of the Stars".into()),
-            artist: Some("Ed Sheeran".into()),
-            album: Some("The Fault In Our Stars (Music From The Motion Picture)".into()),
-            ..Default::default()
-        };
-        let candidates = vec![infra_providers::Candidate {
-            provider: "itunes".into(),
-            title: "All of the Stars".into(),
-            artist: "Ed Sheeran".into(),
-            album: Some("x (10th Anniversary Edition)".into()),
-            duration_delta: Some(2.0),
-            ..Default::default()
-        }];
-        assert!(!unique_exact_catalog_match(
-            &candidates[0],
-            &candidates,
-            &info
-        ));
     }
 
     #[test]

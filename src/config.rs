@@ -13,13 +13,19 @@ pub const USER_AGENT: &str = concat!(
     " ( https://github.com/artamrj/magpie-fi )"
 );
 
+/// Files read and fingerprinted at the same time during an inbox check.
+pub const SCAN_WORKERS: usize = 6;
+pub const FINGERPRINT_WORKERS: usize = 3;
+/// Parallel catalog lookups and cover downloads.
+pub const LOOKUP_WORKERS: usize = 3;
+/// Parallel tag writes when filing.
+pub const WRITE_WORKERS: usize = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TelegramConfig {
     pub token: String,
     /// Telegram user IDs that may use the bot and invite guests.
     pub owners: Vec<i64>,
-    /// Always `https://api.telegram.org`; tests point it at a fake server.
-    pub api_url: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,14 +74,9 @@ pub struct Config {
     pub youtube_api_key: String,
     pub discogs_token: String,
     pub lastfm_key: String,
-    pub theaudiodb_key: String,
-    pub musicbrainz_user_agent: String,
-    pub scan_workers: usize,
-    pub fingerprint_workers: usize,
-    pub lookup_workers: usize,
-    pub write_workers: usize,
 }
 
+#[cfg(test)]
 impl Default for Config {
     fn default() -> Self {
         Self::with_folders(Path::new(".local/music"), Path::new(".local/data"))
@@ -116,12 +117,6 @@ impl Config {
             youtube_api_key: String::new(),
             discogs_token: String::new(),
             lastfm_key: String::new(),
-            theaudiodb_key: String::new(),
-            musicbrainz_user_agent: USER_AGENT.into(),
-            scan_workers: 6,
-            fingerprint_workers: 3,
-            lookup_workers: 3,
-            write_workers: 2,
         }
     }
 
@@ -187,11 +182,7 @@ impl Config {
                          (send /id to the bot to see yours)"
                     );
                 }
-                Some(TelegramConfig {
-                    token,
-                    owners,
-                    api_url: "https://api.telegram.org".into(),
-                })
+                Some(TelegramConfig { token, owners })
             }
         };
         config.public_url =
@@ -225,11 +216,6 @@ impl Config {
         text(&mut config.youtube_api_key, "MAGPIE_YOUTUBE_API_KEY");
         text(&mut config.discogs_token, "MAGPIE_DISCOGS_TOKEN");
         text(&mut config.lastfm_key, "MAGPIE_LASTFM_KEY");
-        text(&mut config.theaudiodb_key, "MAGPIE_THEAUDIODB_KEY");
-        text(
-            &mut config.musicbrainz_user_agent,
-            "MAGPIE_MUSICBRAINZ_USER_AGENT",
-        );
         if config.public_url.is_some() && config.telegram.is_none() {
             bail!(
                 "MAGPIE_PUBLIC_URL needs Telegram: without MAGPIE_TELEGRAM_BOT_TOKEN the web page \
@@ -241,10 +227,6 @@ impl Config {
     }
 
     pub fn normalize(&mut self) {
-        self.scan_workers = self.scan_workers.clamp(1, 32);
-        self.fingerprint_workers = self.fingerprint_workers.clamp(1, 16);
-        self.lookup_workers = self.lookup_workers.clamp(1, 16);
-        self.write_workers = self.write_workers.clamp(1, 8);
         self.inbox_check_seconds = self.inbox_check_seconds.clamp(10, 24 * 60 * 60);
         self.inbox_settle_seconds = self.inbox_settle_seconds.min(60 * 60);
         self.trash_days = self.trash_days.clamp(1, 3650);
@@ -341,7 +323,6 @@ mod tests {
         .unwrap();
         let telegram = config.telegram.unwrap();
         assert_eq!(telegram.owners, vec![123, 456, 789]);
-        assert_eq!(telegram.api_url, "https://api.telegram.org");
         assert!(
             from(&[
                 ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
@@ -374,19 +355,11 @@ mod tests {
     #[test]
     fn unsafe_values_are_bounded() {
         let mut config = Config {
-            scan_workers: 0,
-            fingerprint_workers: usize::MAX,
-            lookup_workers: 0,
-            write_workers: usize::MAX,
             inbox_check_seconds: 0,
             trash_days: 0,
             ..Config::default()
         };
         config.normalize();
-        assert_eq!(config.scan_workers, 1);
-        assert_eq!(config.fingerprint_workers, 16);
-        assert_eq!(config.lookup_workers, 1);
-        assert_eq!(config.write_workers, 8);
         assert_eq!(config.inbox_check_seconds, 10);
         assert_eq!(config.trash_days, 1);
     }

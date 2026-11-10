@@ -20,7 +20,7 @@ pub async fn downloaded_file_done(
     library_path: &Path,
     already_owned: bool,
 ) {
-    let staging = state.config.read().await.staging_dir.clone();
+    let staging = state.config.staging_dir.clone();
     if !original.starts_with(&staging) {
         return;
     }
@@ -35,7 +35,7 @@ pub async fn downloaded_file_done(
 /// Rewrites the playlist files of these requests. Navidrome's file watcher
 /// picks up the change.
 pub async fn refresh_playlists(state: &Arc<AppState>, requests: &[i64]) {
-    let config = state.config.read().await.clone();
+    let config = &state.config;
     let library_root = Path::new(&config.output_dir);
     for request in requests {
         match store::playlist_for_request(&state.pool, *request).await {

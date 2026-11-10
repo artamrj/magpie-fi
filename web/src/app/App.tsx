@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { api } from "@/api/client";
-import { queryKeys, useSetupQuery, useStatusQuery, useTracksQuery } from "@/api/queries";
-import type { AutoApproveResult, RetryIssuesResult, Setup, Track } from "@/api/types";
+import { post } from "../api/client";
+import { queryKeys, useSetupQuery, useStatusQuery, useTracksQuery } from "../api/queries";
+import type { AutoApproveResult, RetryIssuesResult, Setup, Track } from "../api/types";
 import { Icon } from "./Icons";
-import { NavButton } from "./components/NavButton";
+import { ViewTabs } from "./components/ViewTabs";
 import { TrackRow } from "./components/TrackRow";
 import { TrackInspector, InspectorEmpty } from "./components/TrackInspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
@@ -20,10 +20,10 @@ import {
   folderName,
   friendlyError,
   hasRetryableArtwork,
-  isCompleted,
   isProblem,
   isReady,
   isReview,
+  matchesFilter,
   preferredTrack,
   queueOrderLabels,
   queueOrderSequence,
@@ -56,13 +56,9 @@ export function App() {
   const tracks = useMemo(() => tracksQuery.data ?? [], [tracksQuery.data]);
   const setup = setupQuery.data ?? emptySetup;
   const [selectedId, setSelectedId] = useState<number>();
-  // Links from the bot open straight on Review (?view=review) or Get music (?view=get).
-  const [filter, setFilter] = useState<QueueFilter>(() =>
-    startView() === "review" ? "review" : "all",
-  );
-  const [view, setView] = useState<"get" | "queue">(() =>
-    startView() === "get" ? "get" : "queue",
-  );
+  // Links from the bot open straight on Review (?view=review).
+  const [filter, setFilter] = useState<QueueFilter>(startView === "review" ? "review" : "all");
+  const [view, setView] = useState<"get" | "queue">("queue");
   const [queueOrder, setQueueOrder] = useState<QueueOrder>("queue");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -126,44 +122,45 @@ export function App() {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, []);
 
-  const checkInbox = async () => {
+  /** Runs a user action; a failure is shown in the error toast. */
+  const run = async (action: () => Promise<void>) => {
     setError("");
     try {
-      await api("/inbox/check", { method: "POST", body: "{}" });
-      setNotice("Checking the inbox now.");
-      await invalidateStatusAndTracks();
+      await action();
     } catch (reason) {
       setError((reason as Error).message);
     }
   };
 
-  const choose = async (trackId: number, candidateId: number) => {
-    setError("");
-    try {
-      const result = await api<{ ready: boolean; cover_verified?: boolean }>(
-        `/tracks/${trackId}/choose`,
-        {
-          method: "POST",
-          body: JSON.stringify({ candidate_id: candidateId }),
-        },
+  const checkInbox = () =>
+    run(async () => {
+      const result = await post<{ already_running: boolean }>("/inbox/check");
+      setNotice(
+        result.already_running
+          ? "magpie is already working on the inbox."
+          : "Checking the inbox now.",
       );
+      await invalidateStatusAndTracks();
+    });
+
+  const choose = (trackId: number, candidateId: number) =>
+    run(async () => {
+      const result = await post<{ ready: boolean }>(`/tracks/${trackId}/choose`, {
+        candidate_id: candidateId,
+      });
       await queryClient.invalidateQueries({ queryKey: queryKeys.tracks });
       setNotice(
         !result.ready
           ? "Match accepted, but this track still needs a verified cover before it can be cleaned."
           : "Match accepted. This track is ready to clean.",
       );
-    } catch (reason) {
-      setError((reason as Error).message);
-    }
-  };
+    });
 
   const counts = useMemo(
     () => ({
       review: tracks.filter(isReview).length,
       ready: tracks.filter(isReady).length,
       problems: tracks.filter(isProblem).length,
-      completed: tracks.filter(isCompleted).length,
     }),
     [tracks],
   );
@@ -183,13 +180,9 @@ export function App() {
 
   const autoApprove = async () => {
     setAutoApproving(true);
-    setError("");
     setNotice("");
-    try {
-      const result = await api<AutoApproveResult>("/tracks/auto-approve", {
-        method: "POST",
-        body: "{}",
-      });
+    await run(async () => {
+      const result = await post<AutoApproveResult>("/tracks/auto-approve");
       await queryClient.invalidateQueries({ queryKey: queryKeys.tracks });
       setNotice(
         [
@@ -200,11 +193,8 @@ export function App() {
           .filter(Boolean)
           .join(" "),
       );
-    } catch (reason) {
-      setError((reason as Error).message);
-    } finally {
-      setAutoApproving(false);
-    }
+    });
+    setAutoApproving(false);
   };
 
   const retryIssues = async () => {
@@ -217,13 +207,9 @@ export function App() {
     )
       return;
     setRetryingIssues(true);
-    setError("");
     setNotice("");
-    try {
-      const result = await api<RetryIssuesResult>("/tracks/retry-issues", {
-        method: "POST",
-        body: "{}",
-      });
+    await run(async () => {
+      const result = await post<RetryIssuesResult>("/tracks/retry-issues");
       await invalidateStatusAndTracks();
       if (result.started) {
         setNotice(
@@ -241,51 +227,32 @@ export function App() {
             : "No issues need to be checked.",
         );
       }
-    } catch (reason) {
-      setError((reason as Error).message);
-    } finally {
-      setRetryingIssues(false);
-    }
+    });
+    setRetryingIssues(false);
   };
 
-  const write = async () => {
-    setError("");
-    try {
-      const result = await api<{ count: number; outputs: number; duplicates_skipped: number }>(
-        "/write",
-        { method: "POST", body: "{}" },
-      );
+  const write = () =>
+    run(async () => {
+      const result = await post<{ outputs: number; duplicates_skipped: number }>("/write");
       setNotice(
         result.duplicates_skipped
           ? `Filing ${result.outputs} ${result.outputs === 1 ? "song" : "songs"}; ${result.duplicates_skipped} duplicate ${result.duplicates_skipped === 1 ? "copy goes" : "copies go"} to trash.`
           : `Filing ${result.outputs} ${result.outputs === 1 ? "song" : "songs"}.`,
       );
       await invalidateStatusAndTracks();
-    } catch (reason) {
-      setError((reason as Error).message);
-    }
-  };
+    });
 
-  const stop = async () => {
-    setError("");
-    try {
-      await api("/stop", { method: "POST", body: "{}" });
+  const stop = () =>
+    run(async () => {
+      await post("/stop");
       setNotice("Stopping safely after the current operation.");
       await invalidateStatusAndTracks();
-    } catch (reason) {
-      setError((reason as Error).message);
-    }
-  };
+    });
 
   const visibleTracks = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     const filteredTracks = tracks.filter((track) => {
-      const inFilter =
-        filter === "all" ||
-        (filter === "review" && isReview(track)) ||
-        (filter === "problems" && isProblem(track)) ||
-        (filter === "ready" && isReady(track));
-      if (!inFilter) return false;
+      if (!matchesFilter(track, filter)) return false;
       if (!normalized) return true;
       const candidate = selectedCandidate(track) ?? track.candidates[0];
       return [
@@ -322,16 +289,21 @@ export function App() {
     setView("queue");
     setFilter(next);
     const nextTrack =
-      next === "all"
-        ? preferredTrack(tracks)
-        : tracks.find(
-            (track) =>
-              (next === "review" && isReview(track)) ||
-              (next === "problems" && isProblem(track)) ||
-              (next === "ready" && isReady(track)),
-          );
+      next === "all" ? preferredTrack(tracks) : tracks.find((track) => matchesFilter(track, next));
     setSelectedId(nextTrack?.id);
   };
+
+  const tabs = {
+    view,
+    filter,
+    counts,
+    total: tracks.length,
+    onGet: () => setView("get"),
+    onFilter: changeFilter,
+  };
+  // Review offers to retry covers that failed to download; Issues offers to check and fix.
+  const retryCount =
+    filter === "review" ? retryableArtwork : filter === "problems" ? counts.problems : 0;
 
   const selectTrack = useCallback((track: Track) => {
     setSelectedId(track.id);
@@ -366,41 +338,7 @@ export function App() {
               </span>
             </button>
           </div>
-          <nav className="workspace-nav" aria-label="Workspace views">
-            <NavButton
-              className="get-music-tab"
-              active={view === "get"}
-              onClick={() => setView("get")}
-              label="Get music"
-            />
-            <NavButton
-              className="all-tracks-tab"
-              active={view === "queue" && filter === "all"}
-              onClick={() => changeFilter("all")}
-              label="All tracks"
-              count={tracks.length}
-            />
-            <div className="status-tabs" role="group" aria-label="Filter tracks by status">
-              <NavButton
-                active={view === "queue" && filter === "review"}
-                onClick={() => changeFilter("review")}
-                label="Review"
-                count={counts.review}
-              />
-              <NavButton
-                active={view === "queue" && filter === "problems"}
-                onClick={() => changeFilter("problems")}
-                label="Issues"
-                count={counts.problems}
-              />
-              <NavButton
-                active={view === "queue" && filter === "ready"}
-                onClick={() => changeFilter("ready")}
-                label="Ready"
-                count={counts.ready}
-              />
-            </div>
-          </nav>
+          <ViewTabs className="workspace-nav" {...tabs} />
           <div className="topbar-controls">
             <button
               className={`topbar-scan-action ${tracks.length ? "" : "prominent"}`.trim()}
@@ -445,41 +383,7 @@ export function App() {
         </div>
       </header>
 
-      <nav className="mobile-nav" aria-label="Workspace views">
-        <NavButton
-          className="get-music-tab"
-          active={view === "get"}
-          onClick={() => setView("get")}
-          label="Get music"
-        />
-        <NavButton
-          className="all-tracks-tab"
-          active={view === "queue" && filter === "all"}
-          onClick={() => changeFilter("all")}
-          label="All tracks"
-          count={tracks.length}
-        />
-        <div className="status-tabs" role="group" aria-label="Filter tracks by status">
-          <NavButton
-            active={view === "queue" && filter === "review"}
-            onClick={() => changeFilter("review")}
-            label="Review"
-            count={counts.review}
-          />
-          <NavButton
-            active={view === "queue" && filter === "problems"}
-            onClick={() => changeFilter("problems")}
-            label="Issues"
-            count={counts.problems}
-          />
-          <NavButton
-            active={view === "queue" && filter === "ready"}
-            onClick={() => changeFilter("ready")}
-            label="Ready"
-            count={counts.ready}
-          />
-        </div>
-      </nav>
+      <ViewTabs className="mobile-nav" {...tabs} />
 
       <div className="announcement-region" aria-live="polite" aria-atomic="true">
         {error && (
@@ -546,9 +450,9 @@ export function App() {
                   {autoApproving ? "Checking…" : `Auto-select ${autoApprovable}`}
                 </button>
               )}
-              {retryableArtwork > 0 && filter === "review" && (
+              {retryCount > 0 && (
                 <button
-                  className="compact-button accent issue-retry-button"
+                  className="compact-button accent"
                   disabled={busy || retryingIssues}
                   onClick={() => void retryIssues()}
                 >
@@ -558,22 +462,12 @@ export function App() {
                     <Icon name="refresh" size={15} />
                   )}
                   {retryingIssues || busy
-                    ? "Retrying…"
-                    : `Retry ${retryableArtwork} ${retryableArtwork === 1 ? "cover" : "covers"}`}
-                </button>
-              )}
-              {counts.problems > 0 && filter === "problems" && (
-                <button
-                  className="compact-button accent issue-retry-button"
-                  disabled={busy || retryingIssues}
-                  onClick={() => void retryIssues()}
-                >
-                  {retryingIssues || busy ? (
-                    <span className="spinner" />
-                  ) : (
-                    <Icon name="refresh" size={15} />
-                  )}
-                  {retryingIssues || busy ? "Checking…" : `Check & fix ${counts.problems}`}
+                    ? filter === "review"
+                      ? "Retrying…"
+                      : "Checking…"
+                    : filter === "review"
+                      ? `Retry ${retryCount} ${retryCount === 1 ? "cover" : "covers"}`
+                      : `Check & fix ${retryCount}`}
                 </button>
               )}
             </header>

@@ -1,11 +1,8 @@
+use crate::infrastructure::file_stamp::FileStamp;
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use std::{
-    future::Future,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, path::Path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FingerprintSource {
@@ -20,12 +17,6 @@ pub struct FingerprintResult {
     pub source: FingerprintSource,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FileIdentity {
-    size: i64,
-    mtime: i64,
-}
-
 pub async fn get_or_calculate<F, Fut>(
     pool: &SqlitePool,
     path: &Path,
@@ -35,11 +26,9 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(String, f64)>>,
 {
-    let identity = file_identity(path).await?;
+    let stamp = FileStamp::of(path).await?;
     let path_text = path.to_string_lossy();
-    if let Some((fingerprint, duration)) =
-        get(pool, path_text.as_ref(), identity.size, identity.mtime).await?
-    {
+    if let Some((fingerprint, duration)) = get(pool, path_text.as_ref(), stamp).await? {
         return Ok(FingerprintResult {
             fingerprint,
             duration,
@@ -48,15 +37,7 @@ where
     }
 
     let (fingerprint, duration) = calculate().await?;
-    put(
-        pool,
-        path_text.as_ref(),
-        identity.size,
-        identity.mtime,
-        &fingerprint,
-        duration,
-    )
-    .await?;
+    put(pool, path_text.as_ref(), stamp, &fingerprint, duration).await?;
     Ok(FingerprintResult {
         fingerprint,
         duration,
@@ -65,43 +46,32 @@ where
 }
 
 pub async fn cached(pool: &SqlitePool, path: &Path) -> Result<Option<FingerprintResult>> {
-    let identity = file_identity(path).await?;
-    Ok(get(
-        pool,
-        path.to_string_lossy().as_ref(),
-        identity.size,
-        identity.mtime,
-    )
-    .await?
-    .map(|(fingerprint, duration)| FingerprintResult {
-        fingerprint,
-        duration,
-        source: FingerprintSource::Cache,
-    }))
+    let stamp = FileStamp::of(path).await?;
+    Ok(get(pool, path.to_string_lossy().as_ref(), stamp)
+        .await?
+        .map(|(fingerprint, duration)| FingerprintResult {
+            fingerprint,
+            duration,
+            source: FingerprintSource::Cache,
+        }))
 }
 
-async fn get(
-    pool: &SqlitePool,
-    path: &str,
-    file_size: i64,
-    file_mtime: i64,
-) -> Result<Option<(String, f64)>> {
-    let row: Option<(String, f64)> = sqlx::query_as(
+/// `file_mtime` holds nanoseconds, like the other file caches.
+async fn get(pool: &SqlitePool, path: &str, stamp: FileStamp) -> Result<Option<(String, f64)>> {
+    Ok(sqlx::query_as(
         "SELECT fingerprint,duration FROM fingerprint_cache WHERE path=? AND file_size=? AND file_mtime=?",
     )
     .bind(path)
-    .bind(file_size)
-    .bind(file_mtime)
+    .bind(stamp.size)
+    .bind(stamp.mtime_ns)
     .fetch_optional(pool)
-    .await?;
-    Ok(row)
+    .await?)
 }
 
 async fn put(
     pool: &SqlitePool,
     path: &str,
-    file_size: i64,
-    file_mtime: i64,
+    stamp: FileStamp,
     fingerprint: &str,
     duration: f64,
 ) -> Result<()> {
@@ -110,29 +80,14 @@ async fn put(
          ON CONFLICT(path) DO UPDATE SET file_size=excluded.file_size,file_mtime=excluded.file_mtime,fingerprint=excluded.fingerprint,duration=excluded.duration,updated_at=excluded.updated_at",
     )
     .bind(path)
-    .bind(file_size)
-    .bind(file_mtime)
+    .bind(stamp.size)
+    .bind(stamp.mtime_ns)
     .bind(fingerprint)
     .bind(duration)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
     Ok(())
-}
-
-async fn file_identity(path: &Path) -> Result<FileIdentity> {
-    let metadata = tokio::fs::metadata(path).await?;
-    Ok(FileIdentity {
-        size: metadata.len() as i64,
-        mtime: system_time_seconds(metadata.modified()?),
-    })
-}
-
-fn system_time_seconds(value: SystemTime) -> i64 {
-    value
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -196,7 +151,6 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         tokio::fs::write(&path, b"changed audio").await.unwrap();
         let result = get_or_calculate(&pool, &path, || async { Ok(("fp2".into(), 14.0)) })
             .await

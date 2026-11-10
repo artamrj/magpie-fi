@@ -13,13 +13,13 @@ struct Canonical {
     authority: i64,
 }
 
+/// Gives every artist and title the most trusted spelling seen so far, across
+/// these candidates and earlier scans. Expects credits already normalized
+/// (see [`normalize_credits`]).
 pub async fn canonicalize_candidates(
     pool: &SqlitePool,
     candidates: &mut [Candidate],
 ) -> Result<()> {
-    for candidate in candidates.iter_mut() {
-        normalize_candidate_credits(candidate);
-    }
     let mut winners = HashMap::<(String, String), Canonical>::new();
     for candidate in candidates.iter() {
         let authority = provider_authority(&candidate.provider);
@@ -46,33 +46,27 @@ pub async fn canonicalize_candidates(
             });
     }
 
+    // A stored spelling with at least the same authority wins; the row that
+    // results from the upsert is the canonical one.
+    let now = Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
     for ((kind, key), winner) in &mut winners {
-        if let Some((value, authority)) = sqlx::query_as::<_, (String, i64)>(
-            "SELECT canonical_value,authority FROM canonical_names WHERE kind=? AND identity_key=?",
-        )
-        .bind(kind)
-        .bind(key)
-        .fetch_optional(pool)
-        .await?
-            && authority >= winner.authority
-        {
-            winner.value = value;
-            winner.authority = authority;
-        }
-        sqlx::query(
+        (winner.value, winner.authority) = sqlx::query_as(
             "INSERT INTO canonical_names(kind,identity_key,canonical_value,authority,updated_at)
              VALUES(?,?,?,?,?) ON CONFLICT(kind,identity_key) DO UPDATE SET
              canonical_value=CASE WHEN excluded.authority>authority THEN excluded.canonical_value ELSE canonical_value END,
-             authority=MAX(authority,excluded.authority),updated_at=excluded.updated_at",
+             authority=MAX(authority,excluded.authority),updated_at=excluded.updated_at
+             RETURNING canonical_value,authority",
         )
         .bind(kind)
         .bind(key)
         .bind(&winner.value)
         .bind(winner.authority)
-        .bind(Utc::now().to_rfc3339())
-        .execute(pool)
+        .bind(&now)
+        .fetch_one(&mut *transaction)
         .await?;
     }
+    transaction.commit().await?;
 
     for candidate in candidates {
         apply_credits(&mut candidate.artist_credits, &winners);
@@ -90,9 +84,12 @@ pub async fn canonicalize_candidates(
     Ok(())
 }
 
-fn normalize_candidate_credits(candidate: &mut Candidate) {
+/// Splits featured artists out of titles and artist strings into structured
+/// credits, preferring a Latin alias for names that have one.
+pub fn normalize_credits(candidate: &mut Candidate) {
+    let artist = crate::domain::credits::prefer_latin_alias(&candidate.artist);
     let credits = crate::domain::credits::normalize_structured(
-        &candidate.artist,
+        &artist,
         &candidate.title,
         std::mem::take(&mut candidate.artist_credits),
     );
@@ -100,8 +97,9 @@ fn normalize_candidate_credits(candidate: &mut Candidate) {
     candidate.title = credits.title;
     candidate.artist_credits = credits.artists;
     if let Some(album_artist) = candidate.album_artist.as_deref() {
+        let album_artist = crate::domain::credits::prefer_latin_alias(album_artist);
         let credits = crate::domain::credits::normalize_structured(
-            album_artist,
+            &album_artist,
             "",
             std::mem::take(&mut candidate.album_artist_credits),
         );

@@ -3,7 +3,7 @@ use super::*;
 pub(crate) async fn identify(
     state: &Arc<AppState>,
     cfg: &crate::config::Config,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     path: &Path,
     fingerprint: FingerprintEvidence<'_>,
     current: &audio::AudioInfo,
@@ -22,7 +22,7 @@ pub(crate) async fn identify(
     {
         Ok(candidates) => candidates,
         Err(error) => {
-            handle_provider_error(state, limits, filename, "acoustid", error).await;
+            handle_provider_error(limits, filename, "acoustid", error).await;
             Vec::new()
         }
     };
@@ -31,9 +31,9 @@ pub(crate) async fn identify(
         out.extend(query_youtube(state, limits, &cfg.youtube_api_key, current, filename).await);
     }
     out.extend(query_musicbrainz_text(state, limits, current, filename).await);
-    match query_itunes(state, cfg, current, filename).await {
+    match query_itunes(state, current, filename).await {
         Ok(candidates) => out.extend(candidates),
-        Err(error) => handle_provider_error(state, limits, filename, "itunes", error).await,
+        Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
     }
     out.extend(query_deezer(state, limits, current, filename).await);
     out.extend(query_radiojavan(state, limits, current, filename).await);
@@ -50,7 +50,7 @@ pub(crate) async fn identify(
             query_songrec(state, limits, path, fingerprint.value, filename).await;
         if let Some(recognized) = songrec_candidates.first() {
             let info = audio_info_from_recognition(recognized, current);
-            out.extend(query_recognized_catalogs(state, cfg, limits, &info, filename).await);
+            out.extend(query_recognized_catalogs(state, limits, &info, filename).await);
             recognized_info = Some(info);
             songrec_matched = true;
         }
@@ -74,7 +74,7 @@ pub(crate) async fn identify(
         .await;
         if let Some(recognized) = audd_candidates.first() {
             let info = audio_info_from_recognition(recognized, current);
-            out.extend(query_recognized_catalogs(state, cfg, limits, &info, filename).await);
+            out.extend(query_recognized_catalogs(state, limits, &info, filename).await);
             recognized_info = Some(info);
         }
         out.extend(audd_candidates);
@@ -94,14 +94,9 @@ pub(crate) async fn identify(
     }
     out.extend(query_discogs(state, limits, catalog_info, filename).await);
     out.extend(query_lastfm(state, limits, catalog_info, filename).await);
-    out.extend(query_theaudiodb(state, limits, catalog_info, filename).await);
-    out.extend(query_wikidata(state, limits, catalog_info, filename).await);
-    for candidate in &mut out {
-        normalize_candidate_credits(candidate);
-    }
     crate::application::canonical_names::canonicalize_candidates(&state.pool, &mut out).await?;
     apply_source_agreement(&mut out)?;
-    enrich_artwork_fallbacks(&mut out)?;
+    enrich_artwork_fallbacks(&mut out);
     apply_artwork_override(&state.pool, path, &mut out).await?;
     let artist_genres = if crate::domain::genre::needs_artist_lookup(&out, catalog_info) {
         if let Some(artist) = catalog_info.artist.as_deref() {
@@ -109,17 +104,10 @@ pub(crate) async fn identify(
             {
                 Ok(genres) => genres,
                 Err(error) => {
-                    state
-                        .log_entry(
-                            ActivityLogEntry::new(
-                                "warn",
-                                "genre",
-                                "Artist genre enrichment failed; using track evidence",
-                            )
-                            .file(filename.to_owned())
-                            .error(error.as_ref()),
-                        )
-                        .await;
+                    tracing::warn!(
+                        file = filename,
+                        "artist genre enrichment failed; using track evidence: {error:#}"
+                    );
                     Vec::new()
                 }
             }
@@ -131,14 +119,10 @@ pub(crate) async fn identify(
     };
     crate::domain::genre::enrich(&mut out, catalog_info, &artist_genres)?;
     if out.is_empty() {
-        state
-            .log(
-                "warn",
-                "providers",
-                Some(filename),
-                "No enabled metadata source returned candidates",
-            )
-            .await;
+        tracing::warn!(
+            file = filename,
+            "no enabled metadata source returned candidates"
+        );
     }
     Ok(out)
 }
@@ -152,7 +136,7 @@ pub(crate) fn sort_candidates_for_decision(candidates: &mut [infra_providers::Ca
 }
 
 pub(crate) fn candidate_trust_tier(candidate: &infra_providers::Candidate) -> u8 {
-    if candidate_has_fingerprint(candidate) {
+    if has_audio_recognition(candidate) {
         3
     } else if matches!(
         candidate.provider.as_str(),
@@ -166,7 +150,7 @@ pub(crate) fn candidate_trust_tier(candidate: &infra_providers::Candidate) -> u8
             | "genius"
     ) {
         2
-    } else if candidate_source_count(candidate) >= 2 {
+    } else if source_count(candidate) >= 2 {
         1
     } else {
         0
@@ -190,16 +174,15 @@ pub(crate) fn audio_info_from_recognition(
 
 pub(crate) async fn query_recognized_catalogs(
     state: &Arc<AppState>,
-    cfg: &crate::config::Config,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     recognized: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
     let mut out = Vec::new();
     out.extend(query_musicbrainz_text(state, limits, recognized, filename).await);
-    match query_itunes(state, cfg, recognized, filename).await {
+    match query_itunes(state, recognized, filename).await {
         Ok(candidates) => out.extend(candidates),
-        Err(error) => handle_provider_error(state, limits, filename, "itunes", error).await,
+        Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
     }
     out.extend(query_deezer(state, limits, recognized, filename).await);
     out.extend(query_radiojavan(state, limits, recognized, filename).await);
@@ -230,7 +213,7 @@ struct CatalogSpec {
 
 async fn query_catalog<F, P>(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
     spec: CatalogSpec,
@@ -243,12 +226,8 @@ where
     if provider_disabled(limits, spec.provider).await {
         return Vec::new();
     }
-    let key_reason = {
-        let cfg = state.config.read().await;
-        (spec.key_check)(&cfg)
-    };
-    if let Some(reason) = key_reason {
-        log_provider_skip(state, filename, spec.provider, reason).await;
+    if let Some(reason) = (spec.key_check)(&state.config) {
+        log_provider_skip(filename, spec.provider, reason);
         return Vec::new();
     }
     if spec.requires_title
@@ -265,11 +244,11 @@ where
             for candidate in &mut candidates {
                 let _ = score_text_candidate(candidate, current, spec.source);
             }
-            log_provider_count(state, filename, spec.provider, candidates.len(), started).await;
+            log_provider_count(filename, spec.provider, candidates.len(), started);
             candidates
         }
         Err(error) => {
-            handle_provider_error(state, limits, filename, spec.provider, error).await;
+            handle_provider_error(limits, filename, spec.provider, error).await;
             Vec::new()
         }
     }
@@ -277,7 +256,7 @@ where
 
 pub(crate) async fn query_soundcloud(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -293,7 +272,7 @@ pub(crate) async fn query_soundcloud(
             key_check: |_| None,
         },
         |state, current| async move {
-            let cfg = state.config.read().await;
+            let cfg = &state.config;
             let title = current.title.as_deref().unwrap_or_default();
             infra_providers::soundcloud::search(
                 &state.client,
@@ -311,7 +290,7 @@ pub(crate) async fn query_soundcloud(
 
 pub(crate) async fn query_songrec(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     path: &Path,
     fingerprint: &str,
     filename: &str,
@@ -327,13 +306,13 @@ pub(crate) async fn query_songrec(
     match result {
         Ok(mut candidates) => {
             for candidate in &mut candidates {
-                normalize_candidate_credits(candidate);
+                normalize_credits(candidate);
             }
-            log_provider_count(state, filename, "songrec", candidates.len(), started).await;
+            log_provider_count(filename, "songrec", candidates.len(), started);
             candidates
         }
         Err(error) => {
-            handle_provider_error(state, limits, filename, "songrec", error).await;
+            handle_provider_error(limits, filename, "songrec", error).await;
             Vec::new()
         }
     }
@@ -341,7 +320,7 @@ pub(crate) async fn query_songrec(
 
 pub(crate) async fn query_audd(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     token: &str,
     path: &Path,
     fingerprint: &str,
@@ -364,7 +343,7 @@ pub(crate) async fn query_audd(
     {
         Ok(mut candidates) => {
             for candidate in &mut candidates {
-                normalize_candidate_credits(candidate);
+                normalize_credits(candidate);
                 candidate.duration_delta = candidate
                     .duration_delta
                     .map(|candidate_duration| (current.duration - candidate_duration).abs());
@@ -375,11 +354,11 @@ pub(crate) async fn query_audd(
                     candidate.score_breakdown = Some(value.to_string());
                 }
             }
-            log_provider_count(state, filename, "audd", candidates.len(), started).await;
+            log_provider_count(filename, "audd", candidates.len(), started);
             candidates
         }
         Err(error) => {
-            handle_provider_error(state, limits, filename, "audd", error).await;
+            handle_provider_error(limits, filename, "audd", error).await;
             Vec::new()
         }
     }
@@ -387,7 +366,7 @@ pub(crate) async fn query_audd(
 
 pub(crate) async fn query_youtube(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     api_key: &str,
     current: &audio::AudioInfo,
     filename: &str,
@@ -408,11 +387,11 @@ pub(crate) async fn query_youtube(
             for candidate in &mut candidates {
                 let _ = score_text_candidate(candidate, current, "youtube_exact_video_id");
             }
-            log_provider_count(state, filename, "youtube", candidates.len(), started).await;
+            log_provider_count(filename, "youtube", candidates.len(), started);
             candidates
         }
         Err(error) => {
-            handle_provider_error(state, limits, filename, "youtube", error).await;
+            handle_provider_error(limits, filename, "youtube", error).await;
             Vec::new()
         }
     }
@@ -420,7 +399,7 @@ pub(crate) async fn query_youtube(
 
 pub(crate) async fn query_spotify(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     cfg: &crate::config::Config,
     current: &audio::AudioInfo,
     filename: &str,
@@ -467,11 +446,11 @@ pub(crate) async fn query_spotify(
                     }
                 }
             }
-            log_provider_count(state, filename, "spotify", candidates.len(), started).await;
+            log_provider_count(filename, "spotify", candidates.len(), started);
             candidates
         }
         Err(error) => {
-            handle_provider_error(state, limits, filename, "spotify", error).await;
+            handle_provider_error(limits, filename, "spotify", error).await;
             Vec::new()
         }
     }
@@ -479,7 +458,6 @@ pub(crate) async fn query_spotify(
 
 pub(crate) async fn query_itunes(
     state: &Arc<AppState>,
-    cfg: &crate::config::Config,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Result<Vec<infra_providers::Candidate>> {
@@ -508,14 +486,10 @@ pub(crate) async fn query_itunes(
         .is_some_and(|artist| !artist.is_ascii())
         && candidates.iter().all(|candidate| candidate.score < 70.0);
     if needs_alias_search && let Some(artist) = current.artist.as_deref() {
-        let aliases = infra_providers::musicbrainz::artist_aliases(
-            &state.pool,
-            &state.client,
-            &cfg.musicbrainz_user_agent,
-            artist,
-        )
-        .await
-        .unwrap_or_default();
+        let aliases =
+            infra_providers::musicbrainz::artist_aliases(&state.pool, &state.client, artist)
+                .await
+                .unwrap_or_default();
         for alias in aliases {
             let mut alias_info = current.clone();
             alias_info.artist = Some(alias.clone());
@@ -531,13 +505,13 @@ pub(crate) async fn query_itunes(
             candidates.extend(alias_candidates);
         }
     }
-    log_provider_count(state, filename, "itunes", candidates.len(), started).await;
+    log_provider_count(filename, "itunes", candidates.len(), started);
     Ok(candidates)
 }
 
 pub(crate) async fn query_deezer(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -568,7 +542,7 @@ pub(crate) async fn query_deezer(
 
 pub(crate) async fn query_radiojavan(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -599,7 +573,7 @@ pub(crate) async fn query_radiojavan(
 
 pub(crate) async fn query_audiomack(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -630,7 +604,7 @@ pub(crate) async fn query_audiomack(
 
 pub(crate) async fn query_navahang(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -661,7 +635,7 @@ pub(crate) async fn query_navahang(
 
 pub(crate) async fn query_genius(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -707,7 +681,7 @@ pub(crate) fn needs_genius_enrichment(candidates: &[infra_providers::Candidate])
 pub(crate) async fn query_musicbrainz_acoustid(
     state: &Arc<AppState>,
     cfg: &crate::config::Config,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     fingerprint: &str,
     duration: f64,
     current: &audio::AudioInfo,
@@ -715,7 +689,7 @@ pub(crate) async fn query_musicbrainz_acoustid(
 ) -> Result<Vec<infra_providers::Candidate>> {
     let mut out = Vec::new();
     if cfg.acoustid_key.is_empty() || fingerprint.is_empty() {
-        log_provider_skip(state, filename, "acoustid", "AcoustID API key is missing").await;
+        log_provider_skip(filename, "acoustid", "AcoustID API key is missing");
         return Ok(out);
     }
     let started = Instant::now();
@@ -730,34 +704,11 @@ pub(crate) async fn query_musicbrainz_acoustid(
         )
         .await?
     };
-    state
-        .log_entry(
-            ActivityLogEntry::new(
-                "info",
-                "acoustid",
-                format!("AcoustID returned {} hit(s)", hits.len()),
-            )
-            .file(filename.to_owned())
-            .duration_ms(started.elapsed().as_millis() as i64),
-        )
-        .await;
+    log_provider_count(filename, "acoustid", hits.len(), started);
     for hit in hits.into_iter().take(3) {
-        let started = Instant::now();
-        let mut candidate = infra_providers::musicbrainz::recording(
-            &state.pool,
-            &state.client,
-            &cfg.musicbrainz_user_agent,
-            &hit.recording_id,
-        )
-        .await?;
-        state
-            .log_entry(
-                ActivityLogEntry::new("info", "musicbrainz", "Fetched recording details")
-                    .file(filename.to_owned())
-                    .duration_ms(started.elapsed().as_millis() as i64)
-                    .context(serde_json::json!({"recording_id": hit.recording_id})),
-            )
-            .await;
+        let mut candidate =
+            infra_providers::musicbrainz::recording(&state.pool, &state.client, &hit.recording_id)
+                .await?;
         let candidate_duration = candidate.duration_delta;
         let outcome = crate::domain::matcher::score_candidate(
             current,
@@ -776,6 +727,7 @@ pub(crate) async fn query_musicbrainz_acoustid(
         candidate.score = outcome.score;
         candidate.duration_delta = outcome.duration_delta;
         candidate.score_breakdown = Some(outcome.breakdown_json);
+        normalize_credits(&mut candidate);
         out.push(candidate);
     }
     Ok(out)
@@ -783,7 +735,7 @@ pub(crate) async fn query_musicbrainz_acoustid(
 
 pub(crate) async fn query_musicbrainz_text(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -799,12 +751,10 @@ pub(crate) async fn query_musicbrainz_text(
             key_check: |_| None,
         },
         |state, current| async move {
-            let cfg = state.config.read().await;
             let title = current.title.as_deref().unwrap_or_default();
             infra_providers::musicbrainz::search(
                 &state.pool,
                 &state.client,
-                &cfg.musicbrainz_user_agent,
                 title,
                 current.artist.as_deref(),
             )
@@ -816,7 +766,7 @@ pub(crate) async fn query_musicbrainz_text(
 
 pub(crate) async fn query_discogs(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -837,10 +787,7 @@ pub(crate) async fn query_discogs(
             },
         },
         |state, current| async move {
-            let token = {
-                let cfg = state.config.read().await;
-                cfg.discogs_token.trim().to_owned()
-            };
+            let token = state.config.discogs_token.trim().to_owned();
             infra_providers::discogs::search(&state.pool, &state.client, Some(&token), &current)
                 .await
         },
@@ -850,7 +797,7 @@ pub(crate) async fn query_discogs(
 
 pub(crate) async fn query_lastfm(
     state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     current: &audio::AudioInfo,
     filename: &str,
 ) -> Vec<infra_providers::Candidate> {
@@ -871,72 +818,39 @@ pub(crate) async fn query_lastfm(
             },
         },
         |state, current| async move {
-            let api_key = {
-                let cfg = state.config.read().await;
-                cfg.lastfm_key.trim().to_owned()
-            };
+            let api_key = state.config.lastfm_key.trim().to_owned();
             infra_providers::lastfm::search(&state.pool, &state.client, &api_key, &current).await
         },
     )
     .await
 }
 
-pub(crate) async fn query_theaudiodb(
-    state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+/// Scores a text-search candidate against the file's current tags.
+pub(crate) fn score_text_candidate(
+    candidate: &mut infra_providers::Candidate,
     current: &audio::AudioInfo,
-    filename: &str,
-) -> Vec<infra_providers::Candidate> {
-    query_catalog(
-        state,
-        limits,
+    source: &str,
+) -> Result<()> {
+    normalize_credits(candidate);
+    preserve_album_context_for_catalog_single(candidate, current);
+    let outcome = crate::domain::matcher::score_candidate(
         current,
-        filename,
-        CatalogSpec {
-            provider: "theaudiodb",
-            source: "theaudiodb_track_search",
-            requires_title: false,
-            key_check: |cfg| {
-                cfg.theaudiodb_key
-                    .trim()
-                    .is_empty()
-                    .then_some("TheAudioDB API key is missing")
-            },
+        crate::domain::matcher::CandidateInput {
+            title: &candidate.title,
+            artist: &candidate.artist,
+            album: candidate.album.as_deref(),
+            candidate_duration: candidate.duration_delta,
         },
-        |state, current| async move {
-            let api_key = {
-                let cfg = state.config.read().await;
-                cfg.theaudiodb_key.trim().to_owned()
-            };
-            infra_providers::theaudiodb::search(&state.pool, &state.client, &api_key, &current)
-                .await
+        crate::domain::matcher::ScoreMode::Text {
+            source,
+            provider_label: provider_name(&candidate.provider),
         },
-    )
-    .await
-}
-
-pub(crate) async fn query_wikidata(
-    state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
-    current: &audio::AudioInfo,
-    filename: &str,
-) -> Vec<infra_providers::Candidate> {
-    query_catalog(
-        state,
-        limits,
-        current,
-        filename,
-        CatalogSpec {
-            provider: "wikidata",
-            source: "wikidata_sparql",
-            requires_title: false,
-            key_check: |_| None,
-        },
-        |state, current| async move {
-            infra_providers::wikidata::search(&state.pool, &state.client, &current).await
-        },
-    )
-    .await
+        &candidate.provider,
+    )?;
+    candidate.duration_delta = outcome.duration_delta;
+    candidate.score = outcome.score;
+    candidate.score_breakdown = Some(outcome.breakdown_json);
+    Ok(())
 }
 
 pub(crate) fn preserve_album_context_for_catalog_single(
@@ -985,9 +899,9 @@ pub(crate) fn apply_source_agreement(candidates: &mut [infra_providers::Candidat
                 continue;
             }
             if candidate_agrees(candidate, other) {
-                sources.push(provider_display_name(&other.provider).to_owned());
+                sources.push(provider_name(&other.provider).to_owned());
                 if agreeing_providers.insert(other.provider.as_str()) {
-                    let cap = if candidate_has_fingerprint(candidate) {
+                    let cap = if has_audio_recognition(candidate) {
                         99.0
                     } else {
                         98.0
@@ -1006,96 +920,42 @@ pub(crate) fn apply_source_agreement(candidates: &mut [infra_providers::Candidat
     Ok(())
 }
 
-pub(crate) fn normalize_candidate_credits(candidate: &mut infra_providers::Candidate) {
-    let artist = crate::domain::credits::prefer_latin_alias(&candidate.artist);
-    let credits = crate::domain::credits::normalize_structured(
-        &artist,
-        &candidate.title,
-        std::mem::take(&mut candidate.artist_credits),
-    );
-    candidate.artist = credits.artist;
-    candidate.title = credits.title;
-    candidate.artist_credits = credits.artists;
-
-    if let Some(album_artist) = candidate.album_artist.as_deref() {
-        let album_artist = crate::domain::credits::prefer_latin_alias(album_artist);
-        let credits = crate::domain::credits::normalize_structured(
-            &album_artist,
-            "",
-            std::mem::take(&mut candidate.album_artist_credits),
-        );
-        candidate.album_artist = Some(credits.artist);
-        candidate.album_artist_credits = credits.artists;
-    }
-}
-
-pub(crate) fn enrich_artwork_fallbacks(
-    candidates: &mut [infra_providers::Candidate],
-) -> Result<()> {
-    let snapshot = candidates.to_vec();
-    for candidate in candidates {
-        let mut artwork = snapshot
-            .iter()
-            .filter(|other| artwork_agrees(candidate, other))
-            .filter_map(|other| {
-                other.cover_url.as_deref().map(|url| {
-                    (
-                        artwork_provider_priority(&other.provider),
-                        other.score,
-                        other.provider.clone(),
-                        url.to_owned(),
-                        other.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        artwork.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| right.1.total_cmp(&left.1))
-        });
-        artwork.dedup_by(|left, right| left.3 == right.3);
-        candidate.cover_url = artwork
-            .first()
-            .map(|item| item.3.clone())
-            .or_else(|| candidate.cover_url.clone());
-        candidate.artwork_candidates = artwork
-            .iter()
-            .map(
-                |(_, _, provider, url, source)| infra_providers::ArtworkCandidate {
-                    provider: provider_display_name(provider).to_owned(),
-                    url: url.clone(),
+/// Gives each candidate the covers of every agreeing catalog row, best
+/// provider first, so a broken primary cover can fall back to another one.
+pub(crate) fn enrich_artwork_fallbacks(candidates: &mut [infra_providers::Candidate]) {
+    let covers = (0..candidates.len())
+        .map(|index| {
+            let candidate = &candidates[index];
+            let mut sources = candidates
+                .iter()
+                .filter(|other| other.cover_url.is_some() && artwork_agrees(candidate, other))
+                .collect::<Vec<_>>();
+            sources.sort_by(|left, right| {
+                artwork_provider_priority(&right.provider)
+                    .cmp(&artwork_provider_priority(&left.provider))
+                    .then_with(|| right.score.total_cmp(&left.score))
+            });
+            sources.dedup_by(|left, right| left.cover_url == right.cover_url);
+            sources
+                .into_iter()
+                .map(|source| infra_providers::ArtworkCandidate {
+                    provider: provider_name(&source.provider).to_owned(),
+                    url: source.cover_url.clone().unwrap_or_default(),
                     release_id: source.release_id.clone(),
                     isrc: source.isrc.clone(),
                     album: source.album.clone(),
                     artist: Some(source.artist.clone()),
                     ..Default::default()
-                },
-            )
-            .collect();
-        if artwork.is_empty() {
-            continue;
-        }
-        let mut breakdown = candidate
-            .score_breakdown
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        breakdown["artwork_candidates"] = serde_json::Value::Array(
-            artwork
-                .into_iter()
-                .map(|(_, _, provider, url, _)| {
-                    serde_json::json!({
-                        "provider": provider_display_name(&provider),
-                        "url": url
-                    })
                 })
-                .collect(),
-        );
-        candidate.score_breakdown = Some(breakdown.to_string());
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (candidate, artwork) in candidates.iter_mut().zip(covers) {
+        if let Some(best) = artwork.first() {
+            candidate.cover_url = Some(best.url.clone());
+        }
+        candidate.artwork_candidates = artwork;
     }
-    Ok(())
 }
 
 pub(crate) fn artwork_agrees(
@@ -1127,7 +987,7 @@ pub(crate) fn artwork_provider_priority(provider: &str) -> u8 {
         "soundcloud" => 6,
         "deezer" => 5,
         "discogs" => 4,
-        "audd" | "theaudiodb" => 3,
+        "audd" => 3,
         "lastfm" => 2,
         "youtube" => 1,
         _ => 0,
@@ -1169,26 +1029,6 @@ pub(crate) async fn apply_artwork_override(
                 artist: Some(candidate.artist.clone()),
             },
         );
-        let mut breakdown = candidate
-            .score_breakdown
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let artwork = breakdown["artwork_candidates"]
-            .as_array_mut()
-            .map(|items| items as &mut Vec<serde_json::Value>);
-        if let Some(items) = artwork {
-            items.insert(
-                0,
-                serde_json::json!({"provider":"User verified","url":cover_url.clone()}),
-            );
-        } else {
-            breakdown["artwork_candidates"] = serde_json::json!([
-                {"provider":"User verified","url":cover_url.clone()}
-            ]);
-        }
-        breakdown["artwork_override"] = serde_json::json!(true);
-        candidate.score_breakdown = Some(breakdown.to_string());
     }
     Ok(())
 }
@@ -1205,84 +1045,6 @@ pub(crate) fn dedupe_candidates(candidates: &mut Vec<infra_providers::Candidate>
         .join("|");
         seen.insert(key)
     });
-}
-
-pub(crate) fn candidate_has_fingerprint(candidate: &infra_providers::Candidate) -> bool {
-    candidate
-        .score_breakdown
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .is_some_and(|value| {
-            value["acoustid"].as_f64().is_some_and(|score| score > 0.0)
-                || value["audio_recognition"].as_bool() == Some(true)
-        })
-}
-
-pub(crate) fn candidate_source_count(candidate: &infra_providers::Candidate) -> usize {
-    candidate_source_list(candidate).len()
-}
-
-#[cfg(test)]
-pub(crate) fn unique_exact_catalog_match(
-    best: &infra_providers::Candidate,
-    candidates: &[infra_providers::Candidate],
-    current: &audio::AudioInfo,
-) -> bool {
-    if !matches!(
-        best.provider.as_str(),
-        "itunes"
-            | "musicbrainz"
-            | "deezer"
-            | "spotify"
-            | "radiojavan"
-            | "audiomack"
-            | "navahang"
-            | "genius"
-    ) || best.duration_delta.is_none_or(|delta| delta > 5.0)
-    {
-        return false;
-    }
-    let Some(title) = current.title.as_deref() else {
-        return false;
-    };
-    let Some(artist) = current.artist.as_deref() else {
-        return false;
-    };
-    if title_similarity(title, &best.title) < 0.94 || artist_similarity(artist, &best.artist) < 0.90
-    {
-        return false;
-    }
-    let current_album = current
-        .album
-        .as_deref()
-        .filter(|album| !album.trim().is_empty() && !album.trim().starts_with('@'));
-    let best_album_similarity = current_album
-        .zip(best.album.as_deref())
-        .map(|(album, candidate_album)| text_similarity(album, candidate_album));
-    if best_album_similarity.is_some_and(|similarity| similarity < 0.65) {
-        return false;
-    }
-    let required_album_similarity = if best_album_similarity.is_some_and(|value| value >= 0.90) {
-        0.90
-    } else {
-        0.65
-    };
-    candidates
-        .iter()
-        .filter(|candidate| {
-            title_similarity(title, &candidate.title) >= 0.94
-                && artist_similarity(artist, &candidate.artist) >= 0.90
-                && candidate.duration_delta.is_some_and(|delta| delta <= 5.0)
-                && current_album.is_none_or(|album| {
-                    candidate.album.as_deref().is_some_and(|candidate_album| {
-                        text_similarity(album, candidate_album) >= required_album_similarity
-                    })
-                })
-        })
-        .map(|candidate| normalize_match_key(candidate.album.as_deref().unwrap_or_default()))
-        .collect::<HashSet<_>>()
-        .len()
-        == 1
 }
 
 pub(crate) fn candidate_agrees(
@@ -1306,7 +1068,7 @@ pub(crate) fn candidate_agrees(
 }
 
 pub(crate) fn candidate_source_list(candidate: &infra_providers::Candidate) -> Vec<String> {
-    let mut out = vec![provider_display_name(&candidate.provider).to_owned()];
+    let mut out = vec![provider_name(&candidate.provider).to_owned()];
     if let Some(value) = candidate
         .score_breakdown
         .as_deref()
@@ -1340,55 +1102,25 @@ pub(crate) fn set_score_sources(
     Ok(())
 }
 
-pub(crate) async fn log_provider_count(
-    state: &Arc<AppState>,
-    filename: &str,
-    provider: &str,
-    count: usize,
-    started: Instant,
-) {
-    state
-        .log_entry(
-            ActivityLogEntry::new(
-                "info",
-                provider,
-                format!("{provider} returned {count} candidate(s)"),
-            )
-            .file(filename.to_owned())
-            .duration_ms(started.elapsed().as_millis() as i64),
-        )
-        .await;
+pub(crate) fn log_provider_count(filename: &str, provider: &str, count: usize, started: Instant) {
+    tracing::debug!(
+        file = filename,
+        provider,
+        count,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "provider lookup finished"
+    );
 }
 
-pub(crate) async fn log_provider_skip(
-    state: &Arc<AppState>,
-    filename: &str,
-    provider: &str,
-    reason: &str,
-) {
-    state.log("warn", provider, Some(filename), reason).await;
+pub(crate) fn log_provider_skip(filename: &str, provider: &str, reason: &str) {
+    tracing::debug!(file = filename, provider, "provider skipped: {reason}");
 }
 
-pub(crate) async fn log_provider_error(
-    state: &Arc<AppState>,
-    filename: &str,
-    provider: &str,
-    error: anyhow::Error,
-) {
-    state
-        .log_entry(
-            ActivityLogEntry::new("error", provider, "Provider lookup failed")
-                .file(filename.to_owned())
-                .error_text(format!("{error:#}")),
-        )
-        .await;
-}
-
-pub(crate) async fn provider_disabled(limits: &Arc<PipelineLimits>, provider: &str) -> bool {
+pub(crate) async fn provider_disabled(limits: &PipelineLimits, provider: &str) -> bool {
     limits.disabled_providers.lock().await.contains(provider)
 }
 
-pub(crate) async fn disable_provider(limits: &Arc<PipelineLimits>, provider: &str) -> bool {
+pub(crate) async fn disable_provider(limits: &PipelineLimits, provider: &str) -> bool {
     limits
         .disabled_providers
         .lock()
@@ -1397,8 +1129,7 @@ pub(crate) async fn disable_provider(limits: &Arc<PipelineLimits>, provider: &st
 }
 
 pub(crate) async fn handle_provider_error(
-    state: &Arc<AppState>,
-    limits: &Arc<PipelineLimits>,
+    limits: &PipelineLimits,
     filename: &str,
     provider: &str,
     error: anyhow::Error,
@@ -1418,19 +1149,18 @@ pub(crate) async fn handle_provider_error(
     if let Some(reason) = disable_reason
         && disable_provider(limits, provider).await
     {
-        state
-            .log_entry(
-                ActivityLogEntry::new(
-                    "warn",
-                    provider,
-                    format!("Provider disabled for this scan: {reason}"),
-                )
-                .file(filename.to_owned())
-                .error_text(error_text),
-            )
-            .await;
+        tracing::warn!(
+            file = filename,
+            provider,
+            error = error_text,
+            "provider disabled for this scan: {reason}"
+        );
         return;
     }
-
-    log_provider_error(state, filename, provider, error).await;
+    tracing::error!(
+        file = filename,
+        provider,
+        error = error_text,
+        "provider lookup failed"
+    );
 }

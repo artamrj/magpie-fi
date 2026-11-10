@@ -1,7 +1,9 @@
 //! A small Telegram Bot API client: frankenstein's typed parameters and
 //! results, sent with magpie's own HTTP client.
+//!
+//! Bot API URLs contain the bot token, so every HTTP error drops its URL
+//! before it can reach a log, the database or a message.
 
-use crate::config::TelegramConfig;
 use anyhow::{Context, Result, bail};
 use frankenstein::response::{ErrorResponse, MethodResponse};
 use serde::{Serialize, de::DeserializeOwned};
@@ -12,6 +14,8 @@ use std::{path::Path, time::Duration};
 pub const DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
 
 pub const TOO_BIG: &str = "Telegram only lets bots receive files up to 20 MB";
+
+const API_URL: &str = "https://api.telegram.org";
 
 #[derive(Clone)]
 pub struct Bot {
@@ -40,37 +44,55 @@ impl std::fmt::Display for TelegramError {
 impl std::error::Error for TelegramError {}
 
 impl Bot {
-    pub fn new(config: &TelegramConfig) -> Result<Self> {
+    pub fn new(token: &str) -> Result<Self> {
+        Self::with_api_url(API_URL, token)
+    }
+
+    /// Tests point the bot at a fake Telegram.
+    pub(super) fn with_api_url(api_url: &str, token: &str) -> Result<Self> {
         Ok(Self {
             // Long polling holds a request open for up to 50 s.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(75))
                 .user_agent(crate::config::USER_AGENT)
                 .build()?,
-            api_url: config.api_url.clone(),
-            token: config.token.clone(),
+            api_url: api_url.to_owned(),
+            token: token.to_owned(),
         })
     }
 
     /// Calls a Bot API method. Waits and tries again when Telegram asks to
-    /// slow down; "message is not modified" counts as success.
+    /// slow down or cannot be reached; "message is not modified" counts as
+    /// success. A message is never sent twice: `send…` methods are only
+    /// repeated when the request surely did not reach Telegram.
     pub async fn call<P: Serialize + ?Sized, R: DeserializeOwned>(
         &self,
         method: &str,
         params: &P,
     ) -> Result<R> {
         let url = format!("{}/bot{}/{method}", self.api_url, self.token);
+        let repeatable = !method.starts_with("send");
         for attempt in 0..4 {
-            let response = match self.client.post(&url).json(params).send().await {
+            let response = match self
+                .client
+                .post(&url)
+                .json(params)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+            {
                 Ok(response) => response,
-                Err(error) if attempt < 3 => {
+                Err(error) if attempt < 3 && (repeatable || error.is_connect()) => {
                     tracing::debug!(%error, method, "Telegram request failed; retrying");
                     tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            let body = response.bytes().await?;
+            let body = response
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)?;
             if let Ok(ok) = serde_json::from_slice::<MethodResponse<R>>(&body) {
                 return Ok(ok.result);
             }
@@ -126,10 +148,12 @@ impl Bot {
             .get(url)
             .timeout(Duration::from_secs(600))
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest::Error::without_url)?
             .bytes()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         tokio::fs::write(target, &bytes).await?;
         Ok(())
     }
@@ -147,4 +171,35 @@ pub fn is_gone(error: &anyhow::Error) -> bool {
         error.description.contains("message to edit not found")
             || error.description.contains("message can't be edited")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, routing::post};
+
+    #[tokio::test]
+    async fn errors_never_show_the_bot_token() {
+        // getFile works, but the file download itself fails (404).
+        let app = Router::new().route(
+            "/{bot}/getFile",
+            post(|| async {
+                Json(serde_json::json!({"ok": true, "result": {
+                    "file_id": "f", "file_unique_id": "u", "file_path": "music/a.mp3"
+                }}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let token = "123:SECRET-TOKEN";
+        let bot = Bot::with_api_url(&format!("http://{address}"), token).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let error = bot
+            .download("f", &directory.path().join("a.mp3"))
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#} {error:?}").contains("SECRET-TOKEN"));
+    }
 }

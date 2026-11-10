@@ -1,4 +1,4 @@
-import type { Workflow } from "@/api/types";
+import type { Workflow } from "../../api/types";
 import { Icon } from "../Icons";
 
 export function ProcessingDock({
@@ -10,7 +10,7 @@ export function ProcessingDock({
   onWrite,
 }: {
   workflow?: Workflow;
-  counts: { review: number; ready: number; problems: number; completed: number };
+  counts: { review: number; ready: number; problems: number };
   busy: boolean;
   trashDays: number;
   onStop: () => void;

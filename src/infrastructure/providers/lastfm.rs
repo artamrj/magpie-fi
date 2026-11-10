@@ -1,13 +1,15 @@
-use super::Candidate;
+use super::{Candidate, request_json};
 use crate::{
     domain::audio::AudioInfo,
-    infrastructure::provider_cache::{ProviderCache, search_key},
+    infrastructure::provider_cache::{cached, search_key},
 };
 use anyhow::Result;
-use chrono::{Duration, Utc};
-use reqwest::{Client, RequestBuilder};
+use chrono::Duration;
+use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
+
+const API: &str = "https://ws.audioscrobbler.com/2.0/";
 
 pub async fn search(
     pool: &SqlitePool,
@@ -27,10 +29,8 @@ pub async fn search(
         current.artist.as_deref().unwrap_or_default(),
         title
     ));
-    let raw = if let Some(value) = ProviderCache::get(pool, "lastfm", &key).await? {
-        value
-    } else {
-        let value = request_json(client.get("https://ws.audioscrobbler.com/2.0/").query(&[
+    let raw = cached(pool, "lastfm", &key, Duration::days(7), || {
+        request_json(client.get(API).query(&[
             ("method", "track.search"),
             ("track", title),
             ("artist", current.artist.as_deref().unwrap_or_default()),
@@ -38,10 +38,8 @@ pub async fn search(
             ("format", "json"),
             ("limit", "5"),
         ]))
-        .await?;
-        ProviderCache::put(pool, "lastfm", &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+    })
+    .await?;
     let mut candidates = candidates_from_search(&raw);
     if let Some(artist) = current
         .artist
@@ -49,10 +47,8 @@ pub async fn search(
         .filter(|value| !value.trim().is_empty())
     {
         let info_key = search_key(&format!("track-info {artist} {title}"));
-        let info = if let Some(value) = ProviderCache::get(pool, "lastfm", &info_key).await? {
-            value
-        } else {
-            let value = request_json(client.get("https://ws.audioscrobbler.com/2.0/").query(&[
+        let info = cached(pool, "lastfm", &info_key, Duration::days(14), || {
+            request_json(client.get(API).query(&[
                 ("method", "track.getInfo"),
                 ("track", title),
                 ("artist", artist),
@@ -60,17 +56,8 @@ pub async fn search(
                 ("api_key", api_key),
                 ("format", "json"),
             ]))
-            .await?;
-            ProviderCache::put(
-                pool,
-                "lastfm",
-                &info_key,
-                &value,
-                Utc::now() + Duration::days(14),
-            )
-            .await?;
-            value
-        };
+        })
+        .await?;
         enrich_with_track_info(&mut candidates, &info);
     }
     Ok(candidates)
@@ -167,10 +154,6 @@ fn candidates_from_search(raw: &Value) -> Vec<Candidate> {
             }
         })
         .collect()
-}
-
-async fn request_json(request: RequestBuilder) -> Result<Value> {
-    Ok(request.send().await?.error_for_status()?.json().await?)
 }
 
 #[cfg(test)]

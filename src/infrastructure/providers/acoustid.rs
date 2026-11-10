@@ -1,9 +1,9 @@
-use crate::infrastructure::provider_cache::{ProviderCache, fingerprint_key};
+use super::request_json;
+use crate::infrastructure::provider_cache::{cached, fingerprint_key};
 use anyhow::{Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 use sqlx::SqlitePool;
 
 #[derive(Debug)]
@@ -11,23 +11,23 @@ pub struct Hit {
     pub score: f64,
     pub recording_id: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct Response {
     status: String,
     error: Option<ApiError>,
     #[serde(default)]
     results: Vec<ResultItem>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ApiError {
     message: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ResultItem {
     score: f64,
     recordings: Option<Vec<Recording>>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct Recording {
     id: String,
 }
@@ -40,32 +40,15 @@ pub async fn lookup(
     duration: f64,
 ) -> Result<Vec<Hit>> {
     let cache_key = fingerprint_key(fingerprint);
-    let raw = if let Some(value) = ProviderCache::get(pool, "acoustid", &cache_key).await? {
-        value
-    } else {
-        let value: Value = client
-            .post("https://api.acoustid.org/v2/lookup")
-            .form(&[
-                ("client", key),
-                ("meta", "recordings releases releasegroups tracks compress"),
-                ("fingerprint", fingerprint),
-                ("duration", &duration.round().to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        ProviderCache::put(
-            pool,
-            "acoustid",
-            &cache_key,
-            &value,
-            Utc::now() + Duration::days(90),
-        )
-        .await?;
-        value
-    };
+    let raw = cached(pool, "acoustid", &cache_key, Duration::days(90), || {
+        request_json(client.post("https://api.acoustid.org/v2/lookup").form(&[
+            ("client", key),
+            ("meta", "recordings releases releasegroups tracks compress"),
+            ("fingerprint", fingerprint),
+            ("duration", &duration.round().to_string()),
+        ]))
+    })
+    .await?;
     hits_from_response(serde_json::from_value(raw)?)
 }
 
@@ -97,7 +80,8 @@ fn hits_from_response(response: Response) -> Result<Vec<Hit>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::provider_cache::{ProviderCache, fingerprint_key};
+    use crate::infrastructure::provider_cache::put;
+    use chrono::Utc;
 
     async fn test_pool() -> SqlitePool {
         let dir = tempfile::tempdir().unwrap();
@@ -113,7 +97,7 @@ mod tests {
     async fn lookup_uses_cached_response_without_network() {
         let pool = test_pool().await;
         let fingerprint = "abc";
-        ProviderCache::put(
+        put(
             &pool,
             "acoustid",
             &fingerprint_key(fingerprint),

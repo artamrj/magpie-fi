@@ -1,21 +1,11 @@
-use super::Candidate;
+use super::{Candidate, ClientCredentials, nonempty, request_json};
 use anyhow::{Result, bail};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use serde_json::Value;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
-#[derive(Default)]
-pub struct SoundCloudAuth {
-    token: Mutex<Option<CachedToken>>,
-}
+pub type SoundCloudAuth = ClientCredentials;
 
-struct CachedToken {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_at: Instant,
-}
+const TOKEN_URL: &str = "https://secure.soundcloud.com/oauth/token";
 
 pub async fn search(
     client: &Client,
@@ -25,37 +15,35 @@ pub async fn search(
     title: &str,
     artist: Option<&str>,
 ) -> Result<Vec<Candidate>> {
-    let token = access_token(client, auth, client_id, client_secret).await?;
+    let token = auth
+        .token(client, TOKEN_URL, client_id, client_secret)
+        .await?;
     let query = match artist.filter(|value| !value.trim().is_empty()) {
         Some(artist) => format!("{} {}", artist.trim(), title.trim()),
         None => title.trim().to_owned(),
     };
-    let raw = client
-        .get("https://api.soundcloud.com/tracks")
-        .header("Authorization", format!("OAuth {token}"))
-        .query(&[
-            ("q", query.as_str()),
-            ("limit", "15"),
-            ("linked_partitioning", "true"),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let raw = request_json(
+        client
+            .get("https://api.soundcloud.com/tracks")
+            .header("Authorization", format!("OAuth {token}"))
+            .query(&[
+                ("q", query.as_str()),
+                ("limit", "15"),
+                ("linked_partitioning", "true"),
+            ]),
+    )
+    .await?;
     Ok(parse_results(&raw))
 }
 
 pub async fn lookup_url(client: &Client, url: &str) -> Result<Candidate> {
     validate_url(url)?;
-    let raw = client
-        .get("https://soundcloud.com/oembed")
-        .query(&[("url", url), ("format", "json")])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let raw = request_json(
+        client
+            .get("https://soundcloud.com/oembed")
+            .query(&[("url", url), ("format", "json")]),
+    )
+    .await?;
     candidate_from_oembed(&raw).ok_or_else(|| anyhow::anyhow!("SoundCloud returned no title"))
 }
 
@@ -70,96 +58,6 @@ fn validate_url(url: &str) -> Result<()> {
         bail!("only HTTPS SoundCloud source links are supported");
     }
     Ok(())
-}
-
-async fn access_token(
-    client: &Client,
-    auth: &SoundCloudAuth,
-    client_id: &str,
-    client_secret: &str,
-) -> Result<String> {
-    let mut cached = auth.token.lock().await;
-    if let Some(token) = cached.as_ref()
-        && token.expires_at > Instant::now() + Duration::from_secs(30)
-    {
-        return Ok(token.access_token.clone());
-    }
-
-    let refreshed = if let Some(refresh_token) = cached
-        .as_ref()
-        .and_then(|token| token.refresh_token.as_deref())
-    {
-        request_token(
-            client,
-            client_id,
-            client_secret,
-            &[
-                ("grant_type", "refresh_token"),
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-                ("refresh_token", refresh_token),
-            ],
-            false,
-        )
-        .await
-        .ok()
-    } else {
-        None
-    };
-    let token = match refreshed {
-        Some(token) => token,
-        None => {
-            request_token(
-                client,
-                client_id,
-                client_secret,
-                &[("grant_type", "client_credentials")],
-                true,
-            )
-            .await?
-        }
-    };
-    let access_token = token.access_token.clone();
-    *cached = Some(token);
-    Ok(access_token)
-}
-
-async fn request_token(
-    client: &Client,
-    client_id: &str,
-    client_secret: &str,
-    form: &[(&str, &str)],
-    basic_auth: bool,
-) -> Result<CachedToken> {
-    let mut request = client
-        .post("https://secure.soundcloud.com/oauth/token")
-        .header("Accept", "application/json; charset=utf-8")
-        .form(form);
-    if basic_auth {
-        request = request.header(
-            "Authorization",
-            format!(
-                "Basic {}",
-                STANDARD.encode(format!("{client_id}:{client_secret}"))
-            ),
-        );
-    }
-    let raw = request
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-    let access_token = raw["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("SoundCloud token response had no access token"))?
-        .to_owned();
-    let expires_in = raw["expires_in"].as_u64().unwrap_or(3600).max(60);
-    Ok(CachedToken {
-        access_token,
-        refresh_token: raw["refresh_token"].as_str().map(str::to_owned),
-        expires_at: Instant::now() + Duration::from_secs(expires_in),
-    })
 }
 
 fn parse_results(raw: &Value) -> Vec<Candidate> {
@@ -177,7 +75,7 @@ fn candidate_from_track(track: &Value) -> Option<Candidate> {
         return None;
     }
     let raw_title = track["title"].as_str()?.trim();
-    let explicit_artist = nonempty(track["metadata_artist"].as_str());
+    let explicit_artist = nonempty(track["metadata_artist"].as_str()).map(str::to_owned);
     let title_credit = split_artist_title(raw_title);
     let use_title_credit = title_credit.as_ref().is_some_and(|(title_artist, _)| {
         explicit_artist
@@ -195,7 +93,7 @@ fn candidate_from_track(track: &Value) -> Option<Candidate> {
                 .filter(|_| use_title_credit)
                 .map(|(artist, _)| artist.clone())
         })
-        .or_else(|| nonempty(track["user"]["username"].as_str()))?;
+        .or_else(|| nonempty(track["user"]["username"].as_str()).map(str::to_owned))?;
     let credits = crate::domain::credits::normalize_featured(&artist, title);
     let release_year = track["release_year"].as_i64().map(|year| year.to_string());
     let release_date = release_year.as_deref().map(|year| {
@@ -217,9 +115,9 @@ fn candidate_from_track(track: &Value) -> Option<Candidate> {
         album: track["release"].as_str().map(str::to_owned),
         album_artist,
         year: release_year,
-        genre: nonempty(track["genre"].as_str()),
-        label: nonempty(track["label_name"].as_str()),
-        isrc: nonempty(track["isrc"].as_str()),
+        genre: nonempty(track["genre"].as_str()).map(str::to_owned),
+        label: nonempty(track["label_name"].as_str()).map(str::to_owned),
+        isrc: nonempty(track["isrc"].as_str()).map(str::to_owned),
         cover_url: track["artwork_url"].as_str().map(upgrade_artwork_url),
         release_date,
         duration_delta: track["duration"].as_f64().map(|value| value / 1000.0),
@@ -255,13 +153,6 @@ fn candidate_from_oembed(raw: &Value) -> Option<Candidate> {
         raw_json: raw.to_string(),
         ..Default::default()
     })
-}
-
-fn nonempty(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 fn split_artist_title(value: &str) -> Option<(String, String)> {

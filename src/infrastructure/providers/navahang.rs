@@ -1,15 +1,13 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::{BROWSER_USER_AGENT, Candidate, browser_page, nonempty, request_json};
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
 const PROVIDER: &str = "navahang";
 const BASE_URL: &str = "https://www.navahang.com";
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/138 Safari/537.36";
 
 pub async fn search(
     pool: &SqlitePool,
@@ -24,27 +22,26 @@ pub async fn search(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let value = client
-            .get(format!("{BASE_URL}/main-search.php"))
-            .header("Accept", "application/json")
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .query(&[
-                ("q", query.as_str()),
-                ("size", "10"),
-                ("suggestion", "true"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        ProviderCache::put(pool, PROVIDER, &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+    let raw = cached(
+        pool,
+        PROVIDER,
+        &search_key(&query),
+        Duration::days(7),
+        || {
+            request_json(
+                client
+                    .get(format!("{BASE_URL}/main-search.php"))
+                    .header("Accept", "application/json")
+                    .header("User-Agent", BROWSER_USER_AGENT)
+                    .query(&[
+                        ("q", query.as_str()),
+                        ("size", "10"),
+                        ("suggestion", "true"),
+                    ]),
+            )
+        },
+    )
+    .await?;
 
     let mut candidates = parse_search_results(&raw);
     if let Some(path) = raw["MP3"]
@@ -66,30 +63,12 @@ pub async fn search(
 pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result<Candidate> {
     let (canonical, slug) = song_url(url)?;
     let key = format!("song:{slug}");
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let html = client
-            .get(canonical.clone())
-            .header("Accept", "text/html,application/xhtml+xml")
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let value = page_metadata(&html, canonical.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Navahang returned no usable song metadata"))?;
-        ProviderCache::put(
-            pool,
-            PROVIDER,
-            &key,
-            &value,
-            Utc::now() + Duration::days(14),
-        )
-        .await?;
-        value
-    };
+    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || async {
+        let html = browser_page(client, canonical.as_str()).await?;
+        page_metadata(&html, canonical.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Navahang returned no usable song metadata"))
+    })
+    .await?;
     let mut candidate = candidate_from_page_metadata(&raw)
         .ok_or_else(|| anyhow::anyhow!("Navahang returned incomplete song metadata"))?;
     candidate.score = 96.0;
@@ -322,10 +301,6 @@ fn decode_html(value: &str) -> String {
         .replace("&#8211;", "–")
         .replace("&#8217;", "’")
         .replace("&nbsp;", " ")
-}
-
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

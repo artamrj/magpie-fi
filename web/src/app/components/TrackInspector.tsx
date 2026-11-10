@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
-import { api } from "@/api/client";
-import type { Candidate, Track } from "@/api/types";
+import { api, post } from "../../api/client";
+import type { Candidate, Track } from "../../api/types";
 import { askConfirm } from "../telegram";
 import { Icon, type IconName } from "../Icons";
 import {
-  artworkStatusLabel,
-  artworkUrls,
+  artworkStatusLabels,
   candidateConfidence,
   candidateSignals,
   candidateSources,
@@ -15,7 +14,6 @@ import {
   friendlyTrackError,
   googleMetadataUrl,
   hasRetryableArtwork,
-  isCompleted,
   isProblem,
   isReview,
   metadataAudit,
@@ -24,6 +22,7 @@ import {
   selectedCandidate,
   statusFor,
 } from "../trackUtils";
+import { CandidateCover, ChosenCover, OriginalCover } from "./Cover";
 import { ManualEditor } from "./ManualEditor";
 
 export function TrackInspector({
@@ -46,18 +45,23 @@ export function TrackInspector({
   const [actionError, setActionError] = useState("");
   const candidate = selectedCandidate(track);
   const corrupt = track.status === "corrupt";
-  const showChosenOverview = Boolean(candidate);
-  const overviewTitle = showChosenOverview ? candidate?.title : track.current_title;
-  const overviewArtist = showChosenOverview ? candidate?.artist : track.current_artist;
-  const overviewAlbum = showChosenOverview ? candidate?.album : track.current_album;
-  const overviewAlbumArtist = showChosenOverview
-    ? candidate?.album_artist
-    : track.current_album_artist;
-  const overviewTrackNumber = showChosenOverview
-    ? candidate?.track_number
-    : track.current_track_number;
-  const overviewFilename =
-    showChosenOverview && candidate ? outputFilename(track, candidate) : track.filename;
+  const overview = candidate
+    ? {
+        title: candidate.title,
+        artist: candidate.artist,
+        album: candidate.album,
+        albumArtist: candidate.album_artist,
+        trackNumber: candidate.track_number,
+        filename: outputFilename(track, candidate),
+      }
+    : {
+        title: track.current_title,
+        artist: track.current_artist,
+        album: track.current_album,
+        albumArtist: track.current_album_artist,
+        trackNumber: track.current_track_number,
+        filename: track.filename,
+      };
   useEffect(() => {
     setEditing(false);
     setAdvanced(false);
@@ -68,129 +72,85 @@ export function TrackInspector({
     setSavingCover(false);
     setCoverUrl(candidate?.cover_url || "");
   }, [track.id, candidate?.cover_url]);
-  const undoIdentification = async () => {
-    setUndoing(true);
+  /** Sends a change for this track, then reloads; `setBusy` shows it is in progress. */
+  const act = async (setBusy: (busy: boolean) => void, request: () => Promise<unknown>) => {
+    setBusy(true);
     setActionError("");
     try {
-      await api(`/tracks/${track.id}/review`, { method: "POST", body: "{}" });
+      await request();
       await onSaved();
     } catch (reason) {
       setActionError((reason as Error).message);
     } finally {
-      setUndoing(false);
+      setBusy(false);
     }
   };
+  const undoIdentification = () => act(setUndoing, () => post(`/tracks/${track.id}/review`));
   const acceptCandidate = async (candidateId: number) => {
     setChoosingId(candidateId);
     setActionError("");
-    try {
-      await onChoose(track.id, candidateId);
-    } catch (reason) {
-      setActionError((reason as Error).message);
-    } finally {
-      setChoosingId(undefined);
-    }
+    await onChoose(track.id, candidateId); // The app shows any error.
+    setChoosingId(undefined);
   };
   const removeMusicFile = async () => {
     if (
-      !(await askConfirm(
+      await askConfirm(
         `Remove "${track.filename}"? It won't be added to your library. Your own files go to the trash (kept for a while); downloads are deleted.`,
-      ))
+      )
     )
-      return;
-    setRemoving(true);
-    setActionError("");
-    try {
-      await api(`/tracks/${track.id}`, { method: "DELETE" });
-      await onSaved();
-    } catch (reason) {
-      setActionError((reason as Error).message);
-    } finally {
-      setRemoving(false);
-    }
+      await act(setRemoving, () => api(`/tracks/${track.id}`, { method: "DELETE" }));
   };
-  const searchCover = async () => {
-    setSearchingCover(true);
-    setActionError("");
-    try {
-      await api(`/tracks/${track.id}/artwork/search`, { method: "POST", body: "{}" });
-      await onSaved();
-    } catch (reason) {
-      setActionError((reason as Error).message);
-    } finally {
-      setSearchingCover(false);
-    }
-  };
+  const searchCover = () =>
+    act(setSearchingCover, () => post(`/tracks/${track.id}/artwork/search`));
   const saveManualCover = async () => {
     const url = coverUrl.trim();
     if (!url) return;
-    setSavingCover(true);
-    setActionError("");
-    try {
-      await api(`/tracks/${track.id}/artwork`, {
+    await act(setSavingCover, () =>
+      api(`/tracks/${track.id}/artwork`, {
         method: "PUT",
         body: JSON.stringify({ cover_url: url }),
-      });
-      await onSaved();
-    } catch (reason) {
-      setActionError((reason as Error).message);
-    } finally {
-      setSavingCover(false);
-    }
+      }),
+    );
   };
   const coverBusy = searchingCover || savingCover;
-  const coverNeeded = Boolean(
-    candidate && !isCompleted(track) && candidate.artwork_status !== "verified",
-  );
+  const coverNeeded = Boolean(candidate && candidate.artwork_status !== "verified");
 
   return (
     <div className="inspector-content">
       <header className="original-overview">
-        {showChosenOverview && candidate ? (
-          <Artwork candidate={candidate} trackId={track.id} size="large" />
+        {candidate ? (
+          <ChosenCover track={track} candidate={candidate} size="large" />
         ) : (
-          <OriginalArtwork track={track} size="large" />
+          <OriginalCover track={track} size="large" />
         )}
         <div className="original-overview-main">
           <div className="overview-label">
-            <span>
-              {showChosenOverview
-                ? isCompleted(track)
-                  ? "Written metadata"
-                  : "Chosen metadata"
-                : "Original file"}
-            </span>
+            <span>{candidate ? "Chosen metadata" : "Original file"}</span>
             <TrackStatus track={track} />
           </div>
-          <h2>{overviewTitle || fileStem(track.filename)}</h2>
+          <h2>{overview.title || fileStem(track.filename)}</h2>
           <p>
-            {overviewArtist || "Unknown artist"}
+            {overview.artist || "Unknown artist"}
             <i>·</i>
-            {overviewAlbum || "Album not set"}
+            {overview.album || "Album not set"}
           </p>
-          <div className={`original-filename ${showChosenOverview ? "chosen" : ""}`}>
+          <div className={`original-filename ${candidate ? "chosen" : ""}`}>
             <Icon name="music" size={15} />
             <span>
-              <small>
-                {showChosenOverview
-                  ? isCompleted(track)
-                    ? "Written filename"
-                    : "New filename"
-                  : "Filename"}
-              </small>
-              <b title={overviewFilename}>{overviewFilename}</b>
+              <small>{candidate ? "New filename" : "Filename"}</small>
+              <b title={overview.filename}>{overview.filename}</b>
             </span>
           </div>
           <div className="original-audio-facts">
             <span>
               <small>Album artist</small>
-              <b>{overviewAlbumArtist || "Not set"}</b>
+              <b>{overview.albumArtist || "Not set"}</b>
             </span>
             <span>
               <small>Track</small>
               <b>
-                {overviewTrackNumber
-                  ? `${overviewTrackNumber}${showChosenOverview && candidate?.track_total ? ` / ${candidate.track_total}` : ""}`
+                {overview.trackNumber
+                  ? `${overview.trackNumber}${candidate?.track_total ? ` / ${candidate.track_total}` : ""}`
                   : "Not set"}
               </b>
             </span>
@@ -250,7 +210,7 @@ export function TrackInspector({
             </p>
             {coverNeeded && (
               <div className="cover-search-actions">
-                <div className="cover-search-buttons">
+                <div>
                   <button
                     className="compact-button accent"
                     disabled={coverBusy}
@@ -264,9 +224,9 @@ export function TrackInspector({
                     {searchingCover ? "Searching…" : "Search for cover art"}
                   </button>
                 </div>
-                <label className="cover-url-field">
+                <label>
                   <span>Or paste a cover URL</span>
-                  <span className="cover-url-row">
+                  <span>
                     <input
                       value={coverUrl}
                       onChange={(event) => setCoverUrl(event.target.value)}
@@ -323,7 +283,7 @@ export function TrackInspector({
       )}
 
       {isReview(track) && track.candidates.length > 0 && (
-        <section className="inspector-section candidate-section">
+        <section className="inspector-section">
           <div className="section-heading">
             <div>
               <p className="eyebrow">magpie suggestions</p>
@@ -361,7 +321,7 @@ export function TrackInspector({
 
       {candidate && (
         <>
-          <section className="inspector-section selected-proposal">
+          <section className="inspector-section">
             <div className="section-heading">
               <div>
                 <p className="eyebrow">magpie suggestion</p>
@@ -374,7 +334,7 @@ export function TrackInspector({
             </div>
             <div className="proposal-summary">
               <div className="proposal-side current">
-                <OriginalArtwork track={track} size="medium" />
+                <OriginalCover track={track} size="medium" />
                 <span>
                   <small>Current file</small>
                   <b>{track.current_title || fileStem(track.filename)}</b>
@@ -383,7 +343,7 @@ export function TrackInspector({
               </div>
               <Icon name="arrow" size={17} />
               <div className="proposal-side proposed">
-                <Artwork candidate={candidate} trackId={track.id} size="medium" />
+                <ChosenCover track={track} candidate={candidate} size="medium" />
                 <span>
                   <small>Will be written</small>
                   <b>{candidate.title || "Untitled"}</b>
@@ -430,7 +390,11 @@ export function TrackInspector({
           </section>
           <section className="quality-strip">
             <QualityItem icon="layers" label="Sources" value={candidateSources(candidate)} />
-            <QualityItem icon="album" label="Artwork" value={artworkStatusLabel(candidate)} />
+            <QualityItem
+              icon="album"
+              label="Artwork"
+              value={artworkStatusLabels[candidate.artwork_status]}
+            />
             <QualityItem icon="waveform" label="ReplayGain" value="Added on write" />
           </section>
         </>
@@ -496,7 +460,7 @@ export function TrackInspector({
         <div className="inspector-actions">
           <span>
             <Icon name="check" />
-            {isCompleted(track) ? "Corrected file written" : "Ready to write"}
+            Ready to write
           </span>
           <button
             className="text-button warning"
@@ -546,7 +510,7 @@ function CandidateRow({
         <span className="candidate-rank" aria-label={`Option ${rank}`}>
           {rank}
         </span>
-        <Artwork candidate={candidate} size="medium" />
+        <CandidateCover candidate={candidate} size="medium" />
         <div className="candidate-identity">
           <span className="candidate-kicker">{recommended ? "Recommended" : `Option ${rank}`}</span>
           <b>{candidate.title || "Untitled"}</b>
@@ -624,7 +588,9 @@ function CandidateRow({
         <i>·</i>
         <span>{audit.coreComplete ? "Complete metadata" : `${audit.score}% metadata`}</span>
         <i>·</i>
-        <span title={candidate.artwork_message}>{artworkStatusLabel(candidate)}</span>
+        <span title={candidate.artwork_message}>
+          {artworkStatusLabels[candidate.artwork_status]}
+        </span>
         {candidate.isrc && (
           <>
             <i>·</i>
@@ -723,96 +689,6 @@ export function InspectorEmpty({ busy }: { busy: boolean }) {
           : "Inspect the original tags, proposed corrections, artwork, sources, and confidence here."}
       </p>
     </div>
-  );
-}
-
-export function Secret({
-  label,
-  active,
-  value,
-  onChange,
-}: {
-  label: string;
-  active?: boolean;
-  value?: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label>
-      <span>
-        {label}
-        {active && <i>Configured</i>}
-      </span>
-      <input
-        type="password"
-        value={value || ""}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={active ? "Leave blank to keep" : "Optional"}
-        autoComplete="off"
-      />
-    </label>
-  );
-}
-
-export function Artwork({
-  candidate,
-  trackId,
-  size = "small",
-}: {
-  candidate?: Candidate;
-  trackId?: number;
-  size?: "small" | "medium" | "large";
-}) {
-  const catalogUrls = artworkUrls(candidate);
-  const urls = trackId
-    ? [
-        `/api/tracks/${trackId}/artwork/preview?v=${encodeURIComponent(candidate?.cover_url || candidate?.id || "embedded")}`,
-        ...catalogUrls,
-      ]
-    : candidate?.id && catalogUrls.length
-      ? [
-          `/api/candidates/${candidate.id}/artwork/preview?v=${encodeURIComponent(candidate.cover_url || candidate.id)}`,
-          ...catalogUrls,
-        ]
-      : catalogUrls;
-  const [index, setIndex] = useState(0);
-  useEffect(() => setIndex(0), [candidate?.id, candidate?.cover_url]);
-  return urls[index] ? (
-    <img
-      className={`artwork artwork-${size}`}
-      src={urls[index]}
-      alt={`Cover for ${candidate?.album || candidate?.title || "track"}`}
-      loading="lazy"
-      onError={() => setIndex((current) => current + 1)}
-    />
-  ) : (
-    <span className={`artwork artwork-${size} artwork-missing`}>
-      <Icon name="music" size={size === "large" ? 28 : 18} />
-    </span>
-  );
-}
-
-export function OriginalArtwork({
-  track,
-  size = "small",
-}: {
-  track: Track;
-  size?: "small" | "medium" | "large";
-}) {
-  const [missing, setMissing] = useState(false);
-  useEffect(() => setMissing(false), [track.id]);
-  return missing ? (
-    <span className={`artwork artwork-${size} artwork-missing`}>
-      <Icon name="music" size={size === "large" ? 28 : 18} />
-    </span>
-  ) : (
-    <img
-      className={`artwork artwork-${size}`}
-      src={`/api/tracks/${track.id}/artwork/original?v=${encodeURIComponent(track.filename)}`}
-      alt={`Embedded cover from ${track.filename}`}
-      loading="lazy"
-      onError={() => setMissing(true)}
-    />
   );
 }
 

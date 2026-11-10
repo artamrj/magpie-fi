@@ -1,7 +1,7 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::ProviderCache;
+use super::{Candidate, request_json};
+use crate::infrastructure::provider_cache::cached;
 use anyhow::{Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -15,14 +15,12 @@ pub async fn lookup_url(client: &Client, url: &str) -> Result<Candidate> {
     ) {
         bail!("only YouTube source links are supported");
     }
-    let raw = client
-        .get("https://www.youtube.com/oembed")
-        .query(&[("url", url), ("format", "json")])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let raw = request_json(
+        client
+            .get("https://www.youtube.com/oembed")
+            .query(&[("url", url), ("format", "json")]),
+    )
+    .await?;
     candidate_from_oembed(&raw).ok_or_else(|| anyhow::anyhow!("YouTube returned no title"))
 }
 
@@ -67,35 +65,25 @@ pub async fn lookup_filename_id(
     let Some(video_id) = extract_video_id(filename) else {
         return Ok(Vec::new());
     };
-    let cache_key = format!("video:{video_id}");
-    let raw = if let Some(value) = ProviderCache::get(pool, "youtube", &cache_key).await? {
-        value
-    } else {
-        let value = client
-            .get("https://www.googleapis.com/youtube/v3/videos")
-            .query(&[
-                ("part", "snippet,contentDetails"),
-                ("id", video_id.as_str()),
-                ("key", api_key),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+    let key = format!("video:{video_id}");
+    let raw = cached(pool, "youtube", &key, Duration::days(30), || async {
+        // `request_json` keeps the API key (in the URL) out of errors.
+        let value = request_json(
+            client
+                .get("https://www.googleapis.com/youtube/v3/videos")
+                .query(&[
+                    ("part", "snippet,contentDetails"),
+                    ("id", video_id.as_str()),
+                    ("key", api_key),
+                ]),
+        )
+        .await?;
         if let Some(message) = value["error"]["message"].as_str() {
             bail!("YouTube API error: {message}");
         }
-        ProviderCache::put(
-            pool,
-            "youtube",
-            &cache_key,
-            &value,
-            Utc::now() + Duration::days(30),
-        )
-        .await?;
-        value
-    };
+        Ok(value)
+    })
+    .await?;
     Ok(parse_video(&raw).into_iter().collect())
 }
 

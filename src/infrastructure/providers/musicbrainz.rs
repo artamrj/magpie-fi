@@ -1,7 +1,7 @@
 use super::{ArtistCredit, Candidate};
-use crate::infrastructure::provider_cache::{ProviderCache, recording_key, search_key};
-use anyhow::{Result, bail};
-use chrono::{Duration as ChronoDuration, Utc};
+use crate::infrastructure::provider_cache::{self, recording_key, search_key};
+use anyhow::Result;
+use chrono::Duration as ChronoDuration;
 use reqwest::Client;
 use reqwest::RequestBuilder;
 use serde_json::Value;
@@ -12,78 +12,60 @@ use tokio::time::{Duration, Instant, sleep};
 
 static NEXT_REQUEST: OnceLock<Mutex<Instant>> = OnceLock::new();
 
-pub async fn recording(
-    pool: &SqlitePool,
-    client: &Client,
-    user_agent: &str,
-    id: &str,
-) -> Result<Candidate> {
-    validate_user_agent(user_agent)?;
-    let key = recording_key(id);
-    let raw = if let Some(value) = ProviderCache::get(pool, "musicbrainz", &key).await? {
-        value
-    } else {
-        let value = request_json(
-            client
-                .get(format!("https://musicbrainz.org/ws/2/recording/{id}"))
-                .query(&[
-                    ("fmt", "json"),
-                    ("inc", "artists+releases+release-groups+media+isrcs"),
-                ])
-                .header("User-Agent", user_agent),
-        )
-        .await?;
-        ProviderCache::put(
-            pool,
-            "musicbrainz",
-            &key,
-            &value,
-            Utc::now() + ChronoDuration::days(30),
-        )
-        .await?;
-        value
-    };
+pub async fn recording(pool: &SqlitePool, client: &Client, id: &str) -> Result<Candidate> {
+    let raw = provider_cache::cached(
+        pool,
+        "musicbrainz",
+        &recording_key(id),
+        ChronoDuration::days(30),
+        || {
+            request_json(
+                client
+                    .get(format!("https://musicbrainz.org/ws/2/recording/{id}"))
+                    .query(&[
+                        ("fmt", "json"),
+                        ("inc", "artists+releases+release-groups+media+isrcs"),
+                    ]),
+            )
+        },
+    )
+    .await?;
     Ok(candidate_from_recording(&raw, id))
 }
 
 pub async fn search(
     pool: &SqlitePool,
     client: &Client,
-    user_agent: &str,
     title: &str,
     artist: Option<&str>,
 ) -> Result<Vec<Candidate>> {
-    validate_user_agent(user_agent)?;
     let query = match artist.filter(|value| !value.trim().is_empty()) {
-        Some(artist) => format!("recording:\"{title}\" AND artist:\"{artist}\""),
-        None => format!("recording:\"{title}\""),
+        Some(artist) => format!(
+            "recording:{} AND artist:{}",
+            lucene_phrase(title),
+            lucene_phrase(artist)
+        ),
+        None => format!("recording:{}", lucene_phrase(title)),
     };
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, "musicbrainz", &key).await? {
-        value
-    } else {
-        let value = request_json(
-            client
-                .get("https://musicbrainz.org/ws/2/recording")
-                .query(&[
-                    ("fmt", "json"),
-                    ("limit", "5"),
-                    ("query", &query),
-                    ("inc", "releases+release-groups"),
-                ])
-                .header("User-Agent", user_agent),
-        )
-        .await?;
-        ProviderCache::put(
-            pool,
-            "musicbrainz",
-            &key,
-            &value,
-            Utc::now() + ChronoDuration::days(7),
-        )
-        .await?;
-        value
-    };
+    let raw = provider_cache::cached(
+        pool,
+        "musicbrainz",
+        &search_key(&query),
+        ChronoDuration::days(7),
+        || {
+            request_json(
+                client
+                    .get("https://musicbrainz.org/ws/2/recording")
+                    .query(&[
+                        ("fmt", "json"),
+                        ("limit", "5"),
+                        ("query", &query),
+                        ("inc", "releases+release-groups"),
+                    ]),
+            )
+        },
+    )
+    .await?;
     Ok(raw["recordings"]
         .as_array()
         .into_iter()
@@ -95,32 +77,23 @@ pub async fn search(
 pub async fn artist_aliases(
     pool: &SqlitePool,
     client: &Client,
-    user_agent: &str,
     artist: &str,
 ) -> Result<Vec<String>> {
-    validate_user_agent(user_agent)?;
-    let query = format!("artist:\"{artist}\"");
-    let key = format!("artist-aliases:{}", search_key(&query));
-    let raw = if let Some(value) = ProviderCache::get(pool, "musicbrainz", &key).await? {
-        value
-    } else {
-        let value = request_json(
-            client
-                .get("https://musicbrainz.org/ws/2/artist")
-                .query(&[("fmt", "json"), ("limit", "3"), ("query", &query)])
-                .header("User-Agent", user_agent),
-        )
-        .await?;
-        ProviderCache::put(
-            pool,
-            "musicbrainz",
-            &key,
-            &value,
-            Utc::now() + ChronoDuration::days(30),
-        )
-        .await?;
-        value
-    };
+    let query = format!("artist:{}", lucene_phrase(artist));
+    let raw = provider_cache::cached(
+        pool,
+        "musicbrainz",
+        &format!("artist-aliases:{}", search_key(&query)),
+        ChronoDuration::days(30),
+        || {
+            request_json(client.get("https://musicbrainz.org/ws/2/artist").query(&[
+                ("fmt", "json"),
+                ("limit", "3"),
+                ("query", &query),
+            ]))
+        },
+    )
+    .await?;
     let mut aliases = raw["artists"]
         .as_array()
         .into_iter()
@@ -233,15 +206,9 @@ fn parse_track_position(value: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-fn validate_user_agent(user_agent: &str) -> Result<()> {
-    if !(user_agent.contains('/')
-        && user_agent.contains('(')
-        && user_agent.contains(')')
-        && (user_agent.contains('@') || user_agent.contains("http")))
-    {
-        bail!("MusicBrainz contact must include an email address or website");
-    }
-    Ok(())
+/// A quoted Lucene phrase: `"` and `\` inside the term are escaped.
+fn lucene_phrase(term: &str) -> String {
+    format!("\"{}\"", term.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 async fn rate_limit() {
@@ -366,8 +333,8 @@ fn join_values(values: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::provider_cache::{ProviderCache, recording_key, search_key};
-    use chrono::Duration;
+    use crate::infrastructure::provider_cache::{put, recording_key, search_key};
+    use chrono::{Duration, Utc};
 
     async fn test_pool() -> SqlitePool {
         let dir = tempfile::tempdir().unwrap();
@@ -382,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn recording_uses_cached_response_without_network() {
         let pool = test_pool().await;
-        ProviderCache::put(
+        put(
             &pool,
             "musicbrainz",
             &recording_key("recording-1"),
@@ -426,14 +393,9 @@ mod tests {
         .await
         .unwrap();
 
-        let candidate = recording(
-            &pool,
-            &Client::new(),
-            "magpie-fi/0.1 (test@example.com)",
-            "recording-1",
-        )
-        .await
-        .unwrap();
+        let candidate = recording(&pool, &Client::new(), "recording-1")
+            .await
+            .unwrap();
         assert_eq!(candidate.title, "Song");
         assert_eq!(candidate.artist_credits.len(), 2);
         assert_eq!(candidate.artist_credits[0].join_phrase, " feat. ");
@@ -459,7 +421,7 @@ mod tests {
     async fn search_uses_cached_response_without_network() {
         let pool = test_pool().await;
         let query = "recording:\"Song\" AND artist:\"Artist\"";
-        ProviderCache::put(
+        put(
             &pool,
             "musicbrainz",
             &search_key(query),
@@ -486,20 +448,45 @@ mod tests {
         .await
         .unwrap();
 
-        let candidates = search(
-            &pool,
-            &Client::new(),
-            "magpie-fi/0.1 (test@example.com)",
-            "Song",
-            Some("Artist"),
-        )
-        .await
-        .unwrap();
+        let candidates = search(&pool, &Client::new(), "Song", Some("Artist"))
+            .await
+            .unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].recording_id.as_deref(), Some("recording-1"));
         assert_eq!(candidates[0].release_country.as_deref(), Some("GB"));
         assert_eq!(candidates[0].release_type.as_deref(), Some("Single"));
         assert!(!candidates[0].is_compilation);
         assert_eq!(candidates[0].duration_delta, Some(181.0));
+    }
+}
+
+/// True for a MusicBrainz ID (a lowercase or uppercase UUID such as
+/// `b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d`). Other catalogs' IDs must never be
+/// written into MusicBrainz tags.
+pub fn is_mbid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+#[cfg(test)]
+mod mbid_tests {
+    #[test]
+    fn only_uuids_are_musicbrainz_ids() {
+        assert!(super::is_mbid("b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"));
+        assert!(!super::is_mbid("1440857781"));
+        assert!(!super::is_mbid("discogs:123"));
+        assert!(!super::is_mbid("wikidata:Q1"));
+    }
+
+    #[test]
+    fn quotes_and_backslashes_stay_inside_the_phrase() {
+        assert_eq!(
+            super::lucene_phrase(r#"Say "Hi" \ Bye"#),
+            r#""Say \"Hi\" \\ Bye""#
+        );
     }
 }

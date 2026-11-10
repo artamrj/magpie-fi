@@ -2,7 +2,7 @@
 //! sender when a song waits in review. Reads the same tables as the web page,
 //! every few seconds; a message is only edited when its text changed.
 
-use super::{Context, api, react, send_with, texts};
+use super::{Context, api, edit_params, react, send_with, texts};
 use crate::acquire::store;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -24,24 +24,18 @@ pub async fn run(context: Arc<Context>) {
 
 async fn refresh(context: &Context) -> Result<()> {
     for open in store::open_telegram_requests(&context.state.pool).await? {
-        let Some(summary) = store::request_summary(&context.state.pool, open.id).await? else {
-            continue;
+        let summary = &open.summary;
+        let view = texts::StatusView {
+            song: open.first_song.clone(),
+            newly_filed: open.newly_filed,
         };
-        let view = view(context, open.id).await?;
-        let text = texts::status(&summary, &view);
-        let finished = texts::is_final(&summary);
+        let text = texts::status(summary, &view);
+        let finished = texts::is_final(summary);
         if open.status_text.as_deref() == Some(text.as_str()) && !finished {
             continue;
         }
         let message = i32::try_from(open.status_message_id).unwrap_or_default();
-        let params = json!({
-            "chat_id": open.chat_id,
-            "message_id": message,
-            "text": text,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": true},
-            "reply_markup": keyboard(&summary, finished),
-        });
+        let params = edit_params(open.chat_id, message, &text, keyboard(summary, finished));
         match context
             .bot
             .call::<_, Value>("editMessageText", &params)
@@ -51,15 +45,15 @@ async fn refresh(context: &Context) -> Result<()> {
             Err(error) if api::is_not_modified(&error) => {}
             Err(error) if api::is_gone(&error) => {
                 // The status message was deleted: stop updating it.
-                store::set_status_text(&context.state.pool, open.id, &text, true).await?;
+                store::set_status_text(&context.state.pool, summary.id, &text, true).await?;
                 continue;
             }
             Err(error) => {
-                tracing::warn!(%error, request = open.id, "could not update a status message");
+                tracing::warn!(%error, request = summary.id, "could not update a status message");
                 continue;
             }
         }
-        store::set_status_text(&context.state.pool, open.id, &text, finished).await?;
+        store::set_status_text(&context.state.pool, summary.id, &text, finished).await?;
         if finished && let Some(user_message) = open.user_message_id {
             let emoji = if summary.done > 0 { "👌" } else { "🤷" };
             react(
@@ -72,18 +66,6 @@ async fn refresh(context: &Context) -> Result<()> {
         }
     }
     Ok(())
-}
-
-async fn view(context: &Context, request: i64) -> Result<texts::StatusView> {
-    let songs = store::request_songs(&context.state.pool, request).await?;
-    let first = songs.first();
-    Ok(texts::StatusView {
-        song: first.map(|song| match &song.artist {
-            Some(artist) => format!("{artist} – {}", song.title),
-            None => song.title.clone(),
-        }),
-        newly_filed: songs.iter().filter(|song| song.status == "filed").count() as i64,
-    })
 }
 
 /// Stop while songs are waiting; Retry and Details when something failed.
@@ -107,27 +89,19 @@ fn keyboard(summary: &store::RequestSummary, finished: bool) -> Option<Value> {
 /// Telegram that wait in review.
 async fn ask_reviews(context: &Context) -> Result<()> {
     for question in store::unasked_reviews(&context.state.pool).await? {
-        let candidates: Vec<(i64, String, String, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
+        let candidates: Vec<Choice> = sqlx::query_as(
+            "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
              ORDER BY score DESC LIMIT 3",
-            )
-            .bind(question.track_id)
-            .fetch_all(&context.state.pool)
-            .await?;
+        )
+        .bind(question.track_id)
+        .fetch_all(&context.state.pool)
+        .await?;
         let mut rows: Vec<Vec<Value>> = candidates
             .iter()
-            .map(|(id, title, artist, album, year)| {
-                let mut label = format!("{artist} – {title}");
-                if let Some(album) = album.as_deref().filter(|album| !album.is_empty()) {
-                    label.push_str(&format!(" · {album}"));
-                }
-                if let Some(year) = year.as_deref().and_then(|year| year.get(..4)) {
-                    label.push_str(&format!(" ({year})"));
-                }
+            .map(|choice| {
                 vec![json!({
-                    "text": shorten(&label, 60),
-                    "callback_data": format!("pick:{}:{id}", question.track_id),
+                    "text": shorten(&choice.label(), 60),
+                    "callback_data": format!("pick:{}:{}", question.track_id, choice.id),
                 })]
             })
             .collect();
@@ -135,9 +109,7 @@ async fn ask_reviews(context: &Context) -> Result<()> {
             "text": "🗑 None of these",
             "callback_data": format!("drop:{}", question.track_id),
         })]);
-        if let Some(url) =
-            super::mini_app_url(&context.state.config.read().await.public_url, "review")
-        {
+        if let Some(url) = super::mini_app_url(&context.state.config.public_url, "review") {
             rows.push(vec![
                 json!({"text": "📱 Open review", "web_app": {"url": url}}),
             ]);
@@ -171,6 +143,30 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         store::set_review_message(&context.state.pool, question.wanted_id, message).await?;
     }
     Ok(())
+}
+
+/// A candidate offered as an answer button.
+#[derive(sqlx::FromRow)]
+struct Choice {
+    id: i64,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    year: Option<String>,
+}
+
+impl Choice {
+    /// "Artist – Title · Album (Year)".
+    fn label(&self) -> String {
+        let mut label = format!("{} – {}", self.artist, self.title);
+        if let Some(album) = self.album.as_deref().filter(|album| !album.is_empty()) {
+            label.push_str(&format!(" · {album}"));
+        }
+        if let Some(year) = self.year.as_deref().and_then(|year| year.get(..4)) {
+            label.push_str(&format!(" ({year})"));
+        }
+        label
+    }
 }
 
 fn shorten(text: &str, limit: usize) -> String {

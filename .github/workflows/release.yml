@@ -100,8 +100,8 @@ jobs:
           format: table
           # Block on fixable CRITICAL/HIGH findings.
           exit-code: "1"
-          # Block on problems that have a fix. Debian lists many findings that have
-          # no fixed package yet; those are reported by the weekly security audit.
+          # Block only on problems that have a fix: Debian lists many findings
+          # that have no fixed package yet.
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH

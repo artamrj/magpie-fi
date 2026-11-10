@@ -40,12 +40,13 @@ RUN set -eu; \
     install -m 755 /tmp/deno/deno /out-deno
 
 FROM mirror.gcr.io/library/rust:1.98-slim-trixie AS rust-base
+
+# SongRec's command-line client (Shazam recognition), built once. Only this
+# build needs the ALSA headers.
+FROM rust-base AS songrec
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libasound2-dev pkg-config && \
     rm -rf /var/lib/apt/lists/*
-
-# SongRec's command-line client (Shazam recognition), built once.
-FROM rust-base AS songrec
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/songrec,sharing=locked \
@@ -61,7 +62,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # A dependency-only recipe: source changes keep the cooked dependency layer.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY migrations/ ./migrations/
 COPY src/ ./src/
 RUN cargo chef prepare --recipe-path recipe.json
 

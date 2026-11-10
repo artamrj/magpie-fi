@@ -1,10 +1,10 @@
-use super::Candidate;
+use super::{Candidate, request_json};
 use crate::{
     domain::audio::AudioInfo,
-    infrastructure::provider_cache::{ProviderCache, release_key, search_key},
+    infrastructure::provider_cache::{cached, release_key, search_key},
 };
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -27,28 +27,21 @@ pub async fn search(
         current.artist.as_deref().unwrap_or_default(),
         title
     );
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, "discogs", &key).await? {
-        value
-    } else {
-        let mut request = client
-            .get("https://api.discogs.com/database/search")
-            .query(&[("type", "release"), ("track", title), ("q", query.as_str())])
-            .header("User-Agent", crate::config::USER_AGENT);
-        if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
-            request = request.bearer_auth(token);
-        }
-        let value = request_json(request).await?;
-        ProviderCache::put(
-            pool,
-            "discogs",
-            &key,
-            &value,
-            Utc::now() + Duration::days(14),
-        )
-        .await?;
-        value
-    };
+    let raw = cached(
+        pool,
+        "discogs",
+        &search_key(&query),
+        Duration::days(14),
+        || {
+            request_json(authorized(
+                client
+                    .get("https://api.discogs.com/database/search")
+                    .query(&[("type", "release"), ("track", title), ("q", query.as_str())]),
+                token,
+            ))
+        },
+    )
+    .await?;
 
     let mut out = Vec::new();
     for result in raw["results"].as_array().into_iter().flatten().take(5) {
@@ -73,25 +66,21 @@ async fn fetch_release(
     id: i64,
 ) -> Result<Value> {
     let key = release_key(&id.to_string());
-    if let Some(value) = ProviderCache::get(pool, "discogs_release", &key).await? {
-        return Ok(value);
+    cached(pool, "discogs_release", &key, Duration::days(30), || {
+        request_json(authorized(
+            client.get(format!("https://api.discogs.com/releases/{id}")),
+            token,
+        ))
+    })
+    .await
+}
+
+/// Discogs personal access tokens use their own scheme, not `Bearer`.
+fn authorized(request: RequestBuilder, token: Option<&str>) -> RequestBuilder {
+    match token.filter(|token| !token.trim().is_empty()) {
+        Some(token) => request.header("Authorization", format!("Discogs token={}", token.trim())),
+        None => request,
     }
-    let mut request = client
-        .get(format!("https://api.discogs.com/releases/{id}"))
-        .header("User-Agent", crate::config::USER_AGENT);
-    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
-        request = request.bearer_auth(token);
-    }
-    let value = request_json(request).await?;
-    ProviderCache::put(
-        pool,
-        "discogs_release",
-        &key,
-        &value,
-        Utc::now() + Duration::days(30),
-    )
-    .await?;
-    Ok(value)
 }
 
 fn candidates_from_release(
@@ -130,9 +119,7 @@ fn candidates_from_release(
         })
         .map(str::to_owned)
         .or_else(|| search_result["cover_image"].as_str().map(str::to_owned));
-    let release_id = release["id"]
-        .as_i64()
-        .map(|value| format!("discogs:{value}"));
+    // The Discogs release ID stays in raw_json (not a MusicBrainz ID).
     let tracklist = release["tracklist"].as_array();
     let mut out = Vec::new();
     if let Some(tracks) = tracklist {
@@ -156,7 +143,6 @@ fn candidates_from_release(
                 year: year.clone(),
                 label: label.clone(),
                 cover_url: cover_url.clone(),
-                release_id: release_id.clone(),
                 release_country: country.clone(),
                 release_date: year.clone(),
                 release_type: Some("Release".into()),
@@ -174,7 +160,6 @@ fn candidates_from_release(
             year,
             label,
             cover_url,
-            release_id,
             release_country: country,
             release_type: Some("Release".into()),
             raw_json: release.to_string(),
@@ -182,10 +167,6 @@ fn candidates_from_release(
         });
     }
     out
-}
-
-async fn request_json(request: RequestBuilder) -> Result<Value> {
-    Ok(request.send().await?.error_for_status()?.json().await?)
 }
 
 #[cfg(test)]
@@ -212,5 +193,14 @@ mod tests {
         assert_eq!(candidates[0].provider, "discogs");
         assert_eq!(candidates[0].title, "Song");
         assert_eq!(candidates[0].release_country.as_deref(), Some("US"));
+        assert!(candidates[0].release_id.is_none());
+    }
+
+    #[test]
+    fn personal_tokens_use_the_discogs_scheme() {
+        let request = authorized(Client::new().get("https://api.discogs.com/"), Some("abc"))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["Authorization"], "Discogs token=abc");
     }
 }

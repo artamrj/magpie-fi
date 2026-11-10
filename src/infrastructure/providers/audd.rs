@@ -1,7 +1,10 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, fingerprint_key};
-use anyhow::{Context, Result, bail};
-use chrono::{Duration, Utc};
+use super::{Candidate, request_json};
+use crate::infrastructure::{
+    process,
+    provider_cache::{cached, fingerprint_key},
+};
+use anyhow::{Result, bail};
+use chrono::Duration;
 use reqwest::{Client, multipart};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -17,9 +20,7 @@ pub async fn recognize(
     duration: f64,
 ) -> Result<Vec<Candidate>> {
     let cache_key = fingerprint_key(fingerprint);
-    let raw = if let Some(value) = ProviderCache::get(pool, "audd", &cache_key).await? {
-        value
-    } else {
+    let raw = cached(pool, "audd", &cache_key, Duration::days(90), || async {
         let sample = audio_sample(path, duration).await?;
         let part = multipart::Part::bytes(sample)
             .file_name("recognition-sample.wav")
@@ -28,14 +29,7 @@ pub async fn recognize(
             .text("api_token", token.to_owned())
             .text("return", "musicbrainz,apple_music,spotify,deezer")
             .part("file", part);
-        let value = client
-            .post("https://api.audd.io/")
-            .multipart(form)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        let value = request_json(client.post("https://api.audd.io/").multipart(form)).await?;
         if value["status"] == "error" {
             bail!(
                 "AudD API error: {}",
@@ -44,16 +38,9 @@ pub async fn recognize(
                     .unwrap_or("unknown error")
             );
         }
-        ProviderCache::put(
-            pool,
-            "audd",
-            &cache_key,
-            &value,
-            Utc::now() + Duration::days(90),
-        )
-        .await?;
-        value
-    };
+        Ok(value)
+    })
+    .await?;
     Ok(parse_result(&raw).into_iter().collect())
 }
 
@@ -63,17 +50,16 @@ async fn audio_sample(path: &Path, duration: f64) -> Result<Vec<u8>> {
     } else {
         0.0
     };
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .args(["-v", "error", "-nostdin", "-ss"])
         .arg(format!("{start:.3}"))
         .arg("-i")
         .arg(path)
         .args([
             "-map", "0:a:0", "-t", "20", "-ac", "1", "-ar", "16000", "-f", "wav", "-",
-        ])
-        .output()
-        .await
-        .context("could not create AudD recognition sample with ffmpeg")?;
+        ]);
+    let output = process::run(command, std::time::Duration::from_secs(120)).await?;
     if !output.status.success() || output.stdout.is_empty() {
         bail!(
             "could not create AudD sample: {}",

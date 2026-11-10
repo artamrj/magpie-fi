@@ -16,8 +16,6 @@ export type Setup = {
 };
 /** Who is using the page (GET /api/me). */
 export type Me = {
-  user_id: number;
-  name?: string;
   role: "owner" | "guest";
   via: "telegram" | "session" | "local";
 };
@@ -34,10 +32,8 @@ export type MusicRequest = {
   url: string;
   kind: "track" | "album" | "playlist" | "upload";
   title?: string;
-  owner?: string;
   status: "reading" | "ready" | "failed";
   error?: string;
-  created_at: string;
   total: number;
   done: number;
   working: number;
@@ -51,8 +47,6 @@ export type WantedSong = {
   artist?: string;
   status: string;
   error?: string;
-  library_path?: string;
-  attempts: number;
 };
 export type Candidate = {
   id: number;
@@ -74,32 +68,22 @@ export type Candidate = {
   isrc?: string;
   release_date?: string;
   cover_url?: string;
-  artwork_candidates?: ArtworkCandidate[];
-  artwork_status?: "searching" | "verified" | "retryable_error" | "cover_required";
+  artwork_status: ArtworkStatus;
   artwork_message?: string;
   score_breakdown?: string;
   score: number;
 };
+export type ArtworkStatus = "searching" | "verified" | "retryable_error" | "cover_required";
 export type ArtistCredit = {
   name: string;
   join_phrase: string;
   musicbrainz_id?: string;
-};
-export type ArtworkCandidate = {
-  provider: string;
-  url: string;
-  user_confirmed: boolean;
-  release_id?: string;
-  isrc?: string;
-  album?: string;
-  artist?: string;
 };
 export type TrackStatus =
   | "new"
   | "selected"
   | "needs_review"
   | "review"
-  | "applied"
   | "failed"
   | "corrupt"
   | "provider_error"
@@ -107,7 +91,7 @@ export type TrackStatus =
   | "duplicate"
   | "verified"
   | "retryable_error";
-export type TrackStage = "discovered" | "selected" | "ready" | "review" | "skipped" | "failed";
+export type TrackStage = "discovered" | "ready" | "review" | "skipped" | "failed";
 export type Track = {
   id: number;
   filename: string;
@@ -126,10 +110,8 @@ export type Track = {
   is_missing: boolean;
   candidates: Candidate[];
 };
-export type TrackPage = { items: Track[]; total: number };
 export type AutoApproveResult = {
   approved: number;
-  remaining: number;
   low_confidence: number;
   unavailable: number;
 };
@@ -141,7 +123,4 @@ export type Workflow = {
   current: number;
   total: number;
   processed: number;
-  matched: number;
-  unmatched: number;
-  failed: number;
 };

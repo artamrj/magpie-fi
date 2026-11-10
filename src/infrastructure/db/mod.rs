@@ -1,4 +1,3 @@
-use crate::config::Config;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use sqlx::{
@@ -11,155 +10,8 @@ const DAILY_CACHE_CLEANUP_KEY: &str = "last_disposable_cache_cleanup";
 const MEDIA_CACHE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+pub mod candidates;
 pub mod tracks;
-
-/// Released pre-consolidation schema used only to build legacy fixtures in tests.
-#[cfg(test)]
-const SCHEMA: &str = r#"
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS maintenance (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tracks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  path TEXT NOT NULL UNIQUE,
-  output_path TEXT,
-  filename TEXT NOT NULL,
-  format TEXT,
-  bitrate INTEGER,
-  duration REAL,
-  current_title TEXT,
-  current_artist TEXT,
-  current_album TEXT,
-  current_album_artist TEXT,
-  current_track_number INTEGER,
-  file_mtime INTEGER,
-  file_size INTEGER,
-  content_fingerprint TEXT,
-  selected_candidate_id INTEGER,
-  status TEXT NOT NULL DEFAULT 'new',
-  error TEXT,
-  is_missing INTEGER NOT NULL DEFAULT 0,
-  first_seen_at TEXT NOT NULL,
-  last_seen_at TEXT NOT NULL,
-  last_scanned_at TEXT NOT NULL,
-  last_applied_at TEXT,
-  last_apply_run_id TEXT,
-  stage TEXT NOT NULL DEFAULT 'discovered',
-  stage_message TEXT,
-  retry_count INTEGER NOT NULL DEFAULT 0,
-  next_retry_at TEXT,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS candidates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  provider TEXT NOT NULL,
-  title TEXT,
-  artist TEXT,
-  album TEXT,
-  album_artist TEXT,
-  track_number INTEGER,
-  track_total INTEGER,
-  disc_number INTEGER,
-  disc_total INTEGER,
-  year TEXT,
-  genre TEXT,
-  composer TEXT,
-  label TEXT,
-  isrc TEXT,
-  cover_url TEXT,
-  musicbrainz_recording_id TEXT,
-  musicbrainz_release_id TEXT,
-  musicbrainz_artist_id TEXT,
-  musicbrainz_album_artist_id TEXT,
-  score REAL NOT NULL,
-  raw_json TEXT,
-  release_country TEXT,
-  release_date TEXT,
-  release_type TEXT,
-  release_secondary_types TEXT,
-  is_compilation INTEGER NOT NULL DEFAULT 0,
-  duration_delta REAL,
-  score_breakdown TEXT
-);
-
-CREATE TABLE IF NOT EXISTS candidate_sources (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  candidate_id INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-  provider TEXT NOT NULL,
-  confidence REAL,
-  reason_json TEXT,
-  raw_json TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS provider_cache (
-  provider TEXT NOT NULL,
-  cache_key TEXT NOT NULL,
-  response_json TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  PRIMARY KEY(provider, cache_key)
-);
-
-CREATE TABLE IF NOT EXISTS fingerprint_cache (
-  path TEXT PRIMARY KEY,
-  file_size INTEGER NOT NULL,
-  file_mtime INTEGER NOT NULL,
-  fingerprint TEXT NOT NULL,
-  duration REAL NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS replaygain_cache (
-  path TEXT PRIMARY KEY,
-  file_size INTEGER NOT NULL,
-  file_mtime_ns INTEGER NOT NULL,
-  track_gain_db REAL NOT NULL,
-  track_peak REAL NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS artwork_overrides (
-  path TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  artist TEXT NOT NULL,
-  cover_url TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS integrity_cache (
-  path TEXT PRIMARY KEY,
-  file_size INTEGER NOT NULL,
-  file_mtime_ns INTEGER NOT NULL,
-  is_healthy INTEGER NOT NULL,
-  diagnostic TEXT,
-  checked_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS candidates_track_id ON candidates(track_id);
-CREATE INDEX IF NOT EXISTS tracks_stage ON tracks(stage);
-CREATE INDEX IF NOT EXISTS candidate_sources_candidate_id ON candidate_sources(candidate_id);
-"#;
-
-const PRE_CONSOLIDATION_MIGRATIONS: &[(i64, &str)] = &[
-    (1, "init"),
-    (2, "v020"),
-    (3, "v030"),
-    (4, "previews"),
-    (5, "fingerprint cache"),
-    (6, "candidate release metadata"),
-    (7, "candidate sources"),
-];
 
 pub async fn connect(path: &str) -> Result<SqlitePool> {
     if let Some(parent) = Path::new(path).parent() {
@@ -177,74 +29,12 @@ pub async fn connect(path: &str) -> Result<SqlitePool> {
         .acquire_timeout(Duration::from_secs(30))
         .connect_with(options)
         .await?;
-    adopt_pre_consolidation_migration_history(&pool).await?;
     MIGRATOR
         .run(&pool)
         .await
         .context("database migration failed")?;
     restrict_database_permissions(path).await?;
     Ok(pool)
-}
-
-/// Older releases used migrations 1 through 7 before the schema was
-/// consolidated into the current idempotent baseline. SQLx correctly refuses
-/// to mix those two histories, so recognize that exact released lineage and
-/// let the baseline adopt its already-compatible schema. Unknown histories are
-/// deliberately left untouched for SQLx to reject.
-async fn adopt_pre_consolidation_migration_history(pool: &SqlitePool) -> Result<()> {
-    let migration_table_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if migration_table_exists == 0 {
-        return Ok(());
-    }
-
-    let applied: Vec<(i64, String, i64)> = sqlx::query_as(
-        "SELECT version, description, success FROM _sqlx_migrations ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await?;
-    let is_known_history = applied.len() == PRE_CONSOLIDATION_MIGRATIONS.len()
-        && applied.iter().zip(PRE_CONSOLIDATION_MIGRATIONS).all(
-            |((version, description, success), (expected_version, expected_description))| {
-                version == expected_version && description == expected_description && *success == 1
-            },
-        );
-    if !is_known_history {
-        return Ok(());
-    }
-
-    for required_table in [
-        "settings",
-        "tracks",
-        "candidates",
-        "provider_cache",
-        "fingerprint_cache",
-        "candidate_sources",
-    ] {
-        let exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
-                .bind(required_table)
-                .fetch_one(pool)
-                .await?;
-        if exists == 0 {
-            anyhow::bail!(
-                "legacy migration history is present but required table {required_table} is missing"
-            );
-        }
-    }
-
-    let mut transaction = pool.begin().await?;
-    sqlx::query("DELETE FROM _sqlx_migrations")
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
-    tracing::info!(
-        "adopted pre-consolidation database migration history without deleting user data"
-    );
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -262,18 +52,29 @@ async fn restrict_database_permissions(_path: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn cleanup(pool: &SqlitePool, _config: &Config) -> Result<()> {
+/// Startup cleanup: work interrupted by a restart is marked failed and expired
+/// provider responses are removed.
+pub async fn cleanup(pool: &SqlitePool) -> Result<()> {
     sqlx::query("UPDATE tracks SET stage='failed',status='provider_error',stage_message='Interrupted by restart',error=COALESCE(error,'Interrupted by backend restart') WHERE status='processing'")
         .execute(pool).await?;
-    sqlx::query("DELETE FROM provider_cache WHERE expires_at < datetime('now')")
-        .execute(pool)
-        .await?;
+    delete_expired_provider_cache(pool).await?;
     Ok(())
 }
 
-/// Removes reproducible web-provider responses once per local calendar day and
-/// limits reusable media-analysis results to 100 MiB. Workflow
-/// data live in separate tables and are intentionally preserved.
+/// Provider rows store `expires_at` as RFC 3339 UTC, so they compare as text
+/// against an RFC 3339 "now".
+async fn delete_expired_provider_cache(pool: &SqlitePool) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM provider_cache WHERE expires_at <= ?")
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// Once per local calendar day: drops expired provider responses and keeps
+/// media-analysis caches under 100 MiB. Workflow data is never touched.
 pub async fn run_daily_cache_cleanup_if_due(pool: &SqlitePool) -> Result<bool> {
     let last_cleanup: Option<String> =
         sqlx::query_scalar("SELECT value FROM maintenance WHERE key=?")
@@ -290,10 +91,7 @@ pub async fn run_daily_cache_cleanup_if_due(pool: &SqlitePool) -> Result<bool> {
         return Ok(false);
     }
 
-    let provider_rows_removed = sqlx::query("DELETE FROM provider_cache")
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let provider_rows_removed = delete_expired_provider_cache(pool).await?;
     let media_rows_removed =
         enforce_media_cache_limit_with_limit(pool, MEDIA_CACHE_LIMIT_BYTES).await?;
     sqlx::query(
@@ -318,8 +116,8 @@ pub async fn run_daily_cache_cleanup_if_due(pool: &SqlitePool) -> Result<bool> {
     Ok(true)
 }
 
-/// Enforces the combined 100 MiB limit independently of the midnight provider
-/// cache purge, so a large scan cannot leave analysis caches oversized all day.
+/// Enforces the combined 100 MiB limit between the daily runs, so a large
+/// scan cannot leave analysis caches oversized all day.
 pub async fn enforce_media_cache_limit(pool: &SqlitePool) -> Result<u64> {
     let removed = enforce_media_cache_limit_with_limit(pool, MEDIA_CACHE_LIMIT_BYTES).await?;
     if removed > 0 {
@@ -337,12 +135,16 @@ async fn compact(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Removes the oldest media-analysis rows (across all cache tables) until the
+/// estimated total size fits `limit_bytes`.
 async fn enforce_media_cache_limit_with_limit(pool: &SqlitePool, limit_bytes: u64) -> Result<u64> {
-    let entries: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT cache_kind,path,estimated_bytes FROM (
-           SELECT 'fingerprint' AS cache_kind,path,updated_at AS cached_at,
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "CREATE TEMP TABLE media_cache_victims AS
+         WITH entries AS (
+           SELECT 'fingerprint' AS kind,path,updated_at AS cached_at,
              length(CAST(path AS BLOB)) + length(CAST(fingerprint AS BLOB))
-             + length(CAST(updated_at AS BLOB)) + 32 AS estimated_bytes
+             + length(CAST(updated_at AS BLOB)) + 32 AS bytes
            FROM fingerprint_cache
            UNION ALL
            SELECT 'integrity',path,checked_at,
@@ -350,42 +152,41 @@ async fn enforce_media_cache_limit_with_limit(pool: &SqlitePool, limit_bytes: u6
              + length(CAST(checked_at AS BLOB)) + 40
            FROM integrity_cache
            UNION ALL
-           SELECT 'replaygain',path,updated_at,
-             length(CAST(path AS BLOB)) + length(CAST(updated_at AS BLOB)) + 48
-           FROM replaygain_cache
-           UNION ALL
            SELECT 'content_hash',path,updated_at,
              length(CAST(path AS BLOB)) + length(CAST(sha256 AS BLOB))
              + length(CAST(updated_at AS BLOB)) + 32
            FROM content_hash_cache
-         ) ORDER BY cached_at ASC",
+         ),
+         ranked AS (
+           SELECT kind,path,
+             SUM(bytes) OVER () AS total,
+             COALESCE(SUM(bytes) OVER (ORDER BY cached_at,kind,path
+               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS older
+           FROM entries
+         )
+         SELECT kind,path FROM ranked WHERE total - older > ?",
     )
-    .fetch_all(pool)
+    .bind(i64::try_from(limit_bytes).unwrap_or(i64::MAX))
+    .execute(&mut *transaction)
     .await?;
-    let mut total_bytes = entries
-        .iter()
-        .map(|(_, _, bytes)| (*bytes).max(0) as u64)
-        .sum::<u64>();
     let mut removed = 0;
-
-    for (cache_kind, path, bytes) in entries {
-        if total_bytes <= limit_bytes {
-            break;
-        }
-        let query = match cache_kind.as_str() {
-            "fingerprint" => "DELETE FROM fingerprint_cache WHERE path=?",
-            "integrity" => "DELETE FROM integrity_cache WHERE path=?",
-            "replaygain" => "DELETE FROM replaygain_cache WHERE path=?",
-            "content_hash" => "DELETE FROM content_hash_cache WHERE path=?",
-            _ => continue,
-        };
-        removed += sqlx::query(query)
-            .bind(path)
-            .execute(pool)
-            .await?
-            .rows_affected();
-        total_bytes = total_bytes.saturating_sub(bytes.max(0) as u64);
+    for (table, kind) in [
+        ("fingerprint_cache", "fingerprint"),
+        ("integrity_cache", "integrity"),
+        ("content_hash_cache", "content_hash"),
+    ] {
+        removed += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE path IN (SELECT path FROM media_cache_victims WHERE kind=?)"
+        )))
+        .bind(kind)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
     }
+    sqlx::query("DROP TABLE media_cache_victims")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(removed)
 }
 
@@ -401,48 +202,46 @@ mod tests {
         pool
     }
 
-    #[tokio::test]
-    async fn cleanup_removes_only_expired_provider_cache_rows() {
-        let pool = test_pool().await;
-        sqlx::query("INSERT INTO provider_cache(provider,cache_key,response_json,expires_at) VALUES('musicbrainz','expired','{}',datetime('now','-1 day'))")
-            .execute(&pool)
+    async fn insert_provider_row(pool: &SqlitePool, key: &str, expires_at: DateTime<Utc>) {
+        sqlx::query("INSERT INTO provider_cache(provider,cache_key,response_json,expires_at) VALUES('musicbrainz',?,'{}',?)")
+            .bind(key)
+            .bind(expires_at.to_rfc3339())
+            .execute(pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO provider_cache(provider,cache_key,response_json,expires_at) VALUES('musicbrainz','fresh','{}',datetime('now','+1 day'))")
-            .execute(&pool)
+    }
+
+    async fn provider_keys(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT cache_key FROM provider_cache ORDER BY cache_key")
+            .fetch_all(pool)
             .await
-            .unwrap();
-
-        cleanup(&pool, &Config::default()).await.unwrap();
-
-        let keys: Vec<String> =
-            sqlx::query_scalar("SELECT cache_key FROM provider_cache ORDER BY cache_key")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(keys, vec!["fresh"]);
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn daily_cleanup_preserves_media_analysis_caches() {
+    async fn cleanup_removes_only_expired_provider_cache_rows() {
         let pool = test_pool().await;
-        sqlx::query("INSERT INTO provider_cache(provider,cache_key,response_json,expires_at) VALUES('artwork-url','cover','{}',datetime('now','+30 days'))")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Same day as now: a `datetime('now')` comparison got these wrong.
+        insert_provider_row(&pool, "expired", Utc::now() - chrono::Duration::minutes(1)).await;
+        insert_provider_row(&pool, "fresh", Utc::now() + chrono::Duration::minutes(1)).await;
+
+        cleanup(&pool).await.unwrap();
+
+        assert_eq!(provider_keys(&pool).await, vec!["fresh"]);
+    }
+
+    #[tokio::test]
+    async fn daily_cleanup_keeps_fresh_provider_rows_and_media_caches() {
+        let pool = test_pool().await;
+        insert_provider_row(&pool, "expired", Utc::now() - chrono::Duration::days(1)).await;
+        insert_provider_row(&pool, "fresh", Utc::now() + chrono::Duration::days(30)).await;
         sqlx::query("INSERT INTO fingerprint_cache(path,file_size,file_mtime,fingerprint,duration,updated_at) VALUES('/music/song.mp3',1,2,'fingerprint',3.0,datetime('now'))")
             .execute(&pool)
             .await
             .unwrap();
 
         assert!(run_daily_cache_cleanup_if_due(&pool).await.unwrap());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_cache")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            0
-        );
+        assert_eq!(provider_keys(&pool).await, vec!["fresh"]);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM fingerprint_cache")
                 .fetch_one(&pool)
@@ -456,19 +255,10 @@ mod tests {
     async fn daily_cleanup_does_not_run_twice_within_one_day() {
         let pool = test_pool().await;
         assert!(run_daily_cache_cleanup_if_due(&pool).await.unwrap());
-        sqlx::query("INSERT INTO provider_cache(provider,cache_key,response_json,expires_at) VALUES('musicbrainz','fresh','{}',datetime('now','+7 days'))")
-            .execute(&pool)
-            .await
-            .unwrap();
+        insert_provider_row(&pool, "expired", Utc::now() - chrono::Duration::days(1)).await;
 
         assert!(!run_daily_cache_cleanup_if_due(&pool).await.unwrap());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_cache")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            1
-        );
+        assert_eq!(provider_keys(&pool).await, vec!["expired"]);
     }
 
     #[tokio::test]
@@ -505,6 +295,13 @@ mod tests {
                 .unwrap(),
             1
         );
+        // Under the limit nothing more goes.
+        assert_eq!(
+            enforce_media_cache_limit_with_limit(&pool, 180)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -515,117 +312,33 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reference_files'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='content_hash_cache'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_database_is_adopted_by_the_migrator() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("legacy.sqlite");
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let legacy = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        sqlx::raw_sql(SCHEMA).execute(&legacy).await.unwrap();
-        legacy.close().await;
-
-        let pool = connect(path.to_str().unwrap()).await.unwrap();
-        let versions: Vec<i64> =
-            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tracks")
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        for (table, expected) in [
+            ("reference_files", 0),
+            ("candidate_sources", 0),
+            ("replaygain_cache", 0),
+            ("content_hash_cache", 1),
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                )
+                .bind(table)
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn pre_consolidation_migration_history_is_adopted_without_data_loss() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("pre-consolidation.sqlite");
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let legacy = SqlitePoolOptions::new().connect(&url).await.unwrap();
-        sqlx::raw_sql(SCHEMA).execute(&legacy).await.unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE _sqlx_migrations (
-                version BIGINT PRIMARY KEY,
-                description TEXT NOT NULL,
-                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                success BOOLEAN NOT NULL,
-                checksum BLOB NOT NULL,
-                execution_time BIGINT NOT NULL
-             );
-             INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time)
-             VALUES
-                (1,'init',1,X'00',0),
-                (2,'v020',1,X'00',0),
-                (3,'v030',1,X'00',0),
-                (4,'previews',1,X'00',0),
-                (5,'fingerprint cache',1,X'00',0),
-                (6,'candidate release metadata',1,X'00',0),
-                (7,'candidate sources',1,X'00',0);",
+                expected,
+                "{table}"
+            );
+        }
+        let dropped_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('tracks')
+             WHERE name IN ('last_applied_at','last_apply_run_id','retry_count','next_retry_at')",
         )
-        .execute(&legacy)
+        .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
-             last_scanned_at,stage) VALUES('/input/keep.mp3','keep.mp3','ready',0,
-             'now','now','now','ready')",
-        )
-        .execute(&legacy)
-        .await
-        .unwrap();
-        legacy.close().await;
-
-        let pool = connect(path.to_str().unwrap()).await.unwrap();
-        let versions: Vec<i64> =
-            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM tracks WHERE path='/input/keep.mp3'"
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type='table' AND name='content_hash_cache'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
+        assert_eq!(dropped_columns, 0);
     }
 
     #[tokio::test]

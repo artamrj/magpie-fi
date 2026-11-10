@@ -1,7 +1,8 @@
 use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::request_json;
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -41,80 +42,69 @@ pub async fn search(
     terms.dedup();
     terms.retain(|term| !term.trim().is_empty());
     let mut out = Vec::new();
-    for term in terms {
-        out.extend(search_term(pool, client, &term).await?);
-    }
+    // The same song turns up for several search terms; keep it once.
     let mut seen = std::collections::HashSet::new();
-    out.retain(|candidate| seen.insert(candidate.recording_id.clone()));
+    for term in terms {
+        let raw = search_term(pool, client, &term).await?;
+        out.extend(
+            raw["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|value| seen.insert(value["trackId"].as_i64()))
+                .filter_map(parse_result),
+        );
+    }
     Ok(out)
 }
 
-async fn search_term(pool: &SqlitePool, client: &Client, term: &str) -> Result<Vec<Candidate>> {
-    let key = search_key(term);
-    let raw = if let Some(value) = ProviderCache::get(pool, "itunes", &key).await? {
-        value
-    } else {
-        let value = client
-            .get("https://itunes.apple.com/search")
-            .query(&[
-                ("term", term),
-                ("media", "music"),
-                ("entity", "song"),
-                ("limit", "10"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        ProviderCache::put(pool, "itunes", &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
-    Ok(parse_results(&raw))
+async fn search_term(pool: &SqlitePool, client: &Client, term: &str) -> Result<Value> {
+    cached(pool, "itunes", &search_key(term), Duration::days(7), || {
+        request_json(client.get("https://itunes.apple.com/search").query(&[
+            ("term", term),
+            ("media", "music"),
+            ("entity", "song"),
+            ("limit", "10"),
+        ]))
+    })
+    .await
 }
 
-fn parse_results(raw: &Value) -> Vec<Candidate> {
-    raw["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|value| {
-            let album = value["collectionName"].as_str().map(str::to_owned);
-            let track_total = value["trackCount"].as_i64();
-            let release_type = infer_release_type(album.as_deref(), track_total);
-            Some(Candidate {
-                provider: "itunes".into(),
-                title: value["trackName"].as_str()?.to_owned(),
-                artist: value["artistName"].as_str()?.to_owned(),
-                album,
-                album_artist: value["collectionArtistName"].as_str().map(str::to_owned),
-                track_number: value["trackNumber"].as_i64(),
-                track_total,
-                disc_number: value["discNumber"].as_i64(),
-                disc_total: value["discCount"].as_i64(),
-                year: value["releaseDate"]
-                    .as_str()
-                    .and_then(|date| date.get(..4))
-                    .map(str::to_owned),
-                release_date: value["releaseDate"]
-                    .as_str()
-                    .and_then(|date| date.get(..10))
-                    .map(str::to_owned),
-                genre: value["primaryGenreName"].as_str().map(str::to_owned),
-                cover_url: value["artworkUrl100"]
-                    .as_str()
-                    .map(|url| url.replace("100x100bb", "1200x1200bb")),
-                duration_delta: value["trackTimeMillis"]
-                    .as_f64()
-                    .map(|value| value / 1000.0),
-                recording_id: value["trackId"].as_i64().map(|id| id.to_string()),
-                release_id: value["collectionId"].as_i64().map(|id| id.to_string()),
-                release_type,
-                raw_json: value.to_string(),
-                ..Default::default()
-            })
-        })
-        .collect()
+/// Apple's track and collection IDs stay in `raw_json`: the candidate's
+/// recording and release IDs are MusicBrainz IDs.
+fn parse_result(value: &Value) -> Option<Candidate> {
+    let album = value["collectionName"].as_str().map(str::to_owned);
+    let track_total = value["trackCount"].as_i64();
+    let release_type = infer_release_type(album.as_deref(), track_total);
+    Some(Candidate {
+        provider: "itunes".into(),
+        title: value["trackName"].as_str()?.to_owned(),
+        artist: value["artistName"].as_str()?.to_owned(),
+        album,
+        album_artist: value["collectionArtistName"].as_str().map(str::to_owned),
+        track_number: value["trackNumber"].as_i64(),
+        track_total,
+        disc_number: value["discNumber"].as_i64(),
+        disc_total: value["discCount"].as_i64(),
+        year: value["releaseDate"]
+            .as_str()
+            .and_then(|date| date.get(..4))
+            .map(str::to_owned),
+        release_date: value["releaseDate"]
+            .as_str()
+            .and_then(|date| date.get(..10))
+            .map(str::to_owned),
+        genre: value["primaryGenreName"].as_str().map(str::to_owned),
+        cover_url: value["artworkUrl100"]
+            .as_str()
+            .map(|url| url.replace("100x100bb", "1200x1200bb")),
+        duration_delta: value["trackTimeMillis"]
+            .as_f64()
+            .map(|value| value / 1000.0),
+        release_type,
+        raw_json: value.to_string(),
+        ..Default::default()
+    })
 }
 
 fn infer_release_type(album: Option<&str>, track_total: Option<i64>) -> Option<String> {
@@ -134,7 +124,7 @@ mod tests {
 
     #[test]
     fn parses_international_catalog_result() {
-        let candidates = parse_results(&serde_json::json!({"results": [{
+        let candidate = parse_result(&serde_json::json!({
             "trackId": 1,
             "collectionId": 2,
             "trackName": "Khaar",
@@ -146,16 +136,19 @@ mod tests {
             "artworkUrl100": "https://example.test/100x100bb.jpg",
             "trackNumber": 1,
             "trackCount": 1
-        }]}));
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].artist, "Amir Tataloo");
-        assert_eq!(candidates[0].release_date.as_deref(), Some("2019-06-23"));
-        assert_eq!(candidates[0].duration_delta, Some(427.076));
-        assert_eq!(candidates[0].release_type.as_deref(), Some("single"));
+        }))
+        .unwrap();
+        assert_eq!(candidate.artist, "Amir Tataloo");
+        assert_eq!(candidate.release_date.as_deref(), Some("2019-06-23"));
+        assert_eq!(candidate.duration_delta, Some(427.076));
+        assert_eq!(candidate.release_type.as_deref(), Some("single"));
         assert_eq!(
-            candidates[0].cover_url.as_deref(),
+            candidate.cover_url.as_deref(),
             Some("https://example.test/1200x1200bb.jpg")
         );
+        // Apple IDs are not MusicBrainz IDs.
+        assert!(candidate.recording_id.is_none() && candidate.release_id.is_none());
+        assert!(candidate.raw_json.contains("\"trackId\":1"));
     }
 
     #[test]

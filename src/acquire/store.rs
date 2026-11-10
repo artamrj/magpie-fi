@@ -7,8 +7,8 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::path::Path;
 
-/// Waits before the 2nd, 3rd and last attempt (from sync-me-maybe).
-const RETRY_DELAYS_SECONDS: [i64; 3] = [30, 120, 600];
+/// Waits before the 2nd and the 3rd (last) attempt.
+const RETRY_DELAYS_SECONDS: [i64; 2] = [30, 120];
 pub const MAX_ATTEMPTS: i64 = 3;
 
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -226,7 +226,7 @@ pub async fn mark_attempt_failed(
     let attempts = row.attempts + 1;
     let will_retry = retry && attempts < MAX_ATTEMPTS;
     let not_before = will_retry.then(|| {
-        let delay = RETRY_DELAYS_SECONDS[usize::try_from(attempts - 1).unwrap_or(0).min(2)];
+        let delay = RETRY_DELAYS_SECONDS[usize::try_from(attempts - 1).unwrap_or(0).min(1)];
         (Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
     });
     sqlx::query(
@@ -407,23 +407,35 @@ pub async fn stop_request(pool: &SqlitePool, request_id: i64) -> Result<u64> {
     .rows_affected())
 }
 
+/// A Telegram request whose status message is not final yet, with what the
+/// message shows.
 #[derive(Debug, sqlx::FromRow)]
 pub struct OpenStatus {
-    pub id: i64,
+    #[sqlx(flatten)]
+    pub summary: RequestSummary,
     pub chat_id: i64,
     pub status_message_id: i64,
     pub user_message_id: Option<i64>,
     pub status_text: Option<String>,
+    /// "Artist – Title" of the first song.
+    pub first_song: Option<String>,
+    /// Songs filed now (not counting ones that were already in the library).
+    pub newly_filed: i64,
 }
 
-/// Telegram requests whose status message is not final yet.
+/// Every open Telegram request with its progress, in one query.
 pub async fn open_telegram_requests(pool: &SqlitePool) -> Result<Vec<OpenStatus>> {
-    Ok(sqlx::query_as(
-        "SELECT id,chat_id,status_message_id,user_message_id,status_text FROM requests
-         WHERE chat_id IS NOT NULL AND status_message_id IS NOT NULL AND closed=0",
-    )
-    .fetch_all(pool)
-    .await?)
+    let sql = summary_sql(
+        &format!(
+            ",r.chat_id,r.status_message_id,r.user_message_id,r.status_text,
+              {FIRST_SONG} AS first_song,
+              coalesce(sum(w.status='filed'),0) AS newly_filed"
+        ),
+        "r.chat_id IS NOT NULL AND r.status_message_id IS NOT NULL AND r.closed=0",
+    );
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?)
 }
 
 pub async fn set_status_text(
@@ -513,11 +525,10 @@ pub struct RequestSummary {
     pub id: i64,
     pub url: String,
     pub kind: String,
+    /// The request's own title, or "Artist – Title" of its first song.
     pub title: Option<String>,
-    pub owner: Option<String>,
     pub status: String,
     pub error: Option<String>,
-    pub created_at: String,
     pub total: i64,
     /// Filed now or already in the library.
     pub done: i64,
@@ -526,34 +537,37 @@ pub struct RequestSummary {
     pub failed: i64,
 }
 
-pub async fn list_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<RequestSummary>> {
-    summaries(pool, None, limit).await
-}
+/// "Artist – Title" (or just the title) of a request's first song.
+const FIRST_SONG: &str = "(SELECT CASE WHEN coalesce(f.artist,'')='' THEN f.title
+       ELSE f.artist||' – '||f.title END
+     FROM wanted f WHERE f.request_id=r.id ORDER BY f.position LIMIT 1)";
 
-pub async fn request_summary(pool: &SqlitePool, id: i64) -> Result<Option<RequestSummary>> {
-    Ok(summaries(pool, Some(id), 1).await?.into_iter().next())
-}
-
-async fn summaries(pool: &SqlitePool, id: Option<i64>, limit: i64) -> Result<Vec<RequestSummary>> {
-    Ok(sqlx::query_as(
-        "SELECT r.id,r.url,r.kind,r.title,r.owner,r.status,r.error,r.created_at,
+/// The [`RequestSummary`] query for the requests matching `filter`, with
+/// `extra` columns after the summary's own.
+fn summary_sql(extra: &str, filter: &str) -> String {
+    format!(
+        "SELECT r.id,r.url,r.kind,coalesce(r.title,{FIRST_SONG}) AS title,r.status,r.error,
            count(w.id) AS total,
            coalesce(sum(w.status IN ('filed','in_library')),0) AS done,
            coalesce(sum(w.status IN ('pending','downloading')
              OR (w.status='identifying' AND coalesce(t.stage,'') NOT IN ('review','failed'))),0) AS working,
            coalesce(sum(w.status='identifying' AND t.stage IN ('review','failed')),0) AS review,
            coalesce(sum(w.status='failed'),0) AS failed
+           {extra}
          FROM requests r
          LEFT JOIN wanted w ON w.request_id=r.id
          LEFT JOIN tracks t ON t.path=w.staging_path AND w.status='identifying'
-         WHERE ? IS NULL OR r.id=?
-         GROUP BY r.id ORDER BY r.id DESC LIMIT ?",
+         WHERE {filter}
+         GROUP BY r.id ORDER BY r.id DESC"
     )
-    .bind(id)
-    .bind(id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?)
+}
+
+pub async fn list_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<RequestSummary>> {
+    let sql = summary_sql("", "1") + " LIMIT ?";
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -563,8 +577,6 @@ pub struct WantedView {
     pub artist: Option<String>,
     pub status: String,
     pub error: Option<String>,
-    pub library_path: Option<String>,
-    pub attempts: i64,
 }
 
 pub async fn request_songs(pool: &SqlitePool, request_id: i64) -> Result<Vec<WantedView>> {
@@ -573,8 +585,7 @@ pub async fn request_songs(pool: &SqlitePool, request_id: i64) -> Result<Vec<Wan
            CASE WHEN w.status='identifying' AND t.stage='review' THEN 'review'
                 WHEN w.status='identifying' AND t.stage='failed' THEN 'review'
                 ELSE w.status END AS status,
-           coalesce(w.error, CASE WHEN w.status='identifying' THEN t.stage_message END) AS error,
-           w.library_path,w.attempts
+           coalesce(w.error, CASE WHEN w.status='identifying' THEN t.stage_message END) AS error
          FROM wanted w LEFT JOIN tracks t ON t.path=w.staging_path
          WHERE w.request_id=? ORDER BY w.position",
     )
@@ -702,6 +713,34 @@ mod tests {
 
         let summary = &list_requests(&pool, 10).await.unwrap()[0];
         assert_eq!((summary.total, summary.done), (2, 2));
+        assert_eq!(summary.title.as_deref(), Some("Road Trip"));
+    }
+
+    #[tokio::test]
+    async fn untitled_requests_are_named_after_their_first_song() {
+        let (_directory, pool) = pool().await;
+        let request = create_request(&pool, "https://x/track/1", Scope::Track, "telegram", None)
+            .await
+            .unwrap();
+        let mut songs = collection(&["One", "Two"]);
+        songs.title = None;
+        save_collection(&pool, request, "https://x/track/1", Scope::Track, &songs)
+            .await
+            .unwrap();
+        attach_telegram(&pool, request, 1, 2, 3).await.unwrap();
+        let finished = claim_next(&pool).await.unwrap().unwrap();
+        mark_in_library(&pool, finished.id, "/music/one.m4a")
+            .await
+            .unwrap();
+
+        let summary = &list_requests(&pool, 10).await.unwrap()[0];
+        assert_eq!(summary.title.as_deref(), Some("Artist – One"));
+        let open = &open_telegram_requests(&pool).await.unwrap()[0];
+        assert_eq!(open.summary.id, request);
+        assert_eq!(open.first_song.as_deref(), Some("Artist – One"));
+        assert_eq!((open.summary.total, open.summary.done), (2, 1));
+        assert_eq!(open.newly_filed, 0);
+        assert_eq!(open.status_message_id, 3);
     }
 
     #[tokio::test]

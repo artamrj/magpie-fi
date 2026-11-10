@@ -1,4 +1,7 @@
-use crate::infrastructure::providers::{ArtworkStatus, Candidate};
+use crate::{
+    domain::provider_name,
+    infrastructure::providers::{ArtworkStatus, Candidate},
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -31,7 +34,6 @@ pub fn complete(
     selected: &mut Candidate,
     candidates: &[Candidate],
     existing_album: Option<&str>,
-    embedded_cover: bool,
 ) -> CompletionReport {
     normalize_empty_fields(selected);
     let mut agreeing = candidates
@@ -194,16 +196,12 @@ pub fn complete(
 
     enriched.sort();
     enriched.dedup();
-    let report = audit(selected, embedded_cover, enriched);
-    record_report(selected, &agreeing, &report, embedded_cover);
+    let report = audit(selected, enriched);
+    record_report(selected, &agreeing, &report);
     report
 }
 
-pub fn audit(
-    candidate: &Candidate,
-    _embedded_cover: bool,
-    enriched_fields: Vec<String>,
-) -> CompletionReport {
+pub fn audit(candidate: &Candidate, enriched_fields: Vec<String>) -> CompletionReport {
     let cover = candidate.artwork_status == ArtworkStatus::Verified;
     let fields = [
         ("title", nonempty(Some(&candidate.title)).is_some(), 18_u8),
@@ -244,7 +242,7 @@ pub fn audit(
     }
 }
 
-pub fn reassess(candidate: &mut Candidate, embedded_cover: bool) -> CompletionReport {
+pub fn reassess(candidate: &mut Candidate) -> CompletionReport {
     normalize_release_fields(candidate);
     let enriched_fields = candidate
         .score_breakdown
@@ -262,8 +260,8 @@ pub fn reassess(candidate: &mut Candidate, embedded_cover: bool) -> CompletionRe
                 })
         })
         .unwrap_or_default();
-    let report = audit(candidate, embedded_cover, enriched_fields);
-    record_report(candidate, &[], &report, embedded_cover);
+    let report = audit(candidate, enriched_fields);
+    record_report(candidate, &[], &report);
     report
 }
 
@@ -499,7 +497,8 @@ pub(crate) fn same_recording(left: &Candidate, right: &Candidate) -> bool {
     {
         return true;
     }
-    version_tags(&left.title) == version_tags(&right.title)
+    crate::application::smart_approval::version_tags(&left.title)
+        == crate::application::smart_approval::version_tags(&right.title)
         && text_similarity(&left.title, &right.title) >= 0.90
         && text_similarity(&left.artist, &right.artist) >= 0.82
         && match (left.duration_delta, right.duration_delta) {
@@ -572,12 +571,7 @@ fn fill_any_string(
     fill_release_string(target, donors, value, name, enriched);
 }
 
-fn record_report(
-    candidate: &mut Candidate,
-    donors: &[&Candidate],
-    report: &CompletionReport,
-    embedded_cover: bool,
-) {
+fn record_report(candidate: &mut Candidate, donors: &[&Candidate], report: &CompletionReport) {
     let mut breakdown = candidate
         .score_breakdown
         .as_deref()
@@ -598,15 +592,13 @@ fn record_report(
     sources.sort();
     let cover_verified = breakdown["metadata_completion"]["cover_verified"]
         .as_bool()
-        .unwrap_or(embedded_cover);
+        .unwrap_or(false);
     let cover_source = breakdown["metadata_completion"]["cover_source"]
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| {
             if candidate.cover_url.is_some() {
                 "catalog".into()
-            } else if embedded_cover {
-                "embedded".into()
             } else {
                 "missing".into()
             }
@@ -652,7 +644,7 @@ fn provider_priority(provider: &str) -> u8 {
         "musicbrainz" | "itunes" | "spotify" | "radiojavan" | "audiomack" | "navahang"
         | "shazam" | "genius" => 6,
         "deezer" | "audd" | "songrec" => 5,
-        "discogs" | "theaudiodb" => 4,
+        "discogs" => 4,
         "lastfm" | "soundcloud" => 3,
         _ => 2,
     }
@@ -664,7 +656,7 @@ fn artwork_priority(provider: &str) -> u8 {
         "musicbrainz" | "radiojavan" | "audiomack" | "navahang" | "genius" => 7,
         "soundcloud" | "songrec" => 6,
         "deezer" => 5,
-        "discogs" | "theaudiodb" => 4,
+        "discogs" => 4,
         _ => 2,
     }
 }
@@ -675,27 +667,6 @@ fn is_album_release(candidate: &Candidate) -> bool {
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("album"))
         && !candidate.is_compilation
-}
-
-fn version_tags(value: &str) -> HashSet<&'static str> {
-    let normalized = normalized(value);
-    let words = normalized.split_whitespace().collect::<HashSet<_>>();
-    [
-        ("live", &["live"] as &[&str]),
-        ("remix", &["remix", "mix"] as &[&str]),
-        ("acoustic", &["acoustic", "unplugged"] as &[&str]),
-        ("instrumental", &["instrumental"] as &[&str]),
-        ("karaoke", &["karaoke"] as &[&str]),
-        ("demo", &["demo"] as &[&str]),
-        ("stripped", &["stripped"] as &[&str]),
-        ("sped", &["sped"] as &[&str]),
-        ("slowed", &["slowed"] as &[&str]),
-        ("duet", &["duet"] as &[&str]),
-    ]
-    .into_iter()
-    .filter(|(_, aliases)| aliases.iter().any(|alias| words.contains(alias)))
-    .map(|(tag, _)| tag)
-    .collect()
 }
 
 pub(crate) fn text_similarity(left: &str, right: &str) -> f64 {
@@ -720,27 +691,6 @@ fn normalized(value: &str) -> String {
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn provider_name(provider: &str) -> &str {
-    match provider {
-        "itunes" => "Apple Music",
-        "musicbrainz" => "MusicBrainz",
-        "radiojavan" => "Radio Javan",
-        "songrec" => "SongRec / Shazam",
-        "audiomack" => "Audiomack",
-        "navahang" => "Navahang",
-        "shazam" => "Shazam",
-        "genius" => "Genius",
-        "theaudiodb" => "TheAudioDB",
-        "lastfm" => "Last.fm",
-        "soundcloud" => "SoundCloud",
-        "spotify" => "Spotify",
-        "deezer" => "Deezer",
-        "audd" => "AudD",
-        "discogs" => "Discogs",
-        other => other,
-    }
 }
 
 #[cfg(test)]
@@ -769,7 +719,7 @@ mod tests {
         deezer.track_number = Some(3);
         deezer.cover_url = Some("https://example.test/farangis.jpg".into());
 
-        let report = complete(&mut selected, &[deezer], None, false);
+        let report = complete(&mut selected, &[deezer], None);
 
         assert!(!report.core_complete);
         assert_eq!(selected.year.as_deref(), Some("1993"));
@@ -791,7 +741,7 @@ mod tests {
         other_artist.artist = "Another Artist".into();
         other_artist.genre = Some("Rock".into());
 
-        let report = complete(&mut selected, &[remix, other_artist], None, false);
+        let report = complete(&mut selected, &[remix, other_artist], None);
 
         assert!(!report.core_complete);
         assert!(selected.cover_url.is_none());
@@ -799,18 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn embedded_artwork_does_not_bypass_catalog_verification() {
-        let mut selected = candidate("musicbrainz", Some("Khabe Baroon"));
-        let report = complete(&mut selected, &[], None, true);
-        assert!(!report.core_complete);
-        assert!(report.missing_fields.contains(&"cover".to_owned()));
-    }
-
-    #[test]
     fn defaults_missing_release_fields_for_a_single() {
         let mut selected = candidate("manual", None);
 
-        let report = complete(&mut selected, &[], None, false);
+        let report = complete(&mut selected, &[], None);
 
         // A release without an album name is named after the song.
         assert_eq!(selected.album.as_deref(), Some(selected.title.as_str()));
@@ -857,7 +799,7 @@ mod tests {
         itunes.release_type = Some("single".into());
         itunes.track_total = Some(1);
 
-        complete(&mut selected, &[itunes], None, false);
+        complete(&mut selected, &[itunes], None);
 
         assert_eq!(selected.release_type.as_deref(), Some("single"));
         assert_eq!(selected.album.as_deref(), Some("Moorche"));

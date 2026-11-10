@@ -12,7 +12,9 @@
 //! first track of an album helps fill in every other track). Every candidate
 //! image is downloaded and inspected before it is accepted.
 
-use crate::infrastructure::providers::{ArtworkCandidate, ArtworkStatus, Candidate};
+use crate::infrastructure::providers::{
+    ArtworkCandidate, ArtworkStatus, Candidate, cover_art_archive, musicbrainz::is_mbid,
+};
 use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::Value;
@@ -31,50 +33,30 @@ pub async fn collect_artwork_candidates(
     candidate: &Candidate,
 ) -> Result<Vec<ArtworkCandidate>> {
     let mut artwork = candidate.artwork_candidates.clone();
-    if let Some(url) = candidate.cover_url.as_deref()
-        && !artwork.iter().any(|item| item.url == url)
-    {
-        artwork.push(ArtworkCandidate {
-            provider: candidate.provider.clone(),
-            url: url.to_owned(),
-            release_id: candidate.release_id.clone(),
-            isrc: candidate.isrc.clone(),
-            album: candidate.album.clone(),
-            artist: Some(candidate.artist.clone()),
-            ..Default::default()
-        });
-    }
-    if let Some(breakdown) = candidate
-        .score_breakdown
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-    {
-        for item in breakdown["artwork_candidates"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let Some(url) = item["url"].as_str()
-                && !artwork.iter().any(|existing| existing.url == url)
-            {
-                artwork.push(ArtworkCandidate {
-                    provider: item["provider"].as_str().unwrap_or("catalog").to_owned(),
-                    url: url.to_owned(),
-                    release_id: candidate.release_id.clone(),
-                    isrc: candidate.isrc.clone(),
-                    album: candidate.album.clone(),
-                    artist: Some(candidate.artist.clone()),
-                    ..Default::default()
-                });
-            }
-        }
+    if let Some(url) = candidate.cover_url.as_deref() {
+        push_new(
+            &mut artwork,
+            ArtworkCandidate {
+                provider: candidate.provider.clone(),
+                url: url.to_owned(),
+                release_id: candidate.release_id.clone(),
+                isrc: candidate.isrc.clone(),
+                album: candidate.album.clone(),
+                artist: Some(candidate.artist.clone()),
+                ..Default::default()
+            },
+        );
     }
     for library in library_verified_artwork(pool, candidate).await? {
-        if !artwork.iter().any(|existing| existing.url == library.url) {
-            artwork.push(library);
-        }
+        push_new(&mut artwork, library);
     }
     Ok(artwork)
+}
+
+fn push_new(artwork: &mut Vec<ArtworkCandidate>, item: ArtworkCandidate) {
+    if !artwork.iter().any(|existing| existing.url == item.url) {
+        artwork.push(item);
+    }
 }
 
 /// A verified artwork row from another candidate that shares the same release.
@@ -91,13 +73,15 @@ struct VerifiedArtworkRow {
 /// elsewhere in the library. The bytes themselves are shared through the
 /// artwork-url provider cache, so this makes the first verified cover of an
 /// album instantly available to every other track on the same release.
+/// Release ids are only compared when they are MusicBrainz ids: other
+/// catalogs' ids are not unique across catalogs.
 async fn library_verified_artwork(
     pool: &SqlitePool,
     candidate: &Candidate,
 ) -> Result<Vec<ArtworkCandidate>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    if let Some(release_id) = candidate.release_id.as_deref() {
+    if let Some(release_id) = candidate.release_id.as_deref().filter(|id| is_mbid(id)) {
         let rows: Vec<VerifiedArtworkRow> = sqlx::query_as(
             "SELECT cover_url, provider, isrc, album, artist
              FROM candidates
@@ -155,15 +139,10 @@ fn push_library_row(
 }
 
 /// Run the cover-art worker for a selected recording. Tries every matching
-/// catalog URL, then falls back to a fresh iTunes/Deezer lookup, and finally
-/// to artwork already verified for the same release. Returns whether a valid
-/// matching cover is now available and updates the candidate's status.
-pub async fn ensure_usable_cover(
-    pool: &SqlitePool,
-    client: &Client,
-    candidate: &mut Candidate,
-    _embedded_cover: bool,
-) -> bool {
+/// catalog URL (and artwork already verified for the same release), then
+/// falls back to a fresh iTunes/Deezer lookup. Updates the candidate's
+/// artwork status.
+pub async fn ensure_usable_cover(pool: &SqlitePool, client: &Client, candidate: &mut Candidate) {
     candidate.artwork_status = ArtworkStatus::Searching;
     candidate.artwork_message = Some("Checking matching catalog artwork".into());
     let mut artwork = match collect_artwork_candidates(pool, candidate).await {
@@ -173,15 +152,14 @@ pub async fn ensure_usable_cover(
             Vec::new()
         }
     };
-    let (verified, mut saw_retryable, mut failures) =
-        verify_artwork_candidates(pool, client, candidate, &artwork).await;
-    if let Some((item, info)) = verified {
+    let mut check = verify_artwork_candidates(pool, client, candidate, &artwork).await;
+    if let Some((item, _, info)) = check.verified {
         accept_verified_artwork(candidate, artwork, &item, &info);
-        return true;
+        return;
     }
-    if saw_retryable {
-        mark_retryable_artwork(candidate, artwork, failures);
-        return false;
+    if check.retryable {
+        mark_retryable_artwork(candidate, artwork, check.failures);
+        return;
     }
     let initial_count = artwork.len();
 
@@ -209,12 +187,25 @@ pub async fn ensure_usable_cover(
             Some(&candidate.artist),
         )
     );
+    let mut sources = Vec::new();
     match deezer_isrc {
-        Ok(Some(source)) => {
-            if let Some(url) = source.cover_url.clone()
-                && !artwork.iter().any(|existing| existing.url == url)
-            {
-                artwork.push(ArtworkCandidate {
+        Ok(found) => sources.extend(found),
+        Err(error) => check.retryable |= is_retryable_artwork_error(&error),
+    }
+    for result in [itunes, deezer] {
+        match result {
+            Ok(found) => sources.extend(found.into_iter().filter(|source| {
+                same_recording(candidate, source)
+                    && albums_compatible(candidate.album.as_deref(), source.album.as_deref())
+            })),
+            Err(error) => check.retryable |= is_retryable_artwork_error(&error),
+        }
+    }
+    for source in sources {
+        if let Some(url) = source.cover_url {
+            push_new(
+                &mut artwork,
+                ArtworkCandidate {
                     provider: source.provider,
                     url,
                     release_id: source.release_id,
@@ -222,67 +213,31 @@ pub async fn ensure_usable_cover(
                     album: source.album,
                     artist: Some(source.artist),
                     ..Default::default()
-                });
-            }
-        }
-        Ok(None) => {}
-        Err(error) => saw_retryable |= is_retryable_artwork_error(&error),
-    }
-    for result in [itunes, deezer] {
-        match result {
-            Ok(found) => {
-                for source in found.into_iter().filter(|source| {
-                    source.cover_url.is_some()
-                        && same_recording(candidate, source)
-                        && albums_compatible(candidate.album.as_deref(), source.album.as_deref())
-                }) {
-                    let url = source.cover_url.expect("filtered cover URL");
-                    if artwork.iter().any(|existing| existing.url == url) {
-                        continue;
-                    }
-                    artwork.push(ArtworkCandidate {
-                        provider: source.provider,
-                        url,
-                        release_id: source.release_id,
-                        isrc: source.isrc,
-                        album: source.album,
-                        artist: Some(source.artist),
-                        ..Default::default()
-                    });
-                }
-            }
-            Err(error) => saw_retryable |= is_retryable_artwork_error(&error),
+                },
+            );
         }
     }
-    if let Ok(library) = library_verified_artwork(pool, candidate).await {
-        for item in library {
-            if !artwork.iter().any(|existing| existing.url == item.url) {
-                artwork.push(item);
-            }
-        }
-    }
-    let (verified, retryable, recovery_failures) =
+    let recovery =
         verify_artwork_candidates(pool, client, candidate, &artwork[initial_count..]).await;
-    saw_retryable |= retryable;
-    failures.extend(recovery_failures);
-    if let Some((item, info)) = verified {
+    check.retryable |= recovery.retryable;
+    check.failures.extend(recovery.failures);
+    if let Some((item, _, info)) = recovery.verified {
         accept_verified_artwork(candidate, artwork, &item, &info);
-        return true;
+        return;
     }
-    if saw_retryable {
-        mark_retryable_artwork(candidate, artwork, failures);
-        return false;
+    if check.retryable {
+        mark_retryable_artwork(candidate, artwork, check.failures);
+        return;
     }
     candidate.cover_url = None;
     candidate.artwork_candidates = artwork;
     candidate.artwork_status = ArtworkStatus::CoverRequired;
-    candidate.artwork_message = Some(if failures.is_empty() {
+    candidate.artwork_message = Some(if check.failures.is_empty() {
         "No matching catalog artwork was found; provide a cover URL".to_owned()
     } else {
-        format!("No usable matching cover: {}", failures.join("; "))
+        format!("No usable matching cover: {}", check.failures.join("; "))
     });
     mark_cover_verified(candidate, false, "cover_required");
-    false
 }
 
 /// Apply-time: return the exact bytes to embed, or fail so the track is
@@ -294,41 +249,16 @@ pub async fn resolve_for_write(
     candidate: &Candidate,
 ) -> Result<Vec<u8>> {
     let artwork = collect_artwork_candidates(pool, candidate).await?;
-    let mut failures = Vec::new();
-    for item in &artwork {
-        if !artwork_matches_candidate(candidate, item) {
-            failures.push(format!(
-                "{} did not match the selected release",
-                item.provider
-            ));
-            continue;
-        }
-        let trusted_exact = item.user_confirmed
-            || item
-                .release_id
-                .as_deref()
-                .zip(candidate.release_id.as_deref())
-                .is_some_and(|(artwork_release, selected_release)| {
-                    artwork_release == selected_release
-                });
-        match crate::infrastructure::providers::cover_art_archive::fetch_verified_url_cached(
-            pool,
-            client,
-            &item.url,
-            trusted_exact,
-        )
-        .await
-        {
-            Ok((data, _)) => return Ok(data),
-            Err(error) => failures.push(format!("{}: {error:#}", item.provider)),
-        }
+    let check = verify_artwork_candidates(pool, client, candidate, &artwork).await;
+    if let Some((_, bytes, _)) = check.verified {
+        return Ok(bytes);
     }
     bail!(
         "no usable matching cover could be downloaded{}",
-        if failures.is_empty() {
+        if check.failures.is_empty() {
             String::new()
         } else {
-            format!(": {}", failures.join("; "))
+            format!(": {}", check.failures.join("; "))
         }
     )
 }
@@ -359,17 +289,28 @@ fn record_artwork_failures(candidate: &mut Candidate, failures: &[String]) {
     candidate.score_breakdown = Some(breakdown.to_string());
 }
 
+/// The first usable matching cover among `artwork`, with what went wrong for
+/// the others.
+struct ArtworkCheck {
+    verified: Option<(ArtworkCandidate, Vec<u8>, ArtworkInfo)>,
+    retryable: bool,
+    failures: Vec<String>,
+}
+
 async fn verify_artwork_candidates(
     pool: &SqlitePool,
     client: &Client,
     candidate: &Candidate,
     artwork: &[ArtworkCandidate],
-) -> (Option<(ArtworkCandidate, ArtworkInfo)>, bool, Vec<String>) {
-    let mut saw_retryable = false;
-    let mut failures = Vec::new();
+) -> ArtworkCheck {
+    let mut check = ArtworkCheck {
+        verified: None,
+        retryable: false,
+        failures: Vec::new(),
+    };
     for item in artwork {
         if !artwork_matches_candidate(candidate, item) {
-            failures.push(format!(
+            check.failures.push(format!(
                 "{} did not match the selected release",
                 item.provider
             ));
@@ -383,24 +324,20 @@ async fn verify_artwork_candidates(
                 .is_some_and(|(artwork_release, selected_release)| {
                     artwork_release == selected_release
                 });
-        match crate::infrastructure::providers::cover_art_archive::fetch_verified_url_cached(
-            pool,
-            client,
-            &item.url,
-            trusted_exact,
-        )
-        .await
+        match cover_art_archive::fetch_verified_url_cached(pool, client, &item.url, trusted_exact)
+            .await
         {
-            Ok((_, info)) => {
-                return (Some((item.clone(), info)), saw_retryable, failures);
+            Ok((bytes, info)) => {
+                check.verified = Some((item.clone(), bytes, info));
+                return check;
             }
             Err(error) => {
-                saw_retryable |= is_retryable_artwork_error(&error);
-                failures.push(format!("{}: {error:#}", item.provider));
+                check.retryable |= is_retryable_artwork_error(&error);
+                check.failures.push(format!("{}: {error:#}", item.provider));
             }
         }
     }
-    (None, saw_retryable, failures)
+    check
 }
 
 fn accept_verified_artwork(
@@ -501,6 +438,8 @@ mod tests {
         }
     }
 
+    const RELEASE: &str = "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d";
+
     #[test]
     fn confirmed_single_accepts_its_isrc_matched_catalog_cover_title() {
         let mut selected = candidate("deezer", Some("Single"));
@@ -549,16 +488,17 @@ mod tests {
             .last_insert_rowid();
         sqlx::query(
             "INSERT INTO candidates(track_id,provider,title,artist,album,musicbrainz_release_id,cover_url,score,artwork_status)
-             VALUES(?,'itunes','Farangis','Siavash Ghomayshi','Khabe Baroon','release-1','https://example.test/verified.jpg',95,'verified')",
+             VALUES(?,'itunes','Farangis','Siavash Ghomayshi','Khabe Baroon',?,'https://example.test/verified.jpg',95,'verified')",
         )
         .bind(track_id)
+        .bind(RELEASE)
         .execute(&pool)
         .await
         .unwrap();
-        crate::infrastructure::provider_cache::ProviderCache::put(
+        crate::infrastructure::provider_cache::put(
             &pool,
             "artwork-url",
-            &crate::infrastructure::provider_cache::search_key("https://example.test/verified.jpg"),
+            &crate::infrastructure::provider_cache::url_key("https://example.test/verified.jpg"),
             &serde_json::json!({
                 "data_base64": base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
@@ -571,14 +511,28 @@ mod tests {
         .unwrap();
 
         let mut selected = candidate("musicbrainz", Some("Khabe Baroon"));
-        selected.release_id = Some("release-1".into());
+        selected.release_id = Some(RELEASE.into());
 
-        assert!(ensure_usable_cover(&pool, &Client::new(), &mut selected, false).await);
+        ensure_usable_cover(&pool, &Client::new(), &mut selected).await;
         assert_eq!(
             selected.cover_url.as_deref(),
             Some("https://example.test/verified.jpg")
         );
         assert_eq!(selected.artwork_status, ArtworkStatus::Verified);
+
+        // Other catalogs' release ids are not unique, so they are never shared.
+        sqlx::query("UPDATE candidates SET musicbrainz_release_id='1440857781'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut other_catalog = candidate("itunes", Some("Khabe Baroon"));
+        other_catalog.release_id = Some("1440857781".into());
+        assert!(
+            library_verified_artwork(&pool, &other_catalog)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -595,10 +549,10 @@ mod tests {
                 crate::infrastructure::media::tag_writer::test_artwork_png(),
             ),
         ] {
-            crate::infrastructure::provider_cache::ProviderCache::put(
+            crate::infrastructure::provider_cache::put(
                 &pool,
                 "artwork-url",
-                &crate::infrastructure::provider_cache::search_key(url),
+                &crate::infrastructure::provider_cache::url_key(url),
                 &serde_json::json!({"data_base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)}),
                 chrono::Utc::now() + chrono::Duration::days(1),
             )
@@ -607,16 +561,16 @@ mod tests {
         }
         let mut selected = candidate("musicbrainz", Some("Khabe Baroon"));
         selected.cover_url = Some("https://example.test/broken.jpg".into());
-        selected.score_breakdown = Some(
-            serde_json::json!({
-                "artwork_candidates": [
-                    {"provider":"Deezer","url":"https://example.test/valid.png"}
-                ]
-            })
-            .to_string(),
-        );
+        selected.artwork_candidates = vec![ArtworkCandidate {
+            provider: "Deezer".into(),
+            url: "https://example.test/valid.png".into(),
+            album: Some("Khabe Baroon".into()),
+            artist: Some("Siavash Ghomayshi".into()),
+            ..Default::default()
+        }];
 
-        assert!(ensure_usable_cover(&pool, &Client::new(), &mut selected, false).await);
+        ensure_usable_cover(&pool, &Client::new(), &mut selected).await;
+        assert_eq!(selected.artwork_status, ArtworkStatus::Verified);
         assert_eq!(
             selected.cover_url.as_deref(),
             Some("https://example.test/valid.png")
@@ -640,9 +594,8 @@ mod tests {
             ..Default::default()
         }];
 
-        let usable = ensure_usable_cover(&pool, &Client::new(), &mut selected, false).await;
+        ensure_usable_cover(&pool, &Client::new(), &mut selected).await;
 
-        assert!(!usable);
         assert_eq!(selected.cover_url.as_deref(), Some(url));
         assert_eq!(selected.artwork_status, ArtworkStatus::RetryableError);
         assert_eq!(
@@ -650,8 +603,7 @@ mod tests {
             Some("Cover download temporarily unavailable; retry will use the selected URL")
         );
         assert!(
-            !crate::application::metadata_completion::audit(&selected, false, Vec::new())
-                .core_complete
+            !crate::application::metadata_completion::audit(&selected, Vec::new()).core_complete
         );
     }
 

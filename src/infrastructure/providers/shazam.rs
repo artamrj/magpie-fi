@@ -1,43 +1,23 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::ProviderCache;
+use super::{Candidate, browser_page, nonempty};
+use crate::infrastructure::provider_cache::cached;
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::{Client, Url};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
 const PROVIDER: &str = "shazam";
 const BASE_URL: &str = "https://www.shazam.com";
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/138 Safari/537.36";
 
 pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result<Candidate> {
     let (canonical, song_id) = song_url(url)?;
     let key = format!("song:{song_id}");
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let html = client
-            .get(canonical.clone())
-            .header("Accept", "text/html,application/xhtml+xml")
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let value = page_metadata(&html, &song_id, canonical.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Shazam returned no usable song metadata"))?;
-        ProviderCache::put(
-            pool,
-            PROVIDER,
-            &key,
-            &value,
-            Utc::now() + Duration::days(14),
-        )
-        .await?;
-        value
-    };
+    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || async {
+        let html = browser_page(client, canonical.as_str()).await?;
+        page_metadata(&html, &song_id, canonical.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Shazam returned no usable song metadata"))
+    })
+    .await?;
     candidate_from_metadata(&raw)
         .ok_or_else(|| anyhow::anyhow!("Shazam returned incomplete song metadata"))
 }
@@ -145,7 +125,6 @@ fn candidate_from_metadata(raw: &Value) -> Option<Candidate> {
         label: nonempty(raw["label"].as_str()).map(str::to_owned),
         isrc: nonempty(raw["isrc"].as_str()).map(str::to_owned),
         cover_url: nonempty(raw["cover_url"].as_str()).map(str::to_owned),
-        recording_id: nonempty(raw["song_id"].as_str()).map(str::to_owned),
         release_date,
         release_type: nonempty(raw["release_type"].as_str()).map(str::to_owned),
         is_compilation: raw["is_compilation"].as_bool().unwrap_or(false),
@@ -198,10 +177,6 @@ fn decode_html_entities(value: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +212,9 @@ mod tests {
         assert_eq!(candidate.track_number, Some(1));
         assert_eq!(candidate.track_total, Some(1));
         assert_eq!(candidate.release_type.as_deref(), Some("single"));
+        // The Shazam song ID is kept in raw_json, never as a MusicBrainz ID.
+        assert!(candidate.recording_id.is_none());
+        assert!(candidate.raw_json.contains("1505820972"));
     }
 
     #[tokio::test]

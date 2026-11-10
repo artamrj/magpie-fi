@@ -11,7 +11,10 @@
 //! | Shazam | song page | — | — |
 
 use super::ytdlp;
-use crate::{config::Config, infrastructure::providers};
+use crate::{
+    config::Config,
+    infrastructure::providers::{self, text},
+};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
@@ -231,8 +234,8 @@ fn parse_spotify_embed(html: &str, link: &Link) -> Result<Collection> {
             .collect();
         return Ok(Collection {
             songs: vec![Wanted {
-                title: string(entity, "name")
-                    .or_else(|| string(entity, "title"))
+                title: text(entity, "name")
+                    .or_else(|| text(entity, "title"))
                     .unwrap_or_default(),
                 artist: (!artists.is_empty()).then(|| artists.join(", ")),
                 duration: milliseconds(&entity["duration"]),
@@ -242,16 +245,16 @@ fn parse_spotify_embed(html: &str, link: &Link) -> Result<Collection> {
             ..Collection::default()
         });
     }
-    let title = string(entity, "name").or_else(|| string(entity, "title"));
-    let subtitle = string(entity, "subtitle");
+    let title = text(entity, "name").or_else(|| text(entity, "title"));
+    let subtitle = text(entity, "subtitle");
     let songs = entity["trackList"]
         .as_array()
         .into_iter()
         .flatten()
         .enumerate()
         .map(|(index, track)| Wanted {
-            title: string(track, "title").unwrap_or_default(),
-            artist: string(track, "subtitle").map(|artists| artists.replace('\u{a0}', " ")),
+            title: text(track, "title").unwrap_or_default(),
+            artist: text(track, "subtitle").map(|artists| artists.replace('\u{a0}', " ")),
             album: (link.scope == Scope::Album)
                 .then(|| title.clone())
                 .flatten(),
@@ -310,20 +313,20 @@ fn parse_itunes_lookup(value: &Value, scope: Scope) -> Collection {
         .iter()
         .filter(|item| item["wrapperType"] == "track" && item["kind"] == "song")
         .map(|item| Wanted {
-            title: string(item, "trackName").unwrap_or_default(),
-            artist: string(item, "artistName"),
-            album: string(item, "collectionName"),
+            title: text(item, "trackName").unwrap_or_default(),
+            artist: text(item, "artistName"),
+            album: text(item, "collectionName"),
             track_number: item["trackNumber"].as_i64(),
             duration: milliseconds(&item["trackTimeMillis"]),
-            source_url: string(item, "trackViewUrl"),
+            source_url: text(item, "trackViewUrl"),
             ..Wanted::default()
         })
         .collect();
     Collection {
         title: (scope == Scope::Album)
-            .then(|| collection.and_then(|item| string(item, "collectionName")))
+            .then(|| collection.and_then(|item| text(item, "collectionName")))
             .flatten(),
-        owner: collection.and_then(|item| string(item, "artistName")),
+        owner: collection.and_then(|item| text(item, "artistName")),
         songs,
     }
 }
@@ -362,8 +365,8 @@ fn collect_apple_tracks(value: &Value, songs: &mut Vec<Wanted>) {
                 && map.contains_key("duration")
             {
                 songs.push(Wanted {
-                    title: string(value, "title").unwrap_or_default(),
-                    artist: string(value, "artistName"),
+                    title: text(value, "title").unwrap_or_default(),
+                    artist: text(value, "artistName"),
                     album: value["tertiaryLinks"][0]["title"]
                         .as_str()
                         .map(str::to_owned),
@@ -414,7 +417,7 @@ async fn deezer(client: &reqwest::Client, link: &Link) -> Result<Collection> {
         }
         Scope::Album => {
             let album = get(format!("album/{}", link.id)).await?;
-            let title = string(&album, "title");
+            let title = text(&album, "title");
             let songs = album["tracks"]["data"]
                 .as_array()
                 .into_iter()
@@ -453,7 +456,7 @@ async fn deezer(client: &reqwest::Client, link: &Link) -> Result<Collection> {
                 }
             }
             Ok(Collection {
-                title: string(&playlist, "title"),
+                title: text(&playlist, "title"),
                 owner: playlist["creator"]["name"].as_str().map(str::to_owned),
                 songs,
             })
@@ -469,7 +472,7 @@ fn deezer_track(track: &Value, album: Option<String>) -> Wanted {
         .filter_map(|artist| artist["name"].as_str().map(str::to_owned))
         .collect();
     Wanted {
-        title: string(track, "title").unwrap_or_default(),
+        title: text(track, "title").unwrap_or_default(),
         artist: if contributors.is_empty() {
             track["artist"]["name"].as_str().map(str::to_owned)
         } else {
@@ -478,8 +481,8 @@ fn deezer_track(track: &Value, album: Option<String>) -> Wanted {
         album: album.or_else(|| track["album"]["title"].as_str().map(str::to_owned)),
         track_number: track["track_position"].as_i64(),
         duration: track["duration"].as_f64().filter(|value| *value > 0.0),
-        isrc: string(track, "isrc"),
-        source_url: string(track, "link"),
+        isrc: text(track, "isrc"),
+        source_url: text(track, "link"),
         youtube_id: None,
     }
 }
@@ -553,14 +556,6 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let from = text.find(start)? + start.len();
     let to = from + text[from..].find(end)?;
     Some(&text[from..to])
-}
-
-fn string(value: &Value, key: &str) -> Option<String> {
-    value[key]
-        .as_str()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
 }
 
 fn milliseconds(value: &Value) -> Option<f64> {

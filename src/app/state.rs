@@ -12,88 +12,16 @@ pub struct Workflow {
     pub current: usize,
     pub total: usize,
     pub processed: usize,
-    pub matched: usize,
-    pub unmatched: usize,
-    pub failed: usize,
     #[serde(skip)]
     pub cancelled: bool,
-    #[serde(skip)]
-    pub automatic: bool,
-}
-
-pub struct ActivityLogEntry {
-    level: String,
-    stage: String,
-    file: Option<String>,
-    message: String,
-    detail: Option<String>,
-    error: Option<String>,
-    attempt: Option<i64>,
-    duration_ms: Option<i64>,
-    context_json: Option<serde_json::Value>,
-}
-
-impl ActivityLogEntry {
-    pub fn new(
-        level: impl Into<String>,
-        stage: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            level: level.into(),
-            stage: stage.into(),
-            file: None,
-            message: message.into(),
-            detail: None,
-            error: None,
-            attempt: None,
-            duration_ms: None,
-            context_json: None,
-        }
-    }
-
-    pub fn file(mut self, file: impl Into<String>) -> Self {
-        self.file = Some(file.into());
-        self
-    }
-
-    pub fn detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
-        self
-    }
-
-    pub fn error(mut self, error: &dyn std::error::Error) -> Self {
-        self.error = Some(error.to_string());
-        self
-    }
-
-    pub fn error_text(mut self, error: impl Into<String>) -> Self {
-        self.error = Some(error.into());
-        self
-    }
-
-    pub fn attempt(mut self, attempt: i64) -> Self {
-        self.attempt = Some(attempt);
-        self
-    }
-
-    pub fn duration_ms(mut self, duration_ms: i64) -> Self {
-        self.duration_ms = Some(duration_ms);
-        self
-    }
-
-    pub fn context(mut self, context: serde_json::Value) -> Self {
-        self.context_json = Some(context);
-        self
-    }
 }
 
 pub struct AppState {
-    pub config: RwLock<Config>,
+    pub config: Config,
     pub pool: SqlitePool,
     pub client: reqwest::Client,
-    pub artwork_downloads: RwLock<Arc<Semaphore>>,
-    pub tag_writes: RwLock<Arc<Semaphore>>,
+    pub artwork_downloads: Arc<Semaphore>,
+    pub tag_writes: Arc<Semaphore>,
     pub spotify_auth: crate::infrastructure::providers::spotify::SpotifyAuth,
     pub soundcloud_auth: crate::infrastructure::providers::soundcloud::SoundCloudAuth,
     pub workflow: RwLock<Workflow>,
@@ -103,18 +31,16 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, pool: SqlitePool) -> Self {
-        let lookup_workers = config.lookup_workers;
-        let write_workers = config.write_workers;
         Self {
-            config: RwLock::new(config),
+            config,
             pool,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(12))
                 .user_agent(crate::config::USER_AGENT)
                 .build()
                 .expect("HTTP client should build"),
-            artwork_downloads: RwLock::new(Arc::new(Semaphore::new(lookup_workers))),
-            tag_writes: RwLock::new(Arc::new(Semaphore::new(write_workers))),
+            artwork_downloads: Arc::new(Semaphore::new(crate::config::LOOKUP_WORKERS)),
+            tag_writes: Arc::new(Semaphore::new(crate::config::WRITE_WORKERS)),
             spotify_auth: crate::infrastructure::providers::spotify::SpotifyAuth::default(),
             soundcloud_auth: crate::infrastructure::providers::soundcloud::SoundCloudAuth::default(
             ),
@@ -141,7 +67,6 @@ impl AppState {
         &self,
         phase: WorkflowPhase,
         message: impl Into<String>,
-        automatic: bool,
     ) -> bool {
         let mut workflow = self.workflow.write().await;
         if matches!(
@@ -153,7 +78,6 @@ impl AppState {
         *workflow = Workflow {
             phase,
             message: message.into(),
-            automatic,
             ..Default::default()
         };
         true
@@ -175,17 +99,11 @@ impl AppState {
         self.workflow.read().await.cancelled
     }
 
-    pub async fn finish_workflow(
-        &self,
-        phase: WorkflowPhase,
-        _stage: &'static str,
-        message: impl Into<String>,
-    ) {
+    pub async fn finish_workflow(&self, phase: WorkflowPhase, message: impl Into<String>) {
         let mut workflow = self.workflow.write().await;
         workflow.phase = phase;
         workflow.message = message.into();
         workflow.cancelled = false;
-        workflow.automatic = false;
         workflow.current_file = None;
     }
 
@@ -209,7 +127,6 @@ impl AppState {
     pub async fn set_workflow(
         &self,
         phase: WorkflowPhase,
-        _stage: &'static str,
         message: impl Into<String>,
         current: usize,
         total: usize,
@@ -236,45 +153,12 @@ impl AppState {
         workflow.current_file = Some(file.into());
     }
 
-    pub async fn increment_failed(&self) {
-        self.workflow.write().await.failed += 1;
-    }
-
-    pub async fn increment_matched(&self) {
-        self.workflow.write().await.matched += 1;
-    }
-
-    pub async fn increment_unmatched(&self) {
-        self.workflow.write().await.unmatched += 1;
-    }
-
     pub async fn finish_track(&self, total: usize) -> usize {
         let mut workflow = self.workflow.write().await;
         workflow.processed += 1;
         workflow.current = workflow.processed;
         workflow.total = total;
         workflow.processed
-    }
-
-    pub async fn log(&self, level: &str, stage: &str, file: Option<&str>, message: &str) {
-        let mut entry = ActivityLogEntry::new(level, stage, message);
-        entry.file = file.map(str::to_owned);
-        self.log_entry(entry).await;
-    }
-
-    pub async fn log_entry(&self, entry: ActivityLogEntry) {
-        tracing::info!(
-            level = entry.level,
-            stage = entry.stage,
-            file = entry.file,
-            detail = entry.detail,
-            error = entry.error,
-            attempt = entry.attempt,
-            duration_ms = entry.duration_ms,
-            context = ?entry.context_json,
-            "{}",
-            entry.message
-        );
     }
 }
 
@@ -293,19 +177,15 @@ mod tests {
 
         assert!(
             state
-                .try_claim_workflow(WorkflowPhase::Scan, "First scan", false)
+                .try_claim_workflow(WorkflowPhase::Scan, "First scan")
                 .await
         );
         assert!(
             !state
-                .try_claim_workflow(WorkflowPhase::Apply, "Second workflow", false)
+                .try_claim_workflow(WorkflowPhase::Apply, "Second workflow")
                 .await
         );
-        assert!(
-            !state
-                .try_claim_workflow(WorkflowPhase::Scan, "Third", true)
-                .await
-        );
+        assert!(!state.try_claim_workflow(WorkflowPhase::Scan, "Third").await);
         assert_eq!(state.workflow.read().await.phase, WorkflowPhase::Scan);
     }
 }

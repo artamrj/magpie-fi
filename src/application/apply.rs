@@ -1,24 +1,34 @@
 use crate::{
-    app::{ActivityLogEntry, AppState},
+    app::AppState,
     application::{
+        files,
         input_dedup::{self, RecordingEvidence},
         library,
     },
-    config::Config,
     infrastructure::{
-        db::tracks::{CandidateRow, TRACK_FIELDS, Track, candidates_by_track, selected_for_tracks},
+        db::{
+            self,
+            tracks::{TRACK_FIELDS, Track, candidates_by_track, selected_for_tracks},
+        },
         fingerprint_cache, lyrics,
-        media::{fingerprint, replaygain, rsgain, tag_writer},
+        media::{fingerprint, rsgain, tag_writer},
         providers::Candidate,
     },
     types::{TrackId, WorkflowPhase},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
-use tokio::io::AsyncReadExt;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+/// Tracks that are identified, complete and waiting to be filed.
+const READY: &str =
+    "selected_candidate_id IS NOT NULL AND is_missing=0 AND status!='corrupt' AND stage='ready'";
+
+#[derive(Default)]
 pub(crate) struct PreparedApply {
     pub(crate) items: Vec<PreviewItem>,
     pub(crate) selected_count: usize,
@@ -26,7 +36,6 @@ pub(crate) struct PreparedApply {
     pub(crate) duplicates_skipped: usize,
 }
 
-#[derive(Clone)]
 pub(crate) struct PreviewItem {
     track_id: TrackId,
     filename: String,
@@ -37,7 +46,6 @@ pub(crate) struct PreviewItem {
     duplicates: Vec<DuplicateSource>,
 }
 
-#[derive(Clone)]
 struct DuplicateSource {
     track_id: TrackId,
     filename: String,
@@ -45,51 +53,76 @@ struct DuplicateSource {
     source_missing: bool,
 }
 
-/// Where the track goes in the library (BLUEPRINT.md §5). The format is
-/// sniffed again from the file, because an old scan may have trusted a wrong
-/// extension (for example AAC audio in a file named `.mp3`).
-fn destination(cfg: &Config, track: &Track, candidate: &Candidate) -> Result<String> {
-    let source = std::path::Path::new(&track.path);
-    let detected_format = crate::domain::audio::read(source)
-        .ok()
-        .map(|info| info.format);
-    let extension = detected_format
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .or_else(|| track.format.as_deref().filter(|value| !value.is_empty()))
-        .or_else(|| source.extension().and_then(|value| value.to_str()))
-        .ok_or_else(|| anyhow!("cannot tell the audio format of {}", track.path))?;
-    Ok(
-        library::destination(std::path::Path::new(&cfg.output_dir), candidate, extension)
-            .to_string_lossy()
-            .into_owned(),
-    )
+struct PlannedSource {
+    track: Track,
+    candidate: Option<Candidate>,
+    available: bool,
 }
 
-pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
+/// Where the track goes in the library (BLUEPRINT.md §5). Songs of an album
+/// that is already in the library join its folder and year. The format is
+/// sniffed again from the file, because an old scan may have trusted a wrong
+/// extension (for example AAC audio in a file named `.mp3`).
+async fn destination(
+    output_dir: &str,
+    track: &Track,
+    candidate: &mut Candidate,
+) -> Result<PathBuf> {
+    let library = PathBuf::from(output_dir);
+    let source = PathBuf::from(&track.path);
+    let stored_format = track.format.clone();
+    let mut aligned = candidate.clone();
+    let (aligned, destination) = tokio::task::spawn_blocking(move || {
+        library::align_with_existing_release(&library, &mut aligned);
+        let extension = crate::domain::audio::read(&source)
+            .ok()
+            .map(|info| info.format)
+            .into_iter()
+            .chain(stored_format)
+            .chain(
+                source
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned),
+            )
+            .find(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("cannot tell the audio format of {}", source.display()))?;
+        let destination = library::destination(&library, &aligned, &extension);
+        Ok::<_, anyhow::Error>((aligned, destination))
+    })
+    .await??;
+    *candidate = aligned;
+    Ok(destination)
+}
+
+async fn has_ready_tracks(pool: &sqlx::SqlitePool) -> Result<bool> {
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT EXISTS(SELECT 1 FROM tracks WHERE {READY})"
+    )))
+    .fetch_one(pool)
+    .await?)
+}
+
+pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
     let ready_tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {} FROM tracks WHERE selected_candidate_id IS NOT NULL AND is_missing=0 AND status!='corrupt' AND stage='ready'",
-        TRACK_FIELDS
+        "SELECT {TRACK_FIELDS} FROM tracks WHERE {READY}"
     )))
     .fetch_all(&s.pool)
     .await?;
-    let cfg = s.config.read().await.clone();
+    if ready_tracks.is_empty() {
+        return Ok(PreparedApply::default());
+    }
+    let by_track = candidates_by_track(&s.pool, ready_tracks.iter().map(|track| track.id)).await?;
     let selected = selected_for_tracks(&s.pool, ready_tracks).await?;
     let skipped_tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {} FROM tracks
+        "SELECT {TRACK_FIELDS} FROM tracks
          WHERE status='duplicate' AND stage='skipped' AND is_missing=0
            AND content_fingerprint IS NOT NULL
-         ORDER BY path",
-        TRACK_FIELDS
+         ORDER BY path"
     )))
     .fetch_all(&s.pool)
     .await?;
 
-    struct PlannedSource {
-        track: Track,
-        candidate: Option<Candidate>,
-        available: bool,
-    }
     let mut sources = selected
         .into_iter()
         .map(|(track, candidate)| PlannedSource {
@@ -97,39 +130,38 @@ pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
             candidate: Some(candidate),
             available: false,
         })
+        .chain(skipped_tracks.into_iter().map(|track| PlannedSource {
+            track,
+            candidate: None,
+            available: false,
+        }))
         .collect::<Vec<_>>();
-    sources.extend(skipped_tracks.into_iter().map(|track| PlannedSource {
-        track,
-        candidate: None,
-        available: false,
-    }));
 
     // Reapply release and identity rules at the last mutable boundary. This
     // also repairs ready-but-unwritten selections created by an older scan.
-    let by_track = candidates_by_track(&s.pool).await?;
     for source in &mut sources {
-        let track_id = source.track.id;
-        let existing_album = source.track.current_album.clone();
-        if let Some(candidate) = source.candidate.as_mut() {
-            let candidates = by_track
-                .get(&track_id)
-                .into_iter()
-                .flat_map(|rows| rows.iter())
-                .map(CandidateRow::value)
-                .collect::<Vec<_>>();
-            crate::application::metadata_completion::complete(
-                candidate,
-                &candidates,
-                existing_album.as_deref(),
-                false,
-            );
-            crate::application::canonical_names::canonicalize_candidates(
-                &s.pool,
-                std::slice::from_mut(candidate),
-            )
-            .await?;
-            persist_apply_normalization(&s.pool, candidate).await?;
-        }
+        let PlannedSource {
+            track,
+            candidate: Some(candidate),
+            ..
+        } = source
+        else {
+            continue;
+        };
+        crate::application::metadata_completion::complete(
+            candidate,
+            by_track
+                .get(&track.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            track.current_album.as_deref(),
+        );
+        crate::application::canonical_names::canonicalize_candidates(
+            &s.pool,
+            std::slice::from_mut(candidate),
+        )
+        .await?;
+        db::candidates::update(&s.pool, candidate).await?;
     }
 
     let mut evidence = Vec::with_capacity(sources.len());
@@ -137,47 +169,44 @@ pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
         source.available = tokio::fs::metadata(&source.track.path)
             .await
             .is_ok_and(|metadata| metadata.is_file());
-        if !source.available {
-            sqlx::query(
-                "UPDATE tracks SET is_missing=1,status='failed',stage='failed',
-                 stage_message='Source file is missing; restore it and scan again',updated_at=?
-                 WHERE id=?",
-            )
-            .bind(Utc::now().to_rfc3339())
-            .bind(source.track.id.0)
-            .execute(&s.pool)
-            .await?;
-        }
         if source.available {
             evidence
                 .push(recording_evidence(&s.pool, &source.track, source.candidate.as_ref()).await?);
-        } else {
-            evidence.push(RecordingEvidence {
-                path: source.track.path.clone().into(),
-                format: source.track.format.clone().unwrap_or_default(),
-                bitrate: source
-                    .track
-                    .bitrate
-                    .and_then(|value| u32::try_from(value).ok()),
-                duration: source.track.duration,
-                content_key: source.track.content_fingerprint.clone(),
-                isrc: source
-                    .candidate
-                    .as_ref()
-                    .and_then(|candidate| candidate.isrc.clone()),
-            });
+            continue;
         }
+        sqlx::query(
+            "UPDATE tracks SET is_missing=1,status='failed',stage='failed',
+             stage_message='Source file is missing; restore it and scan again',updated_at=?
+             WHERE id=?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(source.track.id.0)
+        .execute(&s.pool)
+        .await?;
+        evidence.push(RecordingEvidence {
+            path: source.track.path.clone().into(),
+            format: source.track.format.clone().unwrap_or_default(),
+            bitrate: source
+                .track
+                .bitrate
+                .and_then(|value| u32::try_from(value).ok()),
+            duration: source.track.duration,
+            content_key: source.track.content_fingerprint.clone(),
+            isrc: source
+                .candidate
+                .as_ref()
+                .and_then(|candidate| candidate.isrc.clone()),
+        });
     }
 
-    let mut items: Vec<PreviewItem> = Vec::new();
-    let mut selected_count = 0;
+    let mut prepared = PreparedApply::default();
     for group in input_dedup::group_recordings(&evidence) {
-        let Some((candidate_owner, mut candidate)) = group.members.iter().find_map(|index| {
-            sources[*index]
-                .candidate
-                .clone()
-                .map(|candidate| (*index, candidate))
-        }) else {
+        let Some(candidate_owner) = group
+            .members
+            .iter()
+            .copied()
+            .find(|index| sources[*index].candidate.is_some())
+        else {
             continue;
         };
         let Some(representative) = group
@@ -188,76 +217,102 @@ pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
         else {
             continue;
         };
-        if representative != candidate_owner {
-            promote_apply_representative(
-                &s.pool,
-                &sources[candidate_owner].track,
-                &sources[representative].track,
-                sources[candidate_owner].available,
-            )
-            .await?;
-        }
-        selected_count += group
+        let available = group
             .members
             .iter()
             .filter(|index| sources[**index].available)
             .count();
-        let source = &sources[representative];
-        let track = &source.track;
-        // Songs of an album that is already in the library join its folder and year.
-        library::align_with_existing_release(std::path::Path::new(&cfg.output_dir), &mut candidate);
-        let dest = PathBuf::from(destination(&cfg, track, &candidate)?);
-        let duplicates = group
-            .members
-            .into_iter()
-            .filter(|index| *index != representative)
-            .map(|index| DuplicateSource {
-                track_id: sources[index].track.id,
-                filename: sources[index].track.filename.clone(),
-                current_path: sources[index].track.path.clone(),
-                source_missing: !sources[index].available,
-            })
-            .collect();
-        let mut item_evidence = evidence[representative].clone();
-        if item_evidence.isrc.is_none() {
-            item_evidence.isrc = candidate.isrc.clone();
+        match plan_item(
+            s,
+            &sources,
+            &evidence,
+            group.members,
+            candidate_owner,
+            representative,
+        )
+        .await
+        {
+            Ok(item) => {
+                prepared.selected_count += available;
+                prepared.items.push(item);
+            }
+            // One bad track must not hold up the others.
+            Err(error) => {
+                let track = &sources[representative].track;
+                tracing::error!(file = track.path, "could not plan filing: {error:#}");
+                mark_failed(&s.pool, track.id, &error).await?;
+            }
         }
-        items.push(PreviewItem {
-            track_id: track.id,
-            filename: track.filename.clone(),
-            current_path: track.path.clone(),
-            destination_path: dest.to_string_lossy().into_owned(),
-            candidate,
-            evidence: item_evidence,
-            duplicates,
-        });
     }
-    let outputs = items.len();
-    let duplicates_skipped = selected_count.saturating_sub(outputs);
-    Ok(PreparedApply {
-        items,
-        selected_count,
-        outputs,
-        duplicates_skipped,
+    prepared.outputs = prepared.items.len();
+    prepared.duplicates_skipped = prepared.selected_count.saturating_sub(prepared.outputs);
+    Ok(prepared)
+}
+
+/// One output per group of duplicate inputs: the best available file carries
+/// the selected candidate, the others are filed as its duplicates.
+async fn plan_item(
+    s: &AppState,
+    sources: &[PlannedSource],
+    evidence: &[RecordingEvidence],
+    members: Vec<usize>,
+    candidate_owner: usize,
+    representative: usize,
+) -> Result<PreviewItem> {
+    let mut candidate = sources[candidate_owner]
+        .candidate
+        .clone()
+        .context("duplicate group has no selected candidate")?;
+    if representative != candidate_owner {
+        promote_apply_representative(
+            &s.pool,
+            &sources[candidate_owner].track,
+            &sources[representative].track,
+            sources[candidate_owner].available,
+        )
+        .await?;
+    }
+    let track = &sources[representative].track;
+    let destination = destination(&s.config.output_dir, track, &mut candidate).await?;
+    let duplicates = members
+        .into_iter()
+        .filter(|index| *index != representative)
+        .map(|index| DuplicateSource {
+            track_id: sources[index].track.id,
+            filename: sources[index].track.filename.clone(),
+            current_path: sources[index].track.path.clone(),
+            source_missing: !sources[index].available,
+        })
+        .collect();
+    let mut item_evidence = evidence[representative].clone();
+    if item_evidence.isrc.is_none() {
+        item_evidence.isrc = candidate.isrc.clone();
+    }
+    Ok(PreviewItem {
+        track_id: track.id,
+        filename: track.filename.clone(),
+        current_path: track.path.clone(),
+        destination_path: destination.to_string_lossy().into_owned(),
+        candidate,
+        evidence: item_evidence,
+        duplicates,
     })
 }
 
-async fn persist_apply_normalization(pool: &sqlx::SqlitePool, candidate: &Candidate) -> Result<()> {
-    let Some(id) = candidate.id else {
-        return Ok(());
-    };
+/// Takes the track out of the ready set so a failing file is not retried
+/// every inbox cycle; "Retry issues" picks it up again.
+async fn mark_failed(
+    pool: &sqlx::SqlitePool,
+    track_id: TrackId,
+    error: &anyhow::Error,
+) -> Result<()> {
     sqlx::query(
-        "UPDATE candidates SET title=?,artist=?,artist_credits_json=?,album=?,album_artist=?,
-         album_artist_credits_json=?,release_type=? WHERE id=?",
+        "UPDATE tracks SET status='failed',stage='failed',error=?,
+         stage_message='Filing failed; check the file and retry',updated_at=? WHERE id=?",
     )
-    .bind(&candidate.title)
-    .bind(&candidate.artist)
-    .bind(serde_json::to_string(&candidate.artist_credits)?)
-    .bind(&candidate.album)
-    .bind(&candidate.album_artist)
-    .bind(serde_json::to_string(&candidate.album_artist_credits)?)
-    .bind(&candidate.release_type)
-    .bind(id)
+    .bind(format!("{error:#}"))
+    .bind(Utc::now().to_rfc3339())
+    .bind(track_id.0)
     .execute(pool)
     .await?;
     Ok(())
@@ -315,53 +370,69 @@ async fn promote_apply_representative(
     Ok(())
 }
 
-pub(crate) async fn apply_ready_automatically(s: Arc<AppState>) -> Result<usize> {
-    let prepared = prepare_apply(&s).await?;
-    if prepared.selected_count == 0 {
-        return Ok(0);
+pub(crate) enum Claim {
+    /// Another workflow is running.
+    Busy,
+    NothingReady,
+    Ready(PreparedApply),
+}
+
+/// Claims the workflow slot and prepares every ready track for filing. On
+/// `Ready` the caller owns the slot and must hand the items to [`run_claimed`].
+pub(crate) async fn claim_ready(s: &AppState) -> Result<Claim> {
+    if !has_ready_tracks(&s.pool).await? {
+        return Ok(Claim::NothingReady);
     }
     if !s
-        .try_claim_workflow(WorkflowPhase::Apply, "Filing songs into the library", true)
+        .try_claim_workflow(WorkflowPhase::Apply, "Filing songs into the library")
         .await
     {
-        return Ok(0);
+        return Ok(Claim::Busy);
     }
-    let result = apply(s.clone(), prepared.items).await;
-    let count = result.as_ref().copied().unwrap_or_default();
+    match prepare_apply(s).await {
+        Ok(prepared) if prepared.selected_count > 0 => Ok(Claim::Ready(prepared)),
+        Ok(_) => {
+            s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+            Ok(Claim::NothingReady)
+        }
+        Err(error) => {
+            s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+            Err(error)
+        }
+    }
+}
+
+/// Files the prepared items and releases the workflow slot.
+pub(crate) async fn run_claimed(s: Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
+    let result = apply(&s, items).await;
     if s.workflow_cancelled().await {
-        s.finish_workflow(WorkflowPhase::Idle, "idle", "Filing stopped")
-            .await;
-    } else if let Err(error) = &result {
-        s.finish_workflow(WorkflowPhase::Failed, "failed", error.to_string())
+        s.finish_workflow(WorkflowPhase::Idle, "Filing stopped")
             .await;
     } else {
-        s.finish_workflow(
-            WorkflowPhase::Finish,
-            "finish",
-            format!(
-                "Inbox done · {count} {} filed",
-                if count == 1 { "song" } else { "songs" }
-            ),
-        )
-        .await;
+        match &result {
+            Ok(count) => {
+                s.finish_workflow(
+                    WorkflowPhase::Finish,
+                    format!(
+                        "Inbox done · {count} {} filed",
+                        if *count == 1 { "song" } else { "songs" }
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                s.finish_workflow(WorkflowPhase::Failed, error.to_string())
+                    .await
+            }
+        }
     }
     result
 }
 
-pub(crate) async fn finish_apply_workflow(state: Arc<AppState>, items: Vec<PreviewItem>) {
-    let result = apply(state.clone(), items).await;
-    if state.workflow_cancelled().await {
-        state
-            .finish_workflow(WorkflowPhase::Idle, "idle", "Apply stopped")
-            .await;
-    } else if let Err(error) = result {
-        state
-            .finish_workflow(WorkflowPhase::Failed, "failed", error.to_string())
-            .await;
-    } else {
-        state
-            .finish_workflow(WorkflowPhase::Finish, "finish", "Apply complete")
-            .await;
+pub(crate) async fn apply_ready_automatically(s: Arc<AppState>) -> Result<usize> {
+    match claim_ready(&s).await? {
+        Claim::Ready(prepared) => run_claimed(s, prepared.items).await,
+        Claim::Busy | Claim::NothingReady => Ok(0),
     }
 }
 
@@ -370,7 +441,7 @@ async fn recording_evidence(
     track: &Track,
     candidate: Option<&Candidate>,
 ) -> Result<RecordingEvidence> {
-    let path = std::path::Path::new(&track.path);
+    let path = Path::new(&track.path);
     let content_key = if track.content_fingerprint.is_some() {
         track.content_fingerprint.clone()
     } else if let Some(value) = fingerprint_cache::cached(pool, path).await? {
@@ -390,34 +461,6 @@ async fn recording_evidence(
     })
 }
 
-async fn file_sha256(path: &std::path::Path) -> Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 128 * 1024];
-    loop {
-        let count = file.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(hex::encode(digest.finalize()))
-}
-
-fn numbered_destination(base: &std::path::Path, number: usize) -> PathBuf {
-    let parent = base.parent().unwrap_or_else(|| std::path::Path::new(""));
-    let stem = base
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("Corrected track");
-    let extension = base.extension().and_then(|value| value.to_str());
-    let filename = match extension {
-        Some(extension) => format!("{stem} ({number}).{extension}"),
-        None => format!("{stem} ({number})"),
-    };
-    parent.join(filename)
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum Publication {
     Written(PathBuf),
@@ -425,7 +468,7 @@ enum Publication {
 }
 
 impl Publication {
-    fn path(&self) -> &std::path::Path {
+    fn path(&self) -> &Path {
         match self {
             Self::Written(path) | Self::Reused(path) => path,
         }
@@ -436,10 +479,7 @@ impl Publication {
     }
 }
 
-fn destination_variant_number(
-    preferred: &std::path::Path,
-    candidate: &std::path::Path,
-) -> Option<usize> {
+fn destination_variant_number(preferred: &Path, candidate: &Path) -> Option<usize> {
     if candidate.file_name() == preferred.file_name() {
         return Some(1);
     }
@@ -457,11 +497,11 @@ fn destination_variant_number(
     (number >= 2).then_some(number)
 }
 
-async fn existing_destination_variants(preferred: &std::path::Path) -> Result<Vec<PathBuf>> {
+async fn existing_destination_variants(preferred: &Path) -> Result<Vec<PathBuf>> {
     let parent = preferred
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     let mut directory = match tokio::fs::read_dir(parent).await {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -489,15 +529,15 @@ struct AudioEquivalenceProbe {
 }
 
 async fn files_are_equivalent_audio(
-    temporary: &std::path::Path,
-    existing: &std::path::Path,
+    temporary: &Path,
+    existing: &Path,
     probe: &mut Option<AudioEquivalenceProbe>,
 ) -> Result<bool> {
     if probe.is_none() {
         let metadata = tokio::fs::metadata(temporary).await?;
         *probe = Some(AudioEquivalenceProbe {
             file_size: metadata.len(),
-            file_hash: file_sha256(temporary).await?,
+            file_hash: files::sha256(temporary).await?,
             fingerprint: None,
         });
     }
@@ -507,7 +547,7 @@ async fn files_are_equivalent_audio(
         return Ok(false);
     }
     if probe.file_size == existing_metadata.len() {
-        let existing_hash = file_sha256(existing).await?;
+        let existing_hash = files::sha256(existing).await?;
         if probe.file_hash == existing_hash {
             return Ok(true);
         }
@@ -530,7 +570,7 @@ async fn files_are_equivalent_audio(
         && (temporary_duration - existing_duration).abs() <= 3.0)
 }
 
-async fn discard_temporary(temporary: &std::path::Path) {
+async fn discard_temporary(temporary: &Path) {
     if let Err(error) = tokio::fs::remove_file(temporary).await {
         tracing::warn!(
             path = %temporary.display(),
@@ -540,7 +580,7 @@ async fn discard_temporary(temporary: &std::path::Path) {
     }
 }
 
-async fn paths_are_same_existing_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+async fn paths_are_same_existing_file(left: &Path, right: &Path) -> bool {
     tokio::try_join!(
         tokio::fs::canonicalize(left),
         tokio::fs::canonicalize(right)
@@ -556,9 +596,9 @@ async fn paths_are_same_existing_file(left: &std::path::Path, right: &std::path:
 /// are about to publish, so a stale file with missing or wrong cover art is
 /// never silently accepted as the "corrected" output.
 async fn publish_no_clobber(
-    temporary: &std::path::Path,
-    preferred: &std::path::Path,
-    excluded_source: Option<&std::path::Path>,
+    temporary: &Path,
+    preferred: &Path,
+    excluded_source: Option<&Path>,
     expected_artwork: Option<&[u8]>,
 ) -> Result<Publication> {
     tokio::fs::OpenOptions::new()
@@ -588,7 +628,7 @@ async fn publish_no_clobber(
         let destination = if number == 1 {
             preferred.to_owned()
         } else {
-            numbered_destination(preferred, number)
+            files::numbered(preferred, number)
         };
         match tokio::fs::hard_link(temporary, &destination).await {
             Ok(()) => {
@@ -626,7 +666,7 @@ async fn publish_no_clobber(
 /// to write. When no artwork is expected (defensive path) any existing output
 /// passes this check.
 async fn existing_file_has_expected_artwork(
-    existing: &std::path::Path,
+    existing: &Path,
     expected: Option<&[u8]>,
 ) -> Result<bool> {
     let Some(expected) = expected else {
@@ -634,20 +674,16 @@ async fn existing_file_has_expected_artwork(
     };
     let existing = existing.to_path_buf();
     let expected = expected.to_vec();
-    let matches = tokio::task::spawn_blocking(move || {
-        match crate::infrastructure::media::tag_writer::read_artwork(&existing) {
-            Ok(Some(bytes)) => bytes == expected,
-            _ => false,
-        }
+    let matches = tokio::task::spawn_blocking(move || match tag_writer::read_artwork(&existing) {
+        Ok(Some(bytes)) => bytes == expected,
+        _ => false,
     })
     .await?;
     Ok(matches)
 }
 
-fn temporary_destination(destination: &std::path::Path, track_id: i64) -> PathBuf {
-    let parent = destination
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
+fn temporary_destination(destination: &Path, track_id: i64) -> PathBuf {
+    let parent = destination.parent().unwrap_or_else(|| Path::new(""));
     let stem = destination
         .file_stem()
         .and_then(|value| value.to_str())
@@ -659,308 +695,242 @@ fn temporary_destination(destination: &std::path::Path, track_id: i64) -> PathBu
     parent.join(format!(".{stem}.magpie-{track_id}.{extension}"))
 }
 
+enum Filing {
+    Filed,
+    /// Already in the library, or sent back to review.
+    NotFiled,
+}
+
 /// Files every prepared track into the library. Per track:
 /// already in the library? → original to trash (or replace a lossy copy with
-/// a lossless one) · ReplayGain · verified cover · tags · atomic no-clobber
-/// publish · original to trash · index · folder cover · lyrics.
-/// After the batch: album gain per touched album folder, then one Navidrome scan.
+/// a lossless one) · verified cover · tags · atomic no-clobber publish ·
+/// original to trash · index · folder cover · lyrics.
+/// After the batch: ReplayGain per touched album folder.
 /// Returns how many songs were filed (songs already in the library don't count).
-pub async fn apply(s: Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
-    let cfg = s.config.read().await.clone();
-    let inbox = PathBuf::from(&cfg.input_dir);
-    let library_root = PathBuf::from(&cfg.output_dir);
+async fn apply(s: &Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
     let total = items.len();
-    let mut touched_albums = std::collections::BTreeSet::new();
+    let mut touched_albums = BTreeSet::new();
     let mut filed = 0usize;
-    for (i, item) in items.into_iter().enumerate() {
+    for (index, item) in items.into_iter().enumerate() {
         if s.workflow_cancelled().await {
             break;
         }
-        s.log_entry(
-            ActivityLogEntry::new("info", "apply", "Filing into the library")
-                .file(item.filename.clone())
-                .context(serde_json::json!({
-                    "track_id": item.track_id,
-                    "source": item.current_path,
-                    "destination": item.destination_path,
-                })),
-        )
-        .await;
-        let src = PathBuf::from(&item.current_path);
-
-        // 1. Is this recording already in the library?
-        let existing = library::find_same_recording(
-            &s.pool,
-            &item.evidence,
-            item.candidate.recording_id.as_deref(),
-        )
-        .await?;
-        let replaces = match existing {
-            Some(existing) if !library::is_upgrade(&item.evidence, &existing) => {
-                skip_known_recording(&s, &cfg, &item, &existing.path).await?;
-                s.set_workflow(
-                    WorkflowPhase::Apply,
-                    "apply",
-                    "already in library",
-                    i + 1,
-                    total,
-                    Some(item.current_path.clone()),
-                )
-                .await;
-                continue;
-            }
-            Some(existing) => Some(PathBuf::from(existing.path)),
-            None => None,
-        };
-
-        let candidate = item.candidate.clone();
         s.set_workflow(
             WorkflowPhase::Apply,
-            "replaygain",
-            "Analyzing playback loudness",
-            i,
+            "Filing songs into the library",
+            index,
             total,
             Some(item.current_path.clone()),
         )
         .await;
-        let replay_gain = match replaygain::get_or_analyze(&s.pool, &src).await {
-            Ok(value) => Some(value),
+        match file_item(s, &item, &mut touched_albums).await {
+            Ok(Filing::Filed) => filed += 1,
+            Ok(Filing::NotFiled) => {}
+            // One bad track must not hold up the others.
             Err(error) => {
-                // ReplayGain improves compatible players but must never prevent the
-                // other corrected metadata from being written.
-                s.log_entry(
-                    ActivityLogEntry::new(
-                        "warn",
-                        "replaygain",
-                        "ReplayGain unavailable; writing other metadata",
-                    )
-                    .file(item.filename.clone())
-                    .error(error.as_ref()),
-                )
-                .await;
-                None
-            }
-        };
-        let artwork = match resolve_artwork(&s, &item.filename, &candidate).await {
-            Ok(artwork) => artwork,
-            Err(error) => {
-                return_track_for_cover(&s, item.track_id, &error).await?;
-                continue;
-            }
-        };
-        let dest = PathBuf::from(&item.destination_path);
-        if paths_resolve_to_same_target(&src, &dest).await? {
-            anyhow::bail!("refusing to file a song onto itself: {}", src.display());
-        }
-        let temporary = temporary_destination(&dest, item.track_id.0);
-        if let Some(parent) = dest.parent()
-            && let Err(error) = tokio::fs::create_dir_all(parent).await
-        {
-            s.log_entry(
-                ActivityLogEntry::new("error", "apply", "Failed to create the album folder")
-                    .file(item.filename.clone())
-                    .error(&error)
-                    .context(serde_json::json!({"directory": parent.display().to_string()})),
-            )
-            .await;
-            return Err(error.into());
-        }
-        if let Err(error) = tokio::fs::copy(&src, &temporary).await {
-            s.log_entry(
-                ActivityLogEntry::new("error", "apply", "Failed to copy source file")
-                    .file(item.filename.clone())
-                    .error(&error)
-                    .context(serde_json::json!({
-                        "source": src.display().to_string(),
-                        "destination": temporary.display().to_string()
-                    })),
-            )
-            .await;
-            return Err(error.into());
-        }
-
-        // 2. Tags (verified) and atomic publish.
-        let write_target = temporary.clone();
-        let write_limiter = s.tag_writes.read().await.clone();
-        let write_permit = write_limiter.acquire_owned().await?;
-        let expected_artwork = artwork.clone();
-        let tagged_candidate = candidate.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = write_permit;
-            let sanitized = tag_writer::write_resilient(
-                &write_target,
-                &tagged_candidate,
-                Some(artwork.clone()),
-                replay_gain,
-            )?;
-            tag_writer::verify_written_metadata(&write_target, &tagged_candidate)?;
-            tag_writer::verify_embedded_artwork(&write_target, &artwork)?;
-            Ok::<_, anyhow::Error>(sanitized)
-        })
-        .await?;
-        if result.as_ref().is_ok_and(|sanitized| *sanitized) {
-            s.log_entry(
-                ActivityLogEntry::new(
-                    "ok",
-                    "tags",
-                    "Removed malformed legacy tags with lossless stream-copy and retried",
-                )
-                .file(item.filename.clone()),
-            )
-            .await;
-        }
-        let publication = match result {
-            Ok(_) => {
-                publish_no_clobber(&temporary, &dest, Some(&src), Some(&expected_artwork)).await
-            }
-            Err(error) => Err(error),
-        };
-        let publication = match publication {
-            Ok(publication) => publication,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                s.increment_failed().await;
-                s.log_entry(
-                    ActivityLogEntry::new("error", "apply", "Tag writing failed")
-                        .file(item.filename.clone())
-                        .error(error.as_ref()),
-                )
-                .await;
-                sqlx::query(
-                    "UPDATE tracks SET status='failed',error=?,last_applied_at=? WHERE id=?",
-                )
-                .bind(format!("{error:#}"))
-                .bind(Utc::now().to_rfc3339())
-                .bind(item.track_id.0)
-                .execute(&s.pool)
-                .await?;
-                continue;
-            }
-        };
-        let final_path = publication.path().to_owned();
-        let reused_existing = publication.reused_existing();
-
-        // 3. The original goes to the trash, the library remembers the new file.
-        trash_source_after_output(&src, &final_path, &cfg.trash_dir, &cfg.staging_dir, &inbox)
-            .await?;
-        crate::acquire::downloaded_file_done(&s, &src, &final_path, reused_existing).await;
-        if let Some(old) = replaces.as_ref().filter(|old| **old != final_path) {
-            for file in std::iter::once(old.clone()).chain(lyrics::sidecars(old)) {
-                library::move_to_trash(&cfg.trash_dir, &library_root, &file).await?;
-            }
-            library::forget(&s.pool, old).await?;
-            s.log_entry(
-                ActivityLogEntry::new("ok", "library", "Replaced a lossy copy with lossless audio")
-                    .file(item.filename.clone())
-                    .context(serde_json::json!({"replaced": old.display().to_string()})),
-            )
-            .await;
-        }
-        library::remember(
-            &s.pool,
-            &library::LibraryEntry {
-                path: final_path.to_string_lossy().into_owned(),
-                duration: item.evidence.duration,
-                content_key: item.evidence.content_key.clone(),
-                isrc: item.evidence.isrc.clone(),
-                recording_id: candidate.recording_id.clone(),
-                title: Some(candidate.title.clone()),
-                artist: Some(candidate.artist.clone()),
-                album: candidate.album.clone(),
-                format: item.evidence.format.clone(),
-                bitrate: item.evidence.bitrate,
-                source: "inbox".into(),
-            },
-        )
-        .await?;
-
-        // 4. Extras. None of them can undo a successful filing.
-        if let Some(album_folder) = final_path.parent() {
-            if let Err(error) = library::write_folder_cover(album_folder, &expected_artwork).await {
-                tracing::warn!(%error, folder = %album_folder.display(), "could not write cover file");
-            }
-            touched_albums.insert(album_folder.to_path_buf());
-        }
-        if cfg.lyrics {
-            save_lyrics(&s, &item, &final_path).await;
-        }
-
-        sqlx::query("UPDATE tracks SET output_path=?,status='applied',error=NULL,last_applied_at=? WHERE id=?")
-            .bind(final_path.to_string_lossy().as_ref())
-            .bind(Utc::now().to_rfc3339())
-            .bind(item.track_id.0)
-            .execute(&s.pool)
-            .await?;
-        s.set_workflow(
-            WorkflowPhase::Apply,
-            "apply",
-            "applied",
-            i + 1,
-            total,
-            Some(item.current_path.clone()),
-        )
-        .await;
-        s.log_entry(
-            ActivityLogEntry::new(
-                "ok",
-                if reused_existing {
-                    "deduplicate"
-                } else {
-                    "apply"
-                },
-                if reused_existing {
-                    "Already in the library with the same tags and cover; original moved to trash"
-                } else {
-                    "Filed into the library"
-                },
-            )
-            .file(item.filename.clone())
-            .context(serde_json::json!({"output": final_path.display().to_string()})),
-        )
-        .await;
-        filed += 1;
-        for duplicate in &item.duplicates {
-            if let Err(error) = finish_duplicate(&s, duplicate, &final_path).await {
-                s.increment_failed().await;
-                let detail = format!("{error:#}");
-                let _ = sqlx::query(
-                    "UPDATE tracks SET status='failed',stage='failed',error=?,stage_message='Duplicate output was avoided, but moving the duplicate to trash failed',updated_at=? WHERE id=?",
-                )
-                .bind(&detail)
-                .bind(Utc::now().to_rfc3339())
-                .bind(duplicate.track_id.0)
-                .execute(&s.pool)
-                .await;
-                s.log_entry(
-                    ActivityLogEntry::new(
-                        "error",
-                        "deduplicate",
-                        "Duplicate output was avoided, but moving the duplicate to trash failed",
-                    )
-                    .file(duplicate.filename.clone())
-                    .error_text(detail),
-                )
-                .await;
+                tracing::error!(file = item.filename, "filing failed: {error:#}");
+                mark_failed(&s.pool, item.track_id, &error).await?;
             }
         }
-        sqlx::query("DELETE FROM tracks WHERE id=?")
-            .bind(item.track_id.0)
-            .execute(&s.pool)
-            .await?;
     }
     finish_batch(&touched_albums).await;
     Ok(filed)
+}
+
+async fn file_item(
+    s: &Arc<AppState>,
+    item: &PreviewItem,
+    touched_albums: &mut BTreeSet<PathBuf>,
+) -> Result<Filing> {
+    let cfg = &s.config;
+    tracing::info!(
+        file = item.filename,
+        track_id = item.track_id.0,
+        source = item.current_path,
+        destination = item.destination_path,
+        "filing into the library"
+    );
+    let src = PathBuf::from(&item.current_path);
+    let candidate = &item.candidate;
+
+    // 1. Is this recording already in the library?
+    let replaces = match library::find_same_recording(
+        &s.pool,
+        &item.evidence,
+        candidate.recording_id.as_deref(),
+    )
+    .await?
+    {
+        Some(existing) if !library::is_upgrade(&item.evidence, &existing) => {
+            skip_known_recording(s, item, &existing.path).await?;
+            return Ok(Filing::NotFiled);
+        }
+        Some(existing) => Some(PathBuf::from(existing.path)),
+        None => None,
+    };
+
+    let artwork = match resolve_artwork(s, &item.filename, candidate).await {
+        Ok(artwork) => artwork,
+        Err(error) => {
+            return_track_for_cover(s, item.track_id, &error).await?;
+            return Ok(Filing::NotFiled);
+        }
+    };
+    let dest = PathBuf::from(&item.destination_path);
+    if paths_resolve_to_same_target(&src, &dest).await? {
+        bail!("refusing to file a song onto itself: {}", src.display());
+    }
+    let temporary = temporary_destination(&dest, item.track_id.0);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("could not create the album folder {}", parent.display()))?;
+    }
+    tokio::fs::copy(&src, &temporary).await.with_context(|| {
+        format!(
+            "could not copy {} to {}",
+            src.display(),
+            temporary.display()
+        )
+    })?;
+
+    // 2. Tags (verified) and atomic publish.
+    let published = match write_tags(s, &temporary, candidate, &artwork).await {
+        Ok(()) => publish_no_clobber(&temporary, &dest, Some(&src), Some(&artwork)).await,
+        Err(error) => Err(error),
+    };
+    let publication = match published {
+        Ok(publication) => publication,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.context("tag writing failed"));
+        }
+    };
+    let final_path = publication.path().to_owned();
+    let reused_existing = publication.reused_existing();
+
+    // 3. The original goes to the trash, the library remembers the new file.
+    trash_source_after_output(
+        &src,
+        &final_path,
+        &cfg.trash_dir,
+        &cfg.staging_dir,
+        Path::new(&cfg.input_dir),
+    )
+    .await?;
+    crate::acquire::downloaded_file_done(s, &src, &final_path, reused_existing).await;
+    if let Some(old) = replaces.filter(|old| *old != final_path) {
+        for file in std::iter::once(old.clone()).chain(lyrics::sidecars(&old)) {
+            library::move_to_trash(&cfg.trash_dir, Path::new(&cfg.output_dir), &file).await?;
+        }
+        library::forget(&s.pool, &old).await?;
+        tracing::info!(
+            file = item.filename,
+            replaced = %old.display(),
+            "replaced a lossy copy with lossless audio"
+        );
+    }
+    library::remember(
+        &s.pool,
+        &library::LibraryEntry {
+            path: final_path.to_string_lossy().into_owned(),
+            duration: item.evidence.duration,
+            content_key: item.evidence.content_key.clone(),
+            isrc: item.evidence.isrc.clone(),
+            recording_id: candidate.recording_id.clone(),
+            title: Some(candidate.title.clone()),
+            artist: Some(candidate.artist.clone()),
+            album: candidate.album.clone(),
+            format: item.evidence.format.clone(),
+            bitrate: item.evidence.bitrate,
+            source: "inbox".into(),
+        },
+    )
+    .await?;
+
+    // 4. Extras. None of them can undo a successful filing.
+    if let Some(album_folder) = final_path.parent() {
+        if let Err(error) = library::write_folder_cover(album_folder, &artwork).await {
+            tracing::warn!(%error, folder = %album_folder.display(), "could not write cover file");
+        }
+        touched_albums.insert(album_folder.to_path_buf());
+    }
+    if cfg.lyrics {
+        save_lyrics(s, item, &final_path).await;
+    }
+    if reused_existing {
+        tracing::info!(
+            file = item.filename,
+            output = %final_path.display(),
+            "already in the library with the same tags and cover; original moved to trash"
+        );
+    } else {
+        tracing::info!(file = item.filename, output = %final_path.display(), "filed into the library");
+    }
+    for duplicate in &item.duplicates {
+        if let Err(error) = finish_duplicate(s, duplicate, &final_path).await {
+            let detail = format!("{error:#}");
+            let _ = sqlx::query(
+                "UPDATE tracks SET status='failed',stage='failed',error=?,stage_message='Duplicate output was avoided, but moving the duplicate to trash failed',updated_at=? WHERE id=?",
+            )
+            .bind(&detail)
+            .bind(Utc::now().to_rfc3339())
+            .bind(duplicate.track_id.0)
+            .execute(&s.pool)
+            .await;
+            tracing::error!(
+                file = duplicate.filename,
+                error = detail,
+                "duplicate output was avoided, but moving the duplicate to trash failed"
+            );
+        }
+    }
+    sqlx::query("DELETE FROM tracks WHERE id=?")
+        .bind(item.track_id.0)
+        .execute(&s.pool)
+        .await?;
+    Ok(Filing::Filed)
+}
+
+/// Writes and verifies the tags and cover of the temporary copy, off the
+/// async runtime and within the tag-writer limit.
+async fn write_tags(
+    s: &AppState,
+    target: &Path,
+    candidate: &Candidate,
+    artwork: &[u8],
+) -> Result<()> {
+    let permit = s.tag_writes.clone().acquire_owned().await?;
+    let path = target.to_path_buf();
+    let candidate = candidate.clone();
+    let artwork = artwork.to_vec();
+    let sanitized = tokio::task::spawn_blocking(move || {
+        let target = path;
+        let _permit = permit;
+        let sanitized = tag_writer::write_resilient(&target, &candidate, Some(artwork.clone()))?;
+        tag_writer::verify_written_metadata(&target, &candidate)?;
+        tag_writer::verify_embedded_artwork(&target, &artwork)?;
+        Ok::<_, anyhow::Error>(sanitized)
+    })
+    .await??;
+    if sanitized {
+        tracing::info!(
+            file = %target.display(),
+            "removed malformed legacy tags with lossless stream-copy and retried"
+        );
+    }
+    Ok(())
 }
 
 /// The recording is already in the library and the new file is not better:
 /// the new file and its input duplicates go to the trash.
 async fn skip_known_recording(
     s: &Arc<AppState>,
-    cfg: &Config,
     item: &PreviewItem,
     library_path: &str,
 ) -> Result<()> {
-    let inbox = std::path::Path::new(&cfg.input_dir);
+    let cfg = &s.config;
+    let inbox = Path::new(&cfg.input_dir);
     let sources = std::iter::once((item.track_id, item.current_path.as_str(), false)).chain(
         item.duplicates.iter().map(|duplicate| {
             (
@@ -971,31 +941,25 @@ async fn skip_known_recording(
         }),
     );
     for (track_id, path, missing) in sources {
-        let original = std::path::Path::new(path);
+        let original = Path::new(path);
         if !missing {
             library::discard_original(&cfg.trash_dir, &cfg.staging_dir, inbox, original).await?;
         }
-        crate::acquire::downloaded_file_done(s, original, std::path::Path::new(library_path), true)
-            .await;
+        crate::acquire::downloaded_file_done(s, original, Path::new(library_path), true).await;
         sqlx::query("DELETE FROM tracks WHERE id=?")
             .bind(track_id.0)
             .execute(&s.pool)
             .await?;
     }
-    s.log_entry(
-        ActivityLogEntry::new(
-            "ok",
-            "deduplicate",
-            "Already in your library; the new copy was moved to trash",
-        )
-        .file(item.filename.clone())
-        .context(serde_json::json!({"library": library_path})),
-    )
-    .await;
+    tracing::info!(
+        file = item.filename,
+        library = library_path,
+        "already in your library; the new copy was moved to trash"
+    );
     Ok(())
 }
 
-async fn save_lyrics(s: &Arc<AppState>, item: &PreviewItem, audio: &std::path::Path) {
+async fn save_lyrics(s: &AppState, item: &PreviewItem, audio: &Path) {
     let candidate = &item.candidate;
     let names = crate::domain::credits::normalize_featured(&candidate.artist, &candidate.title);
     match lyrics::fetch_and_save(
@@ -1009,12 +973,7 @@ async fn save_lyrics(s: &Arc<AppState>, item: &PreviewItem, audio: &std::path::P
     .await
     {
         Ok(lyrics::Saved::Synced(path) | lyrics::Saved::Plain(path)) => {
-            s.log_entry(
-                ActivityLogEntry::new("ok", "lyrics", "Saved lyrics")
-                    .file(item.filename.clone())
-                    .context(serde_json::json!({"lyrics": path.display().to_string()})),
-            )
-            .await;
+            tracing::info!(file = item.filename, lyrics = %path.display(), "saved lyrics");
         }
         Ok(lyrics::Saved::Nothing) => {}
         Err(error) => {
@@ -1024,20 +983,24 @@ async fn save_lyrics(s: &Arc<AppState>, item: &PreviewItem, audio: &std::path::P
 }
 
 /// After a batch: album ReplayGain for every album folder that got new songs.
-/// Navidrome's file watcher picks up the new files by itself.
-async fn finish_batch(touched_albums: &std::collections::BTreeSet<PathBuf>) {
-    if !touched_albums.is_empty() && rsgain::available() {
-        for folder in touched_albums {
-            if let Err(error) = rsgain::tag_album_folder(folder).await {
-                tracing::warn!(%error, "album ReplayGain failed");
-            }
+async fn finish_batch(touched_albums: &BTreeSet<PathBuf>) {
+    if touched_albums.is_empty() {
+        return;
+    }
+    if !rsgain::available() {
+        tracing::warn!("rsgain is not installed; ReplayGain tags were not written");
+        return;
+    }
+    for folder in touched_albums {
+        if let Err(error) = rsgain::tag_album_folder(folder).await {
+            tracing::warn!(%error, folder = %folder.display(), "album ReplayGain failed");
         }
     }
 }
 
 async fn return_track_for_cover(
-    state: &Arc<AppState>,
-    track_id: crate::types::TrackId,
+    state: &AppState,
+    track_id: TrackId,
     error: &anyhow::Error,
 ) -> Result<()> {
     let detail = format!("Cover verification failed before writing: {error:#}");
@@ -1049,34 +1012,30 @@ async fn return_track_for_cover(
     .bind(track_id.0)
     .execute(&state.pool)
     .await?;
-    state
-        .log_entry(
-            ActivityLogEntry::new("warn", "artwork", "Track returned to Review").detail(detail),
-        )
-        .await;
+    tracing::warn!(track_id = track_id.0, detail, "track returned to review");
     Ok(())
 }
 
 async fn finish_duplicate(
     state: &Arc<AppState>,
     duplicate: &DuplicateSource,
-    output: &std::path::Path,
+    output: &Path,
 ) -> Result<()> {
-    let source = std::path::Path::new(&duplicate.current_path);
+    let source = Path::new(&duplicate.current_path);
     if !duplicate.source_missing {
         if paths_resolve_to_same_target(source, output).await? {
-            anyhow::bail!(
+            bail!(
                 "refusing to trash a duplicate because it is the filed song: {}",
                 source.display()
             );
         }
-        let cfg = state.config.read().await.clone();
+        let cfg = &state.config;
         trash_source_after_output(
             source,
             output,
             &cfg.trash_dir,
             &cfg.staging_dir,
-            std::path::Path::new(&cfg.input_dir),
+            Path::new(&cfg.input_dir),
         )
         .await?;
     }
@@ -1085,21 +1044,13 @@ async fn finish_duplicate(
         .bind(duplicate.track_id.0)
         .execute(&state.pool)
         .await?;
-    state
-        .log_entry(
-            ActivityLogEntry::new(
-                "ok",
-                "deduplicate",
-                "Duplicate copy in the inbox; kept one song and moved this copy to trash",
-            )
-            .file(duplicate.filename.clone())
-            .context(serde_json::json!({
-                "source": duplicate.current_path,
-                "output": output.display().to_string(),
-                "source_missing": duplicate.source_missing
-            })),
-        )
-        .await;
+    tracing::info!(
+        file = duplicate.filename,
+        source = duplicate.current_path,
+        output = %output.display(),
+        source_missing = duplicate.source_missing,
+        "duplicate copy in the inbox; kept one song and moved this copy to trash"
+    );
     Ok(())
 }
 
@@ -1108,53 +1059,38 @@ async fn finish_duplicate(
 /// is only published when it has valid matching cover art. Only artwork that
 /// matches the selected release is considered.
 pub(crate) async fn resolve_artwork(
-    state: &Arc<AppState>,
+    state: &AppState,
     filename: &str,
-    candidate: &crate::infrastructure::providers::Candidate,
+    candidate: &Candidate,
 ) -> Result<Vec<u8>> {
-    let limiter = state.artwork_downloads.read().await.clone();
-    let _permit = limiter.acquire_owned().await?;
+    let _permit = state.artwork_downloads.acquire().await?;
     match crate::application::artwork::resolve_for_write(&state.pool, &state.client, candidate)
         .await
     {
         Ok(bytes) => {
-            state
-                .log_entry(
-                    ActivityLogEntry::new("ok", "artwork", "Downloaded verified cover art")
-                        .file(filename.to_owned())
-                        .context(serde_json::json!({
-                            "provider": candidate.provider,
-                            "url": candidate.cover_url,
-                        })),
-                )
-                .await;
+            tracing::debug!(
+                file = filename,
+                provider = candidate.provider,
+                url = candidate.cover_url,
+                "downloaded verified cover art"
+            );
             Ok(bytes)
         }
         Err(error) => {
-            state
-                .log_entry(
-                    ActivityLogEntry::new(
-                        "warn",
-                        "artwork",
-                        "No matching cover artwork is available; track returned to review",
-                    )
-                    .file(filename.to_owned())
-                    .error_text(format!("{error:#}")),
-                )
-                .await;
+            tracing::warn!(
+                file = filename,
+                "no matching cover artwork is available: {error:#}"
+            );
             Err(error)
         }
     }
 }
 
-async fn paths_resolve_to_same_target(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-) -> Result<bool> {
+async fn paths_resolve_to_same_target(source: &Path, destination: &Path) -> Result<bool> {
     let source = tokio::fs::canonicalize(source).await?;
     let destination_parent = destination
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("output file has no parent directory"))?;
+        .ok_or_else(|| anyhow!("output file has no parent directory"))?;
     tokio::fs::create_dir_all(destination_parent).await?;
     let destination = match tokio::fs::canonicalize(destination).await {
         Ok(path) => path,
@@ -1162,7 +1098,7 @@ async fn paths_resolve_to_same_target(
             tokio::fs::canonicalize(destination_parent).await?.join(
                 destination
                     .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("output file has no filename"))?,
+                    .ok_or_else(|| anyhow!("output file has no filename"))?,
             )
         }
         Err(error) => return Err(error.into()),
@@ -1173,21 +1109,20 @@ async fn paths_resolve_to_same_target(
 /// Moves the original to the trash (or deletes it when it was one of magpie's
 /// own downloads), but only after the filed song exists.
 async fn trash_source_after_output(
-    source: &std::path::Path,
-    destination: &std::path::Path,
-    trash: &std::path::Path,
-    staging: &std::path::Path,
-    inbox: &std::path::Path,
-) -> Result<Option<PathBuf>> {
+    source: &Path,
+    destination: &Path,
+    trash: &Path,
+    staging: &Path,
+    inbox: &Path,
+) -> Result<()> {
     let output = tokio::fs::metadata(destination)
         .await
-        .map_err(|error| anyhow::anyhow!("filed song is unavailable: {error}"))?;
+        .map_err(|error| anyhow!("filed song is unavailable: {error}"))?;
     if !output.is_file() {
-        anyhow::bail!("filed song is not a regular file")
+        bail!("filed song is not a regular file")
     }
     library::discard_original(trash, staging, inbox, source).await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,6 +1327,126 @@ mod tests {
         );
     }
 
+    async fn insert_ready_track(
+        pool: &sqlx::SqlitePool,
+        path: &Path,
+        format: Option<&str>,
+        content_key: &str,
+    ) -> i64 {
+        let track_id = sqlx::query(
+            "INSERT INTO tracks(path,filename,format,duration,content_fingerprint,status,
+             is_missing,first_seen_at,last_seen_at,last_scanned_at,stage)
+             VALUES(?,?,?,180.0,?,'selected',0,'now','now','now','ready')",
+        )
+        .bind(path.to_string_lossy().as_ref())
+        .bind(path.file_name().unwrap().to_string_lossy().as_ref())
+        .bind(format)
+        .bind(content_key)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let candidate_id = sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,album,cover_url,score,artwork_status)
+             VALUES(?,'deezer','Song','Artist','Album','https://example.test/cover.png',95,'verified')",
+        )
+        .bind(track_id)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+            .bind(candidate_id)
+            .bind(track_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        track_id
+    }
+
+    async fn filing_state(directory: &Path) -> Arc<AppState> {
+        let config =
+            crate::config::Config::with_folders(&directory.join("music"), &directory.join("data"));
+        tokio::fs::create_dir_all(&config.input_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config.output_dir).await.unwrap();
+        let pool = crate::infrastructure::db::connect(&config.db_path)
+            .await
+            .unwrap();
+        crate::infrastructure::provider_cache::put(
+            &pool,
+            "artwork-url",
+            &crate::infrastructure::provider_cache::url_key("https://example.test/cover.png"),
+            &serde_json::json!({
+                "data_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    tag_writer::test_artwork_png()
+                )
+            }),
+            Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+        Arc::new(AppState::new(config, pool))
+    }
+
+    async fn stage_of(pool: &sqlx::SqlitePool, track_id: i64) -> (String, String) {
+        sqlx::query_as("SELECT status,stage FROM tracks WHERE id=?")
+            .bind(track_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_song_whose_tags_cannot_be_written_leaves_the_ready_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = filing_state(directory.path()).await;
+        let source = Path::new(&state.config.input_dir).join("broken.mp3");
+        tokio::fs::write(&source, b"not audio at all")
+            .await
+            .unwrap();
+        let track_id = insert_ready_track(&state.pool, &source, Some("mp3"), "fp:broken").await;
+
+        let Claim::Ready(prepared) = claim_ready(&state).await.unwrap() else {
+            panic!("the track should be ready");
+        };
+        assert_eq!(run_claimed(state.clone(), prepared.items).await.unwrap(), 0);
+
+        assert_eq!(
+            stage_of(&state.pool, track_id).await,
+            ("failed".into(), "failed".into())
+        );
+        assert!(source.exists());
+        // The next inbox cycle does not try it again.
+        assert!(matches!(
+            claim_ready(&state).await.unwrap(),
+            Claim::NothingReady
+        ));
+        assert!(!state.workflow_running().await);
+    }
+
+    #[tokio::test]
+    async fn one_unplannable_song_does_not_hold_up_the_others() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = filing_state(directory.path()).await;
+        let inbox = Path::new(&state.config.input_dir);
+        let unknown = inbox.join("no-extension");
+        let good = inbox.join("good.flac");
+        tokio::fs::write(&unknown, b"?").await.unwrap();
+        tokio::fs::write(&good, b"audio").await.unwrap();
+        let unknown_id = insert_ready_track(&state.pool, &unknown, None, "fp:unknown").await;
+        let good_id = insert_ready_track(&state.pool, &good, Some("flac"), "fp:good").await;
+
+        let prepared = prepare_apply(&state).await.unwrap();
+
+        assert_eq!(prepared.items.len(), 1);
+        assert_eq!(prepared.items[0].track_id.0, good_id);
+        assert_eq!(
+            stage_of(&state.pool, unknown_id).await,
+            ("failed".into(), "failed".into())
+        );
+    }
+
     #[test]
     fn recognizes_only_numbered_variants_of_the_preferred_destination() {
         let base = std::path::Path::new("/output/Artist - Song.mp3");
@@ -1506,8 +1561,8 @@ mod tests {
             .unwrap();
         assert!(retagged.success());
         assert_ne!(
-            file_sha256(&temporary).await.unwrap(),
-            file_sha256(&preferred).await.unwrap()
+            files::sha256(&temporary).await.unwrap(),
+            files::sha256(&preferred).await.unwrap()
         );
 
         let published = publish_no_clobber(&temporary, &preferred, None, None)
@@ -1553,14 +1608,12 @@ mod tests {
             &existing,
             &candidate,
             Some(artwork_a.clone()),
-            None,
         )
         .unwrap();
         crate::infrastructure::media::tag_writer::write(
             &temporary,
             &candidate,
             Some(artwork_b.clone()),
-            None,
         )
         .unwrap();
 
@@ -1602,7 +1655,7 @@ mod tests {
             .await
             .unwrap();
         assert!(published.reused_existing());
-        let trashed = trash_source_after_output(
+        trash_source_after_output(
             &source,
             published.path(),
             &trash,
@@ -1610,12 +1663,12 @@ mod tests {
             &inbox,
         )
         .await
-        .unwrap()
         .unwrap();
 
         assert!(!source.exists());
-        assert!(trashed.ends_with("input.mp3"));
-        assert!(trashed.starts_with(&trash));
+        let (trashed, _) = files::audio_files(&trash);
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].ends_with("input.mp3"));
         assert!(preferred.exists());
         assert!(!directory.path().join("Artist - Song (2).mp3").exists());
     }
@@ -1666,12 +1719,12 @@ mod tests {
         assert!(source.exists());
 
         tokio::fs::write(&output, b"corrected").await.unwrap();
-        let trashed = trash_source_after_output(&source, &output, &trash, &staging, &inbox)
+        trash_source_after_output(&source, &output, &trash, &staging, &inbox)
             .await
-            .unwrap()
             .unwrap();
         assert!(!source.exists());
-        assert_eq!(tokio::fs::read(&trashed).await.unwrap(), b"original");
+        let (trashed, _) = files::audio_files(&trash);
+        assert_eq!(tokio::fs::read(&trashed[0]).await.unwrap(), b"original");
         assert_eq!(tokio::fs::read(&output).await.unwrap(), b"corrected");
     }
 

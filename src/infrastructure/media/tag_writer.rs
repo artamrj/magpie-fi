@@ -1,26 +1,22 @@
-use crate::infrastructure::{media::replaygain::ReplayGain, providers::Candidate};
+use crate::infrastructure::providers::{Candidate, musicbrainz::is_mbid};
 use anyhow::{Context, Result, bail};
-use image::GenericImageView;
 use lofty::{
-    config::WriteOptions,
+    config::{ParseOptions, WriteOptions},
     file::TaggedFileExt,
+    flac::FlacFile,
+    ogg::OggPictureStorage,
     picture::{Picture, PictureType},
     prelude::*,
     probe::Probe,
     tag::{ItemKey, ItemValue, Tag, TagItem},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::path::Path;
 
-pub fn write(
-    path: &Path,
-    candidate: &Candidate,
-    artwork: Option<Vec<u8>>,
-    replay_gain: Option<ReplayGain>,
-) -> Result<()> {
+/// Cover images larger than this are refused.
+pub const MAX_ARTWORK_BYTES: usize = 20 * 1024 * 1024;
+
+pub fn write(path: &Path, candidate: &Candidate, artwork: Option<Vec<u8>>) -> Result<()> {
     let mut candidate = candidate.clone();
     crate::application::metadata_completion::normalize_release_fields(&mut candidate);
     let ext = path
@@ -29,7 +25,7 @@ pub fn write(
         .unwrap_or("")
         .to_ascii_lowercase();
     if matches!(ext.as_str(), "wav" | "aiff" | "aif") {
-        bail!("{ext} writing skipped because it is conditional/unsafe in this MVP");
+        bail!("{ext} files are not tagged: their tag support is unreliable");
     }
     let mut file = Probe::open(path)?.guess_file_type()?.read()?;
     let preserved_artwork = valid_embedded_artwork(&file);
@@ -81,15 +77,16 @@ pub fn write(
     optional(tag, ItemKey::Composer, &candidate.composer);
     optional(tag, ItemKey::Label, &candidate.label);
     optional(tag, ItemKey::RecordingDate, &candidate.year);
-    if let Some(replay_gain) = replay_gain {
-        write_replaygain(tag, replay_gain);
-    }
     optional(
         tag,
         ItemKey::MusicBrainzRecordingId,
-        &candidate.recording_id,
+        &musicbrainz_id(&candidate.recording_id),
     );
-    optional(tag, ItemKey::MusicBrainzReleaseId, &candidate.release_id);
+    optional(
+        tag,
+        ItemKey::MusicBrainzReleaseId,
+        &musicbrainz_id(&candidate.release_id),
+    );
     let artist_ids = candidate
         .artist_credits
         .iter()
@@ -235,15 +232,14 @@ pub fn write_resilient(
     path: &Path,
     candidate: &Candidate,
     artwork: Option<Vec<u8>>,
-    replay_gain: Option<ReplayGain>,
 ) -> Result<bool> {
-    match write(path, candidate, artwork.clone(), replay_gain) {
+    match write(path, candidate, artwork.clone()) {
         Ok(()) => Ok(false),
         Err(initial_error) => {
             sanitize_legacy_metadata(path).with_context(|| {
                 format!("initial tag read failed ({initial_error}); lossless tag cleanup failed")
             })?;
-            write(path, candidate, artwork, replay_gain).with_context(|| {
+            write(path, candidate, artwork).with_context(|| {
                 format!("tag cleanup succeeded, but writing still failed ({initial_error})")
             })?;
             Ok(true)
@@ -386,100 +382,21 @@ pub fn verify_embedded_artwork(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Only real MusicBrainz IDs go into MusicBrainz tags.
+fn musicbrainz_id(value: &Option<String>) -> Option<String> {
+    value.clone().filter(|id| is_mbid(id))
+}
+
+/// The front cover from the FLAC stream's own PICTURE metadata blocks (not
+/// a picture inside the Vorbis comments).
 fn native_flac_front_cover(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut file = std::fs::File::open(path)?;
-    let mut prefix = [0_u8; 10];
-    file.read_exact(&mut prefix)?;
-    if &prefix[..3] == b"ID3" {
-        if prefix[6..10].iter().any(|byte| byte & 0x80 != 0) {
-            bail!("invalid ID3 size before FLAC stream");
-        }
-        let id3_size = prefix[6..10]
-            .iter()
-            .fold(0_u64, |size, byte| (size << 7) | u64::from(*byte));
-        let footer_size = if prefix[5] & 0x10 != 0 { 10 } else { 0 };
-        file.seek(SeekFrom::Start(10 + id3_size + footer_size))?;
-    } else {
-        file.seek(SeekFrom::Start(0))?;
-    }
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic)?;
-    if &magic != b"fLaC" {
-        bail!("file does not contain a FLAC stream");
-    }
-
-    loop {
-        let mut header = [0_u8; 4];
-        file.read_exact(&mut header)?;
-        let is_last = header[0] & 0x80 != 0;
-        let block_type = header[0] & 0x7f;
-        let length =
-            (u32::from(header[1]) << 16) | (u32::from(header[2]) << 8) | u32::from(header[3]);
-        if block_type == 6 {
-            if length > 20 * 1024 * 1024 + 1024 {
-                bail!("FLAC PICTURE block exceeds the artwork safety limit");
-            }
-            let mut block = vec![0_u8; length as usize];
-            file.read_exact(&mut block)?;
-            if let Some((picture_type, data)) = parse_flac_picture_block(&block)?
-                && picture_type == 3
-            {
-                return Ok(Some(data.to_vec()));
-            }
-        } else {
-            file.seek(SeekFrom::Current(i64::from(length)))?;
-        }
-        if is_last {
-            return Ok(None);
-        }
-    }
-}
-
-fn parse_flac_picture_block(block: &[u8]) -> Result<Option<(u32, &[u8])>> {
-    let mut position = 0;
-    let picture_type = take_be_u32(block, &mut position)?;
-    let mime_length = take_be_u32(block, &mut position)? as usize;
-    skip_bytes(block, &mut position, mime_length)?;
-    let description_length = take_be_u32(block, &mut position)? as usize;
-    skip_bytes(block, &mut position, description_length)?;
-    // Width, height, color depth, and indexed-color count.
-    skip_bytes(block, &mut position, 16)?;
-    let data_length = take_be_u32(block, &mut position)? as usize;
-    let end = position
-        .checked_add(data_length)
-        .ok_or_else(|| anyhow::anyhow!("FLAC PICTURE data length overflow"))?;
-    let data = block
-        .get(position..end)
-        .ok_or_else(|| anyhow::anyhow!("truncated FLAC PICTURE data"))?;
-    Ok(Some((picture_type, data)))
-}
-
-fn take_be_u32(data: &[u8], position: &mut usize) -> Result<u32> {
-    let end = position
-        .checked_add(4)
-        .ok_or_else(|| anyhow::anyhow!("FLAC PICTURE field offset overflow"))?;
-    let bytes: [u8; 4] = data
-        .get(*position..end)
-        .ok_or_else(|| anyhow::anyhow!("truncated FLAC PICTURE field"))?
-        .try_into()?;
-    *position = end;
-    Ok(u32::from_be_bytes(bytes))
-}
-
-fn skip_bytes(data: &[u8], position: &mut usize, count: usize) -> Result<()> {
-    let end = position
-        .checked_add(count)
-        .ok_or_else(|| anyhow::anyhow!("FLAC PICTURE field length overflow"))?;
-    if end > data.len() {
-        bail!("truncated FLAC PICTURE field");
-    }
-    *position = end;
-    Ok(())
-}
-
-fn write_replaygain(tag: &mut Tag, replay_gain: ReplayGain) {
-    set(tag, ItemKey::ReplayGainTrackGain, &replay_gain.gain_tag());
-    set(tag, ItemKey::ReplayGainTrackPeak, &replay_gain.peak_tag());
+    let flac = FlacFile::read_from(&mut file, ParseOptions::new())?;
+    Ok(flac
+        .pictures()
+        .iter()
+        .find(|(picture, _)| picture.pic_type() == PictureType::CoverFront)
+        .map(|(picture, _)| picture.data().to_vec()))
 }
 
 fn picture_from_bytes(data: Vec<u8>) -> Result<Picture> {
@@ -495,8 +412,19 @@ pub struct ArtworkInfo {
     pub sha256: String,
 }
 
-pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<ArtworkInfo> {
-    if data.len() > 20 * 1024 * 1024 {
+/// What [`check_artwork`] learned about an acceptable image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtworkCheck {
+    pub info: ArtworkInfo,
+    /// One plain colour: usually a placeholder, unless the release is known.
+    pub single_colour: bool,
+}
+
+/// Checks that `data` is a usable cover: a supported format, square-ish, at
+/// least 300×300 and not blank. The size is read from the header before the
+/// image is decoded, so huge images are refused cheaply.
+pub fn check_artwork(data: &[u8]) -> Result<ArtworkCheck> {
+    if data.len() > MAX_ARTWORK_BYTES {
         bail!("cover image exceeds the 20 MB safety limit");
     }
     let format = image::guess_format(data).context("cover image format is unsupported")?;
@@ -507,9 +435,9 @@ pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<Artwo
         image::ImageFormat::WebP => "image/webp",
         _ => bail!("cover image format is unsupported"),
     };
-    let decoded = image::load_from_memory_with_format(data, format)
-        .context("cover image could not be fully decoded")?;
-    let (width, height) = decoded.dimensions();
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(data), format)
+        .into_dimensions()
+        .context("cover image could not be read")?;
     if width < 300 || height < 300 {
         bail!("cover image is too small ({width}x{height}; minimum is 300x300)");
     }
@@ -520,6 +448,8 @@ pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<Artwo
     if !(0.75..=1.333_334).contains(&ratio) {
         bail!("cover image aspect ratio is not credible album artwork");
     }
+    let decoded = image::load_from_memory_with_format(data, format)
+        .context("cover image could not be fully decoded")?;
     let rgba = decoded.to_rgba8();
     let step = ((rgba.len() / 4) / 100_000).max(1);
     let mut visible = 0_usize;
@@ -540,19 +470,27 @@ pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<Artwo
     if sampled == 0 || visible * 50 < sampled {
         bail!("cover image is blank or almost fully transparent");
     }
-    let constant_pixels = (0..3).all(|channel| max[channel].saturating_sub(min[channel]) <= 1);
-    if constant_pixels && !trusted_exact_release {
-        bail!("cover image is a blank constant-color placeholder");
-    }
+    let single_colour = (0..3).all(|channel| max[channel].saturating_sub(min[channel]) <= 1);
     // Lofty must also recognize the bytes because it is responsible for the
     // actual container-specific embedding operation.
-    picture_from_bytes(data.to_vec())?;
-    Ok(ArtworkInfo {
-        width,
-        height,
-        mime,
-        sha256: hex::encode(Sha256::digest(data)),
+    Picture::from_reader(&mut std::io::Cursor::new(data))?;
+    Ok(ArtworkCheck {
+        info: ArtworkInfo {
+            width,
+            height,
+            mime,
+            sha256: hex::encode(Sha256::digest(data)),
+        },
+        single_colour,
     })
+}
+
+pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<ArtworkInfo> {
+    let check = check_artwork(data)?;
+    if check.single_colour && !trusted_exact_release {
+        bail!("cover image is a blank constant-color placeholder");
+    }
+    Ok(check.info)
 }
 
 pub fn validate_artwork(data: &[u8]) -> Result<()> {
@@ -649,11 +587,19 @@ mod tests {
             ..Default::default()
         };
         let artwork = one_pixel_png();
-        write(&path, &candidate, Some(artwork.clone()), None).unwrap();
-        write(&path, &candidate, None, None).unwrap();
+        write(&path, &candidate, Some(artwork.clone())).unwrap();
+        write(&path, &candidate, None).unwrap();
 
         let file = Probe::open(&path).unwrap().read().unwrap();
         assert_eq!(file.primary_tag().unwrap().pictures()[0].data(), artwork);
+    }
+
+    #[test]
+    fn other_catalog_ids_never_become_musicbrainz_tags() {
+        assert_eq!(musicbrainz_id(&Some("1440857781".into())), None);
+        assert_eq!(musicbrainz_id(&Some("discogs:123".into())), None);
+        let mbid = "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d";
+        assert_eq!(musicbrainz_id(&Some(mbid.into())).as_deref(), Some(mbid));
     }
 
     #[test]
@@ -682,7 +628,7 @@ mod tests {
             ..Default::default()
         };
         let artwork = one_pixel_png();
-        write(&path, &candidate, Some(artwork.clone()), None).unwrap();
+        write(&path, &candidate, Some(artwork.clone())).unwrap();
 
         assert_eq!(
             native_flac_front_cover(&path).unwrap().as_deref(),
@@ -718,7 +664,7 @@ mod tests {
                 release_type: Some("Single".into()),
                 ..Default::default()
             };
-            write(&path, &candidate, Some(one_pixel_png()), None).unwrap();
+            write(&path, &candidate, Some(one_pixel_png())).unwrap();
 
             let file = Probe::open(&path).unwrap().read().unwrap();
             let tag = file.primary_tag().unwrap();
@@ -743,74 +689,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(release_type_tag(&unknown), None);
-    }
-
-    #[test]
-    fn replaygain_uses_portable_item_keys() {
-        let mut tag = Tag::new(lofty::tag::TagType::Id3v2);
-        write_replaygain(
-            &mut tag,
-            ReplayGain {
-                track_gain_db: -7.235,
-                track_peak: 0.987_654_3,
-            },
-        );
-        assert_eq!(
-            tag.get_string(ItemKey::ReplayGainTrackGain),
-            Some("-7.24 dB")
-        );
-        assert_eq!(
-            tag.get_string(ItemKey::ReplayGainTrackPeak),
-            Some("0.987654")
-        );
-    }
-
-    #[test]
-    fn replaygain_survives_an_mp3_disk_round_trip() {
-        if std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("round-trip.mp3");
-        let status = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
-            .arg("sine=frequency=440:duration=0.1")
-            .args(["-q:a", "9"])
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let candidate = Candidate {
-            title: "Round trip".into(),
-            artist: "Test artist".into(),
-            ..Candidate::default()
-        };
-        write(
-            &path,
-            &candidate,
-            None,
-            Some(ReplayGain {
-                track_gain_db: -6.25,
-                track_peak: 0.75,
-            }),
-        )
-        .unwrap();
-
-        let file = Probe::open(&path).unwrap().read().unwrap();
-        let tag = file.primary_tag().unwrap();
-        assert_eq!(
-            tag.get_string(ItemKey::ReplayGainTrackGain),
-            Some("-6.25 dB")
-        );
-        assert_eq!(
-            tag.get_string(ItemKey::ReplayGainTrackPeak),
-            Some("0.750000")
-        );
     }
 
     #[test]
@@ -902,7 +780,7 @@ mod tests {
                 is_compilation: true,
                 ..Default::default()
             };
-            write(&path, &candidate, None, None).unwrap();
+            write(&path, &candidate, None).unwrap();
             verify_written_metadata(&path, &candidate)
                 .unwrap_or_else(|error| panic!("{extension}: {error:#}"));
 
@@ -921,7 +799,7 @@ mod tests {
                 )],
                 ..Default::default()
             };
-            write(&path, &band, None, None).unwrap();
+            write(&path, &band, None).unwrap();
             verify_written_metadata(&path, &band)
                 .unwrap_or_else(|error| panic!("{extension} band identity: {error:#}"));
         }

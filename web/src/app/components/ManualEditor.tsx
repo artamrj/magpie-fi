@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { api } from "@/api/client";
-import type { ArtistCredit, Candidate, Track } from "@/api/types";
+import { api, post } from "../../api/client";
+import type { ArtistCredit, Candidate, Track } from "../../api/types";
 import { Icon } from "../Icons";
 
 export function ManualEditor({
@@ -44,10 +44,7 @@ export function ManualEditor({
     setResolving(true);
     setFeedback(undefined);
     try {
-      const found = await api<Candidate>("/source/resolve", {
-        method: "POST",
-        body: JSON.stringify({ url: sourceUrl }),
-      });
+      const found = await post<Candidate>("/source/resolve", { url: sourceUrl });
       setForm((current) => ({
         ...current,
         title: found.title || current.title,
@@ -80,6 +77,10 @@ export function ManualEditor({
         method: "PUT",
         body: JSON.stringify({
           ...form,
+          // Not editable here; sent back so saving keeps them.
+          track_total: candidate?.track_total ?? null,
+          disc_number: candidate?.disc_number ?? null,
+          disc_total: candidate?.disc_total ?? null,
           artist_credits: artistCredits.filter((credit) => credit.name.trim()),
           album_artist_credits: albumArtistCredits.filter((credit) => credit.name.trim()),
           track_number: form.track_number ? Number(form.track_number) : null,

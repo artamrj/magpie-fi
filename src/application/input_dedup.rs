@@ -6,9 +6,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::io::AsyncReadExt;
 
 const DURATION_TOLERANCE_SECONDS: f64 = 3.0;
 
@@ -153,9 +151,7 @@ pub fn is_lossless(format: &str) -> bool {
 }
 
 pub async fn sha256_cached(pool: &SqlitePool, path: &Path) -> Result<String> {
-    let metadata = tokio::fs::metadata(path).await?;
-    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-    let modified_ns = system_time_ns(metadata.modified()?);
+    let (size, modified_ns) = crate::application::files::stamp(path).await?;
     let path_text = path.to_string_lossy();
     if let Some(hash) = sqlx::query_scalar::<_, String>(
         "SELECT sha256 FROM content_hash_cache WHERE path=? AND file_size=? AND file_mtime_ns=?",
@@ -169,17 +165,7 @@ pub async fn sha256_cached(pool: &SqlitePool, path: &Path) -> Result<String> {
         return Ok(hash);
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 128 * 1024];
-    loop {
-        let count = file.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    let hash = hex::encode(digest.finalize());
+    let hash = crate::application::files::sha256(path).await?;
     sqlx::query(
         "INSERT INTO content_hash_cache(path,file_size,file_mtime_ns,sha256,updated_at)
          VALUES(?,?,?,?,?)
@@ -194,14 +180,6 @@ pub async fn sha256_cached(pool: &SqlitePool, path: &Path) -> Result<String> {
     .execute(pool)
     .await?;
     Ok(hash)
-}
-
-fn system_time_ns(value: SystemTime) -> i64 {
-    let nanos = value
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
 struct DisjointSet {

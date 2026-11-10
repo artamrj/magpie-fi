@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use crate::infrastructure::{file_stamp::FileStamp, process};
+use anyhow::Result;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use std::{path::Path, time::Duration};
@@ -14,32 +15,21 @@ pub enum Integrity {
 }
 
 pub fn available() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    process::available("ffmpeg", "-version")
 }
 
 /// Fully decodes the first audio stream into FFmpeg's null sink. No source data
 /// is changed and no decoded audio is stored.
 pub async fn check(pool: &SqlitePool, path: &Path) -> Result<Integrity> {
-    let metadata = tokio::fs::metadata(path).await?;
-    let size = i64::try_from(metadata.len()).context("audio file is too large")?;
-    let mtime_ns: i64 = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .context("audio modification time is out of range")?;
+    let stamp = FileStamp::of(path).await?;
     let path_text = path.to_string_lossy();
     let cached: Option<(bool, Option<String>)> = sqlx::query_as(
         "SELECT is_healthy,diagnostic FROM integrity_cache \
          WHERE path=? AND file_size=? AND file_mtime_ns=?",
     )
     .bind(path_text.as_ref())
-    .bind(size)
-    .bind(mtime_ns)
+    .bind(stamp.size)
+    .bind(stamp.mtime_ns)
     .fetch_optional(pool)
     .await?;
     if let Some((is_healthy, diagnostic)) = cached
@@ -55,25 +45,20 @@ pub async fn check(pool: &SqlitePool, path: &Path) -> Result<Integrity> {
         });
     }
 
-    let output = tokio::time::timeout(
-        CHECK_TIMEOUT,
-        Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-xerror",
-                "-err_detect",
-                "explode",
-                "-nostdin",
-                "-i",
-            ])
-            .arg(path)
-            .args(["-map", "0:a:0", "-f", "null", "-"])
-            .output(),
-    )
-    .await
-    .context("audio integrity check timed out")?
-    .context("could not start ffmpeg; install FFmpeg to check audio integrity")?;
+    let mut command = Command::new("ffmpeg");
+    command
+        .args([
+            "-v",
+            "error",
+            "-xerror",
+            "-err_detect",
+            "explode",
+            "-nostdin",
+            "-i",
+        ])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", "null", "-"]);
+    let output = process::run(command, CHECK_TIMEOUT).await?;
     let integrity = classify(
         output.status.success(),
         &String::from_utf8_lossy(&output.stderr),
@@ -89,8 +74,8 @@ pub async fn check(pool: &SqlitePool, path: &Path) -> Result<Integrity> {
          is_healthy=excluded.is_healthy,diagnostic=excluded.diagnostic,checked_at=excluded.checked_at",
     )
     .bind(path_text.as_ref())
-    .bind(size)
-    .bind(mtime_ns)
+    .bind(stamp.size)
+    .bind(stamp.mtime_ns)
     .bind(is_healthy)
     .bind(diagnostic)
     .bind(Utc::now().to_rfc3339())

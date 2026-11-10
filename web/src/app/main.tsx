@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { Gate } from "./components/Gate";
 import { telegram } from "./telegram";
-import "@/styles/index.css";
+import "../styles/index.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {

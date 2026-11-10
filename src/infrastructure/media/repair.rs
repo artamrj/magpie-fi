@@ -1,4 +1,7 @@
-use crate::{domain::audio, infrastructure::media::integrity};
+use crate::{
+    domain::audio,
+    infrastructure::{media::integrity, process},
+};
 use anyhow::{Context, Result, bail};
 use sqlx::SqlitePool;
 use std::{
@@ -72,10 +75,13 @@ pub async fn repair(pool: &SqlitePool, path: &Path) -> Result<RepairResult> {
     add_encoder(&mut command, &extension)?;
     command.arg("-y").arg(&temporary);
 
-    let output = tokio::time::timeout(REPAIR_TIMEOUT, command.output())
-        .await
-        .context("audio repair timed out")?
-        .context("could not start FFmpeg for audio repair")?;
+    let output = match process::run(command, REPAIR_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error).context("audio repair failed");
+        }
+    };
     if !output.status.success() || !temporary.is_file() {
         let _ = tokio::fs::remove_file(&temporary).await;
         bail!(

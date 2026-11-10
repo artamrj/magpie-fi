@@ -15,17 +15,13 @@ services:
     build: .
     image: ghcr.io/artamrj/magpie-fi:${MAGPIE_TAG:-latest}
     restart: unless-stopped
-    # Web page (Get music, Review, status), published on loopback only. To open it
-    # from your phone or inside Telegram, give it an HTTPS address (README:
-    # "Phone and Telegram Mini App"); with Telegram set up it then needs a login.
     ports:
-      - "${MAGPIE_PORT:-7331}:7331"
-    # Settings come from .env (see .env.example). Empty means "off" or default.
+      # Loopback only: use Tailscale Funnel or an SSH tunnel to reach it from elsewhere.
+      - "127.0.0.1:${MAGPIE_PORT:-7331}:7331"
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
       RUST_LOG: "${RUST_LOG:-info}"
-      # Paths inside the container; the host paths are set by the volumes below.
       MAGPIE_MUSIC_ROOT: /music
       MAGPIE_DATA_DIR: /data
       MAGPIE_INBOX_CHECK_SECONDS: "${MAGPIE_INBOX_CHECK_SECONDS:-}"
@@ -36,7 +32,6 @@ services:
       MAGPIE_MAX_PARALLEL_DOWNLOADS: "${MAGPIE_MAX_PARALLEL_DOWNLOADS:-}"
       MAGPIE_DOWNLOAD_PAUSE_SECONDS: "${MAGPIE_DOWNLOAD_PAUSE_SECONDS:-}"
       MAGPIE_MAX_COLLECTION_TRACKS: "${MAGPIE_MAX_COLLECTION_TRACKS:-}"
-      # Used only when config/ytdlp/cookies.txt exists.
       MAGPIE_YTDLP_COOKIES: /config/cookies.txt
       MAGPIE_TELEGRAM_BOT_TOKEN: "${MAGPIE_TELEGRAM_BOT_TOKEN:-}"
       MAGPIE_TELEGRAM_OWNERS: "${MAGPIE_TELEGRAM_OWNERS:-}"
@@ -50,10 +45,7 @@ services:
       MAGPIE_YOUTUBE_API_KEY: "${MAGPIE_YOUTUBE_API_KEY:-}"
       MAGPIE_DISCOGS_TOKEN: "${MAGPIE_DISCOGS_TOKEN:-}"
       MAGPIE_LASTFM_KEY: "${MAGPIE_LASTFM_KEY:-}"
-      MAGPIE_THEAUDIODB_KEY: "${MAGPIE_THEAUDIODB_KEY:-}"
     volumes:
-      # The whole music root as ONE mount, so moves between inbox, library and
-      # trash are instant renames.
       - ${MUSIC_ROOT:-./music}:/music
       - ${DATA_ROOT:-./data}/magpie:/data
       - ./config/ytdlp:/config:ro

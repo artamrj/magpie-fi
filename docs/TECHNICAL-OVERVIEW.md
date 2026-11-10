@@ -1,541 +1,473 @@
-# magpie — Technical Overview & End-to-End Algorithm
+# magpie — Technical Overview
 
-magpie is the program at the heart of magpie-fi. It watches an inbox folder, reads
-every new audio file, verifies it can be decoded, identifies it through a cascade of
-online metadata providers, lets the user approve or correct uncertain matches, and
-files each song into the library (with ReplayGain, verified cover art and lyrics),
-moving the original to a trash folder. The identification engine comes from the
-earlier *ununknown* project.
+magpie is the program at the heart of magpie-fi. It gets songs from links (Telegram bot, web
+page), files sent to the bot and an inbox folder; checks that each file can be decoded;
+identifies it through a cascade of online sources; lets you approve or correct uncertain matches;
+and files each song into the library with verified cover art, lyrics and ReplayGain, moving the
+original to a trash folder. The identification engine comes from the earlier *ununknown* project.
 
-This document describes how the whole system works: the components, the data model,
-and the exact algorithm the pipeline runs from first launch to final corrected file.
+This document describes how it works: the parts, the data, and the exact steps a song goes
+through. The design and its reasons are in [BLUEPRINT.md](../BLUEPRINT.md).
 
 ---
 
-## 1. High-level architecture
+## 1. Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Browser (React SPA)                          │
-│Setup / Scan button / Review queue / Inspector / Write dock           │
-└──────────────────────────────────▲───────────────────────────────────┘
-                                   │  local HTTP  (127.0.0.1:7331)
-┌──────────────────────────────────┴───────────────────────────────────┐
-│                          Rust server (axum)                          │
-│HTTP router  →  handlers  →  application services                     │
-│                                                                      │
-│  ┌─────────────────────────────────────────────────────────────┐     │
-│  │ scan (run · process · providers · persist)                  │     │
-│  │ input_dedup · smart_approval · metadata_completion · apply  │     │
-│  └──────────────────────────────┬──────────────────────────────┘     │
-│                                  │                                   │
-│  ┌──────────────────────────────┴───────────────────────────────┐    │
-│  │  Infrastructure layer                                        │    │
-│  │  media: audio reader · integrity · fingerprint · replaygain ·│    │
-│  │         tag_writer · repair                                  │    │
-│  │  providers: 20+ metadata/audio sources (see §7)              │    │
-│  │  db: SQLite + repository (tracks/candidates) + caches        │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────┐      ┌──────────────────────────────┐
+│ Web page (React, web/)     │      │ Telegram (links, files,      │
+│ Get music · All tracks ·   │      │ buttons, Mini App)           │
+│ Review · Issues · Ready ·  │      └──────────────┬───────────────┘
+│ Inspector · status dock    │                     │ Bot API (long polling)
+└─────────────▲──────────────┘                     │
+              │ HTTP 127.0.0.1:7331                │
+┌─────────────┴────────────────────────────────────▼───────────────┐
+│ magpie (Rust, axum + tokio + SQLite/sqlx)                        │
+│                                                                  │
+│  http: router → auth → handlers        telegram: bot, status     │
+│  acquire: links → wanted → yt-dlp → .magpie/staging              │
+│  application:                                                    │
+│    scan (walk · process · providers · persist)                   │
+│    input_dedup · smart_approval · metadata_completion · artwork  │
+│    apply (file into library) · library (layout, index, trash)    │
+│  domain: audio reading, matcher, credits, genres                 │
+│  infrastructure:                                                 │
+│    providers: identification, cover and genre sources (§10)      │
+│    media: integrity · fingerprint · tag_writer · repair · rsgain │
+│    db + caches · lyrics (LRCLIB) · process (tool runner)         │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ only writer
+                                ▼
+                       MUSIC_ROOT/library ──► Navidrome (run by you)
 ```
 
-- **Web page** (`web/`): a React SPA served by the same Rust process. It polls
-  `/api/status` and `/api/tracks` and renders the review workspace.
-- **Backend** (`src/`): Rust + axum + tokio + SQLite (`sqlx`). All heavy work
-  (audio decoding, fingerprinting, network lookups, tag writing) runs in workers with
-  bounded concurrency.
-- **Storage**: one SQLite database plus audio/tag caches. No external services are
-  required to run; metadata providers are queried over HTTP when configured/enabled.
-
-The API is deliberately small: `setup`, `status`, `inbox/check`, `tracks`, `write`
-(`src/http/router.rs`). Production builds bind only to loopback and refuse
-non-loopback bind addresses because the API has intentional access to local paths
-(`src/main.rs:160`).
+- **Web page** (`web/`): React, built with Vite and served from disk by the same process
+  (`MAGPIE_WEB_DIR`, `/usr/share/magpie` in the image). It polls `/api/status`, `/api/tracks`
+  and `/api/requests`.
+- **Program** (`src/`): one binary. Heavy work (decoding, fingerprinting, network lookups, tag
+  writing) runs with bounded concurrency (§13).
+- **Storage**: one SQLite file plus caches in it. Settings come only from `MAGPIE_*` environment
+  variables (`src/config.rs`).
+- magpie never calls Navidrome. Navidrome's file watcher sees new files and playlists.
 
 ---
 
 ## 2. Data model
 
-SQLite schema is versioned in `migrations/` and applied at startup.
+The schema is in `migrations/` and is applied at startup. Current tables:
 
 | Table | Purpose |
 |---|---|
-| `tracks` | One row per input file: current tags, status, stage, content fingerprint, selected candidate, output path |
-| `candidates` | One row per metadata suggestion from a provider; full field set + `score` + `score_breakdown` (JSON) |
-| `candidate_sources` | Per-provider evidence rows for a candidate |
-| `provider_cache` | Keyed HTTP responses from metadata providers (disposable, cleared at midnight) |
-| `fingerprint_cache` | Chromaprint result keyed by path+size+mtime |
-| `integrity_cache` | Healthy/corrupt verdict keyed by path+size+mtime |
-| `replaygain_cache` | Track gain/peak keyed by path+size+mtime |
-| `content_hash_cache` | SHA-256 fallback for duplicate detection |
-| `artwork_overrides` | User-confirmed cover URL per path |
-| `automatic_scan_files` | Size+mtime snapshot so automatic scans only re-process changed files |
-| `settings` / `maintenance` | Key/value configuration |
+| `tracks` | One row per inbox/staging file on its way: current tags, `status`/`stage`, content key, selected candidate. Deleted once the song is filed. |
+| `candidates` | One row per suggestion from a source: full field set, `score`, `score_breakdown` (JSON: sources, duration delta, audio recognition, artwork), artist credits, artwork list and status |
+| `artwork_overrides` | Cover chosen by you for a file, so it survives a rescan |
+| `canonical_names` | Preferred spelling of artist/album names (aliases, Latin vs. original script) |
+| `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
+| `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
+| `requests` | One row per link someone asked for; Telegram status message ids |
+| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
+| `playlists` | One row per playlist link → one `.m3u8` file |
+| `telegram_guests`, `telegram_invites`, `telegram_state` | Invited guests, one-time invite tokens, the update offset |
+| `login_links`, `sessions` | Web login: one-time links and 30-day sessions (SHA-256 hashes only) |
+| `provider_cache` | Source answers and downloaded cover bytes, each with an expiry (§14) |
+| `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | Per-file analysis results keyed by path + size + mtime |
+| `maintenance` | Small key/value bookkeeping (last daily cleanup) |
 
-**Track lifecycle** (the `status`/`stage` columns drive the UI):
+**Track lifecycle** (`status`/`stage`; the web page's tabs are Review, Issues and Ready):
 
 ```
-new/discovered → needs_review/review ──▶ selected/ready ──▶ applied (row deleted after write)
-                        │                        │
-                        ├─ duplicate/skipped     ├─ needs_review/review (returned, "Undo")
-                        ├─ corrupt/failed        └─ corrupt/failed
-                        └─ unmatched/review
+new → review (needs you) ──▶ ready ──▶ filed (row deleted)
+        │                      │
+        ├─ duplicate/skipped   ├─ review (cover failed, or "Undo")
+        ├─ corrupt/failed      └─ failed (filing failed → Issues)
+        └─ unmatched/review
 ```
 
 ---
 
-## 3. Startup sequence
+## 3. Startup and background loops
 
-1. Read the configuration from `MAGPIE_*` environment variables (`src/config.rs`),
-   create the inbox, library, trash and data folders, connect to SQLite, run
-   migrations, apply pending cleanup, empty trash days older than `MAGPIE_TRASH_DAYS`.
-2. Launch background tasks (`src/main.rs`):
-   - **Midnight cleanup** — deletes disposable provider responses / downloaded artwork
-     while idle, and empties old trash days.
-   - **Hourly media-cache limit** — enforces a shared 100 MiB budget on
-     fingerprint/integrity/ReplayGain caches (oldest first).
-   - **Inbox loop** — first refreshes the library index (§5a), then runs an inbox
-     cycle every `MAGPIE_INBOX_CHECK_SECONDS` or immediately on `POST /api/inbox/check`.
-     The library index is refreshed again every six hours.
-3. Start the HTTP server, serving `/api/*` and the built web page.
+`src/main.rs`:
+
+1. Read the configuration, create the inbox, library, trash, staging and data folders, connect
+   to SQLite (WAL, `0600` file), run migrations. Tracks left `processing` by a restart are marked
+   failed; expired source answers are removed.
+2. Run the daily cache cleanup if it has not run today, empty trash days older than
+   `MAGPIE_TRASH_DAYS`, and enforce the media-cache limit.
+3. Start the background tasks:
+   - **Midnight**: daily cache cleanup (§14) and trash purge, after any running workflow.
+   - **Hourly**: media-cache limit, skipped while a workflow runs.
+   - **Inbox loop**: refresh the library index (at start, then every six hours), then one inbox
+     cycle every `MAGPIE_INBOX_CHECK_SECONDS` or right away on `POST /api/inbox/check`.
+   - **Download worker** (`acquire::worker`), **Telegram bot** (`telegram::run`).
+   - **yt-dlp updater**: once a day, when `MAGPIE_YTDLP_SELF_UPDATE` is on (it is in the image).
+4. Serve `/api/*` and the web page. On SIGTERM/Ctrl+C the running workflow is asked to stop at a
+   safe point and given up to 30 s.
 
 ---
 
-## 4. The end-to-end algorithm (user journey)
+## 4. The inbox pipeline
 
-### Phase 0 — Configuration
-
-Folders and provider credentials come from the environment (`.env`). Nothing is
-configured in the database; `GET /api/setup` only shows the current values.
-
-### Phase 1 — Inbox check (every minute, or `POST /api/inbox/check`)
+### Phase 1 — Inbox check
 
 `scan::run_automatic` (`src/application/scan/mod.rs`):
 
-1. Walk the inbox **off the async runtime** (`spawn_blocking`), skipping folders and
-   files whose name starts with `.` or `@` (unfinished downloads, NAS metadata).
-2. Keep only files that are new or changed since the last check (size + mtime in
-   `automatic_scan_files`) **and** unchanged for `MAGPIE_INBOX_SETTLE_SECONDS`, so a
-   file that is still being copied waits for the next check.
-3. For each file, in parallel (limited by `metadata` + `fingerprint` semaphores):
-   - Read tags/audio properties with `audio::read`.
-   - Check decodability with `integrity::check` (cached).
-   - Compute a Chromaprint fingerprint (cached) or fall back to SHA-256.
-4. **Duplicate detection** inside the inbox runs before any network lookup (see §5).
+1. Walk the inbox and `.magpie/staging/` off the async runtime, skipping files and folders whose
+   name starts with `.` or `@` (unfinished downloads, NAS metadata).
+2. Keep files that are new or changed since the last check (`automatic_scan_files`). Inbox files
+   must also be unchanged for `MAGPIE_INBOX_SETTLE_SECONDS`; staging files don't wait.
+3. For each file, in parallel: read tags and audio properties, check decodability (cached),
+   compute a Chromaprint fingerprint (cached) or fall back to SHA-256.
+4. Group duplicates inside the inbox (§8) before any network lookup.
 
-### Phase 2 — Per-track matching
+### Phase 2 — Identify each song
 
-Each duplicate group is processed as one "file job" (`scan::process::process_file` →
-`process`, `src/application/scan/process.rs:3`). Two attempts are allowed per
-track; transient provider failures retry with backoff.
+Each duplicate group is one job (`scan::process::process_file`). A job gets two attempts.
 
-For each member of the group:
+1. **Corrupt** files are marked `corrupt` and go to Issues.
+2. **Identify** with the source cascade (§10). A source that answers 401, 429 or times out is
+   skipped for the rest of that check.
+3. **Sort** candidates by trust tier, then score.
+4. **Smart auto-selection** (§9) decides. No candidates → `unmatched`; candidates that fail the
+   rules → Review with the exact reason (ambiguous release, conflicting album, duration
+   mismatch, different performer, …).
+5. **Metadata completion** and **cover verification** (§11). If title, artist, album or a
+   verified cover is still missing, the song stays in Review.
+6. The result is written in one transaction per file (`scan/persist.rs`). Matched songs are
+   **Ready**.
 
-1. **Read metadata** — title/artist/album/etc. plus format, bitrate, duration.
-2. **Integrity check** — decode the stream. Corrupt files are marked `corrupt`,
-   blocked from writing, and counted as failed. (A later "check & fix" step can
-   salvage them via `media/repair.rs`.)
-3. **Fingerprint** — `fpcalc` via `fingerprint::calculate`, cached by
-   path+size+mtime. Failure is non-fatal; text/web sources still run.
-4. **Identify** — run the provider cascade (§7) and collect candidates.
-5. **Dedupe + sort candidates** by trust tier then score.
-6. **Smart auto-selection** (§6) decides whether to auto-approve.
-   - No candidates → `unmatched`, stays in Review with a human-readable reason.
-   - Candidates exist but fail the strict rules → stays in Review with the exact
-     reason (ambiguous release, conflicting album, duration mismatch, different
-     performer, etc.).
-   - A decision is made → run **metadata completion** (§8).
-7. **Metadata completion worker** merges missing fields only from *agreeing*
-   recordings and *compatible* releases, then verifies the actual cover image by
-   downloading it (§8). If title/artist/album/cover are still missing, the track
-   stays in Review instead of creating an incomplete identification.
-8. Persist the track + candidates + selected candidate. Matched tracks go to
-   **Ready**; everything else stays in **Review**.
+### Phase 3 — Review
 
-The whole scan stream is written through a single DB writer task
-(`scan::persist::db_writer`, `src/application/scan/persist.rs:56`) so SQLite is only
-ever touched from one connection at a time.
+In Review you can:
 
-### Phase 3 — Review loop (human in the loop)
+- **Choose a candidate** (`POST /api/tracks/{id}/choose`): re-runs completion and cover
+  verification for it.
+- **Auto-approve** (`POST /api/tracks/auto-approve`): the same rules as Phase 2 over all of
+  Review; doubtful songs stay.
+- **Edit by hand** (`PUT /api/tracks/{id}/manual`): a `manual` candidate (score 100). Pasting a
+  Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`).
+- **Change the cover** (`PUT /api/tracks/{id}/artwork`): a cover URL or a song link; the image is
+  verified and remembered in `artwork_overrides`. **Search again**:
+  `POST /api/tracks/{id}/artwork/search`.
+- **Undo** (`POST /api/tracks/{id}/review`): clears the choice, keeps the candidates.
+- **Remove** (`DELETE /api/tracks/{id}`): only unresolved Review songs inside the inbox or
+  staging. Your files go to the trash; magpie's downloads are deleted.
+- **Check & fix** (`POST /api/tracks/retry-issues`): re-runs everything in Issues. Corrupt files
+  first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
+  original as a `.magpie-damaged` backup.
 
-Tracks that auto-selection refused stay in Review (`stage='review'`). The user can:
+The Telegram bot asks about Telegram songs in Review with up to three candidates and calls the
+same choose/remove logic.
 
-- **Choose a candidate** (`POST /api/tracks/{id}/choose`) — re-runs completion +
-  cover verification for that candidate. The choice is accepted on recording
-  identity alone (title + artist + album); the track becomes Ready even if no
-  catalog cover could be verified, and the cover is retried at write time.
-- **Smart auto-select** (`POST /api/tracks/auto-approve`) — bulk-runs the same
-  `smart_approval::select` + completion + cover pipeline over all Review items.
-  Ambiguous/low-confidence ones stay in Review.
-- **Edit manually** (`PUT /api/tracks/{id}/manual`) — free-form editor; pasting a
-  Shazam/Spotify/YouTube/etc. song link can auto-fill fields via
-  `/api/source/resolve`. Creates a `manual` candidate (score 100).
-- **Update artwork** (`PUT /api/tracks/{id}/artwork`) — accepts a cover URL or a
-  supported song link, verifies the downloaded image, records an `artwork_overrides`
-  row so the choice survives future rescans.
-- **Undo identification** (`POST /api/tracks/{id}/review`) — clears the selected
-  candidate without deleting saved candidates.
-- **Remove the file** (`DELETE /api/tracks/{id}`) — deletes the source file *only if*
-  it resolves inside the configured input folder, and promotes the best remaining
-  duplicate input if one exists.
-- **Check & fix issues** (`POST /api/tracks/retry-issues`) — re-runs the pipeline on
-  `corrupt`/`failed`/`provider_error`/missing/retryable-cover tracks. Corrupt files
-  first go through `repair::repair`, which skips unreadable frames, re-encodes the
-  valid audio, and keeps the damaged original as a `.magpie-damaged` backup.
+### Phase 4 — File into the library
 
-### Phase 4 — File into the library (each inbox cycle, or `POST /api/write`)
+Each inbox cycle ends with `apply::apply_ready_automatically`; `POST /api/write` starts the same
+step now. `src/application/apply.rs`:
 
-The **apply service** (`src/application/apply.rs`) files every Ready track:
-
-1. **Prepare** (`prepare_apply`): load every `stage='ready'` track with its selected
-   candidate, re-run completion/canonicalization at this last mutable boundary,
-   re-group by recording evidence, pick one representative per group (promoting the
-   best *available* input if the selected one is missing), and compute each
-   destination with the library layout (`library::destination`,
-   `Album Artist/Album (Year)[ [Single]|[EP]]/NN - Title.ext`).
-2. **Per song** (`apply`):
-   - **Already in the library?** `library::find_same_recording` looks the recording up
-     in the permanent index (§5a). If it is there and the new file is not an upgrade
-     (lossless replacing lossy), the new file and its inbox duplicates go to the trash.
-   - **ReplayGain** — measure loudness with `replaygain::get_or_analyze` (cached).
-     Failure never blocks filing.
-   - **Artwork** — `resolve_artwork` fetches the verified cover bytes (mandatory; no
-     usable matching cover → back to Review).
-   - **Copy to a temporary file** in the album folder (`.Name.magpie-{id}.ext`),
-     **write tags** and verify them, **publish atomically** with `publish_no_clobber` (§9).
-   - **Original to trash** — `MUSIC_ROOT/.magpie/trash/<date>/<path in inbox>`, only after
-     the filed song exists. A replaced lossy copy (and its lyrics) goes there too.
-   - **Index** the filed song, write `cover.jpg` into the album folder if it has none,
-     and save lyrics from LRCLIB as a `.lrc`/`.txt` sidecar (`MAGPIE_LYRICS`).
-   - Inbox duplicates are finished the same way (`finish_duplicate`); the `tracks`
-     row is deleted.
-3. **After the batch** — `rsgain easy` re-measures every album folder that got new
-   songs (album gain). Navidrome's file watcher picks up the new files; magpie never calls Navidrome.
+1. **Prepare**: load every Ready track with its candidate, re-run completion and name
+   canonicalisation, re-group duplicates, pick the best available file per group, and compute
+   the destination (`library::destination`, §5 of the blueprint).
+2. **Per song**:
+   - **Already in the library?** (`library::find_same_recording`). If yes and the new file is not
+     an upgrade (lossless over lossy), the new file and its inbox duplicates go to the trash.
+   - **Cover**: fetch the verified bytes; no usable cover → back to Review.
+   - **Copy** to a temporary file in the album folder, **write and verify tags** and the
+     embedded cover, **publish** without overwriting anything (§12).
+   - **Original to trash** (`.magpie/trash/<date>/…`), only after the new file exists. A replaced
+     lossy copy and its lyrics go there too. Downloads from staging are deleted instead.
+   - **Index** the new file, write `cover.jpg` into the album folder if it has none, save LRCLIB
+     lyrics as `.lrc` (synced) or `.txt` (`MAGPIE_LYRICS`). None of these extras can undo the filing.
+   - If anything fails, that song is marked `failed` (Issues) and the next one continues.
+3. **After the batch**: `rsgain easy` on every album folder that got new songs writes track and
+   album ReplayGain (R128 tags for Opus). Without rsgain no gain tags are written and one warning
+   is logged per batch.
 
 ---
 
-## 4b. Getting music from links (`src/acquire/`)
+## 5. Getting music from links (`src/acquire/`)
 
 | Part | File | Job |
 |---|---|---|
 | Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube, the Shazam provider. Only public pages and documented APIs. |
-| Queue | `store.rs`, `migrations/0007_requests.sql` | `requests` (one per link), `wanted` (one per song, in order), `playlists` (one per playlist link). Retries after 30 s, 2 min, 10 min; then failed. |
-| Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first (`NORMAL`), ordinary videos only as a strict fallback (`STRICT`). |
-| yt-dlp | `ytdlp.rs` | YouTube Music song search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
+| Queue | `store.rs` | `requests`, `wanted`, `playlists`. Retries after 30 s, 2 min, 10 min; then failed. A request's `title` falls back to its first song. |
+| Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first, ordinary videos only as a strict fallback. |
+| yt-dlp | `ytdlp.rs` | YouTube Music search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
 | Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie/staging/` → write the link's title/artist/album/ISRC as tags. |
 
-Downloads are then identified and filed by the normal inbox cycle, which also walks
-`.magpie/staging/` (without the settle wait). When a download is filed, or recognised as a song
-that is already in the library, `acquire::downloaded_file_done` records the library path and
-rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths). Downloads are
-deleted after filing instead of going to the trash.
+Downloads are then identified and filed by the normal inbox cycle. When a download is filed, or
+found to be in the library already, `acquire::downloaded_file_done` records the library path and
+rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths).
 
-## 4c. Telegram (`src/telegram/`)
+## 6. Telegram (`src/telegram/`)
 
 | Part | File | Job |
 |---|---|---|
-| Client | `api.rs` | Bot API calls with magpie's HTTP client and frankenstein's types; waits on "retry after", ignores "message is not modified"; file download (Telegram allows bots up to 20 MB; bigger files get a clear answer instead). |
-| Bot | `mod.rs` | Long polling (offset kept in `telegram_state`), owners and guests (`telegram_guests`, one-time `telegram_invites`), links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
-| Status | `status.rs` | Every 3 s: redraws each open request's status message when its text changed, closes it when nothing is on the way or waiting for review, and asks about Telegram songs that wait in review (candidate buttons call the same choose/remove handlers as the web page). |
+| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie's HTTP client and frankenstein's types. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
+| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners and guests, random one-time invite tokens, links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
+| Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
 | Texts | `texts.rs` | Every message the bot sends, and the progress bar. |
 
-## 4d. Web page login (`src/http/auth.rs`)
+## 7. Web page login (`src/http/auth.rs`)
 
-- Without Telegram the page needs no login (it is published on loopback only, and
+- Without Telegram there is no login (the page is published on loopback only, and
   `MAGPIE_PUBLIC_URL` is refused).
 - With Telegram, `require_login` guards every `/api` route except `health`, `login` and `me`:
-  - **Mini App:** `Authorization: tma <initData>`; the HMAC-SHA256 signature is checked with a key
+  - **Mini App**: `Authorization: tma <initData>`; the HMAC-SHA256 signature is checked with a key
     derived from the bot token, and the data may be at most 24 h old. `/api/me` also sets a session
-    cookie, so `<img>` and `<audio>` requests (which cannot send the header) work.
-  - **Browser:** `/web` in the bot creates a one-time link (`login_links`, 10 minutes) →
-    `/api/login` starts a 30-day session (`sessions`, `HttpOnly` cookie, `SameSite=None; Secure`
-    over HTTPS). Tokens are stored as SHA-256 hashes.
-  - Only owners get through; guests get 403 and use the bot.
-- The page's CSP allows Telegram's Mini App script and framing by `web.telegram.org`, nothing else.
-
-## 5a. Library index
-
-`library_items` (`src/application/library.rs`) keeps one row per audio file in the
-library: path, size, mtime, duration, content key (fingerprint or SHA-256), ISRC,
-MusicBrainz recording ID, format and bitrate. It is filled when magpie files a song
-and by `library::index_library`, which walks the library at startup and every six
-hours to index music added by hand and forget deleted files. A new song is the same
-recording as a library file when the content is identical, or when the fingerprint,
-ISRC or MusicBrainz recording ID match **and** the durations are within 3 seconds.
-
-## 5. Duplicate detection algorithm (inside the inbox)
-
-`input_dedup::group_recordings` (`src/application/input_dedup.rs:51`) groups input
-files using **proof-only evidence** (never title similarity):
-
-- **Exact SHA-256** (`sha256:` key) — definitive, unioned unconditionally.
-- **Chromaprint fingerprint** (`fp:` key) — unioned only when durations match within
-  ±3 seconds.
-- **ISRC** — unioned only when the 12-character normalized ISRC matches *and*
-  durations are within ±3 seconds.
-
-Group membership is computed with a disjoint-set union; within each group the
-representative is the **best-quality** file: lossless formats first, then higher
-bitrate, then stable path order (`compare_quality`).
-
-Only the representative is matched online and produces one corrected output; the
-others are recorded as `duplicate/skipped` and later collapsed into that single
-output. Different audio, remixes, live versions, and materially different durations
-never union, so they remain separate and receive numbered filenames when corrected
-names collide.
-
-The same grouping is re-run at **apply time** (over `RecordingEvidence` built from
-the DB) so the workspace and the write queue always agree.
+    cookie, so `<img>` and `<audio>` requests work.
+  - **Browser**: `/web` in the bot creates a one-time link (`login_links`, 10 minutes) →
+    `/api/login` starts a 30-day session (`HttpOnly` cookie; `SameSite=None; Secure` over HTTPS).
+  - Only owners get through; guests get 403.
+- Write requests from a foreign `Origin` are rejected. The CSP allows Telegram's Mini App script
+  and framing by `web.telegram.org`, nothing else. Covers are always loaded through magpie's own
+  preview endpoints, never from catalog URLs.
+- The Mini App opens on Review with `?view=review`.
 
 ---
 
-## 6. Smart auto-selection
+## 8. Library index and duplicates
 
-`smart_approval::rank` (`src/application/smart_approval.rs:51`) scores every
-candidate instead of blindly trusting the raw provider score:
+**Library index.** `library_items` (`src/application/library.rs`) keeps one row per audio file in
+the library: path, size, mtime, duration, content key (fingerprint or SHA-256), ISRC, MusicBrainz
+recording ID, format and bitrate. It is filled when magpie files a song and by
+`library::index_library` (at start and every six hours), which also indexes music added by hand
+and forgets deleted files. A new song is the same recording as a library file when the content
+is identical, or when the fingerprint, ISRC or MusicBrainz recording ID match **and** the durations
+are within 3 seconds.
 
-**Score components** (weighted sum):
+**Duplicates inside the inbox.** `input_dedup::group_recordings` groups files by proof only, never
+by title:
+
+- same SHA-256 — always;
+- same Chromaprint fingerprint — only when durations are within ±3 s;
+- same ISRC — only when durations are within ±3 s.
+
+The best-quality file of each group (lossless first, then bitrate, then path) is identified
+online; the others become `duplicate/skipped` and are trashed when it is filed. Remixes, live
+versions and different lengths never group. The same grouping runs again when filing.
+
+---
+
+## 9. Smart auto-selection
+
+`smart_approval::rank` (`src/application/smart_approval.rs`) scores every candidate:
 
 | Signal | Weight / effect |
 |---|---|
-| Title similarity (normalized Levenshtein) | ×28 (or 21 if no existing title) |
-| Artist similarity | ×18 (or 15 if no existing artist) |
-| Duration delta | +16 (≤3s), +13 (≤8s), +7 (≤15s), +1 (≤30s), −14 (>30s) |
+| Title similarity | ×28 (or 21 if the file has no title) |
+| Artist similarity | ×18 (or 15 if the file has no artist) |
+| Duration delta | +16 (≤3 s), +13 (≤8 s), +7 (≤15 s), +1 (≤30 s), −14 (>30 s) |
 | Album match to existing tag | similarity ×18, −8 if conflicting |
 | Metadata completeness | album, cover, year, track no., genre, album artist, ISRC |
-| Multi-source agreement | up to +15 |
-| Provider trust | 0–5 |
-| Audio recognition bonus | +15 |
-| Original album year bonus | +4 |
+| Agreement between sources | up to +15 |
+| Source trust | 0–5 |
+| Recognised by audio | +15 |
+| Original album year | +4 |
 | Version tags (live/remix/acoustic/…) | −22 per unexpected, −16 per missing |
-| Compilation penalty | −7 |
+| Compilation | −7 |
 
-**Decision rules** — a candidate is auto-approved only when:
-- It is *supported*: recognized by audio, corroborated by ≥2 sources, or an exact
-  catalog match (credible provider + ≥0.90/≥0.82 title/artist + close duration).
-- Its total is ≥ 68, and no *different* recording is within 12 points (ties with the
-  same recording are tolerated; `same_recording` compares ISRC/version-tags/title).
-- Its version tags match the filename's version tags.
+A candidate is approved automatically only when:
 
-Tracks that fail stay in Review with a specific human reason (this is why "Auto
-approve" never writes a questionable release, a duet over a plain recording, a
-stripped version over an album version, or a wrong album).
+- it is *supported*: recognised by audio, confirmed by ≥2 sources, or an exact catalog match
+  (credible source, ≥0.90 title / ≥0.82 artist similarity, close duration);
+- its total is ≥ 68 and no *different* recording is within 12 points;
+- its version tags match the file's, and its length is at most 15 s off the audio.
+
+Everything else stays in Review with a reason.
 
 ---
 
-## 7. Provider cascade (identification)
+## 10. Source cascade
 
-`scan::providers::identify` (`src/application/scan/providers.rs:3`) runs a staged
-cascade — the "catalog runner". Order matters — cheap/free/authoritative sources run
-first, expensive or optional ones only when needed:
+`scan::providers::identify` (`src/application/scan/providers.rs`) asks 15 identification sources,
+cheap and free ones first:
 
-1. **AcoustID** (fingerprint lookup) → returns MusicBrainz recordings.
-2. **YouTube Data API** — only if a filename contains an exact video ID.
-3. **MusicBrainz text search** (title/artist).
-4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack**, **Navahang**
-   — free catalogs, good for Persian + international music.
-5. **Genius** — only when enrichment is still needed.
-6. **SongRec / Shazam** (audio recognition) — only when AcoustID found nothing and
-   no ≥90-score candidate exists; recognition is serialized (max 2 concurrent) and
-   cached. Its artist/title is then **fed back through the catalogs** to find album,
-   artwork, credits, release info, ISRC.
-7. **AudD** — only if SongRec also failed (needs a token).
-8. **Spotify** — ISRC cross-check plus release/artwork/track-number enrichment.
-9. **SoundCloud** (needs credentials), then **Discogs**, **Last.fm**,
-   **TheAudioDB**, **Wikidata** (also supplies artist genres).
+1. **AcoustID** (fingerprint, needs `MAGPIE_ACOUSTID_KEY`) → **MusicBrainz** recordings.
+2. **YouTube Data API**, only if the filename contains a video ID (needs a key).
+3. **MusicBrainz** text search.
+4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack**, **Navahang** — free
+   catalogs, good for Persian and international music.
+5. **Genius**, only when the results still lack details.
+6. **SongRec** (Shazam recognition), only when AcoustID found nothing and no candidate scores
+   ≥ 90; at most two at a time. Its artist/title is fed back through the catalogs of step 3–5.
+7. **AudD**, only if SongRec also failed (needs a token); same feedback.
+8. **Spotify** (ISRC cross-check), **SoundCloud**, **Discogs**, **Last.fm** — each only with its
+   key or token.
 
-Post-processing per track:
-- Credits are normalized (`canonical_names`, `domain/credits`).
-- Candidates are canonicalized (alias/prefer-latin names).
-- **Source agreement** (`apply_source_agreement`) boosts corroborating rows.
-- Artwork fallbacks + `artwork_overrides` are applied.
-- Genres are enriched from Wikidata artist lookups when needed.
-- The `score` stored per candidate is the final blended score with a JSON
-  `score_breakdown` (sources, duration delta, audio-recognition flag, artwork list).
+Free without a key: MusicBrainz, Apple Music, Deezer, Radio Javan, Audiomack, Navahang, Genius,
+SongRec. Other sources: **Cover Art Archive** (covers by MusicBrainz release), **Wikidata**
+(artist genres, only when the candidates have no specific genre), **LRCLIB** (lyrics when filing).
 
-All HTTP goes through `resilient_http` (timeouts, retries) and a
-`provider_cache`; MusicBrainz requests are rate-limited to one per second.
+After the cascade: names are canonicalised (`canonical_names`, `domain/credits`), agreeing
+candidates are boosted (`apply_source_agreement`), cover fallbacks and `artwork_overrides` are
+applied, and genres are filled. Only real MusicBrainz IDs are ever written to MusicBrainz tags.
+
+All HTTP goes through one client with timeouts (`resilient_http` adds a DNS-over-HTTPS fallback
+for known catalog hosts) and through `provider_cache`. MusicBrainz is limited to one request per
+second. `RUST_LOG=magpie=debug` logs what every source returned or why it was skipped.
 
 ---
 
-## 8. Metadata completion & cover verification
+## 11. Metadata completion and cover verification
 
-`metadata_completion::complete` (`src/application/metadata_completion.rs:32`):
+`metadata_completion::complete` (`src/application/metadata_completion.rs`):
 
-1. Collect **agreeing recordings** (same ISRC, or same version tags + ≥0.90 title +
-   ≥0.82 artist + compatible duration), ranked by donor quality.
-2. **Never replace** a field that already has a value — only fill missing ones.
-3. Copy release-specific fields (album, album artist, track/disc number, dates,
-   label, country) **only from albums compatible with the chosen release** so a
-   compilation can't silently change the original release.
-4. Normalize release fields: `Single`/`EP` naming and album artist defaults.
-5. `audit` produces a weighted completeness score plus the readiness flag
-   `core_complete` (title, artist, album, **verified cover**).
+1. Collect **agreeing recordings** (same ISRC, or same version tags + ≥0.90 title + ≥0.82
+   artist + compatible duration).
+2. **Never replace** a field that has a value; only fill missing ones.
+3. Copy release fields (album, album artist, track/disc number, dates, label, country) **only
+   from compatible releases**, so a compilation can't replace the original album.
+4. Normalise `Single`/`EP` and album-artist defaults.
+5. `audit` gives a completeness score and `core_complete` (title, artist, album, **verified
+   cover**).
 
-**Cover-art worker** (`src/application/artwork.rs`):
+**Cover worker** (`src/application/artwork.rs`):
 
-- `collect_artwork_candidates` gathers every allowed URL for the selected
-  recording: the candidate's own artwork list + `cover_url`, `score_breakdown`
-  artwork alternatives, and **artwork already verified for the same release or
-  ISRC elsewhere in the library** (`library_verified_artwork`). Bytes are shared
-  through the artwork-url provider cache, so the first verified cover of an album
-  becomes available to every other track on the same release.
-- Each candidate image must *match the selected release* (release ID, ISRC+album,
-  or compatible album+artist) unless user-confirmed. It is downloaded and
-  validated (`cover_art_archive` / `inspect_artwork`), rejecting broken, blank,
-  corrupted, or too-small images.
-- `ensure_usable_cover` is the scan/selection worker. On temporary failures
-  (timeout/429/5xx) it marks `retryable_error`; if the stored URLs are unusable it
-  refreshes once from Deezer-by-ISRC + iTunes/Deezer, then checks the library
-  again. Only when nothing verifies does it declare the cover missing
-  (`cover_required`).
-- `resolve_for_write` is the apply-time fetch: it returns the exact bytes to embed
-  or fails, so a file is never written without valid matching artwork.
+- `collect_artwork_candidates`: the candidate's own artwork list and `cover_url`, plus covers
+  already verified for the same release or ISRC in the library. Release IDs are compared only
+  when they are MusicBrainz IDs.
+- Each image must match the selected release (release ID, ISRC + album, or compatible album +
+  artist) unless you chose it. It is downloaded and checked; broken, blank or single-colour images
+  and images smaller than 300×300 are rejected.
+- `ensure_usable_cover`: temporary failures (timeout, 429, 5xx) mark the cover retryable; if the
+  stored URLs are unusable it tries a fresh Deezer/iTunes lookup once. Only then is the cover
+  "missing".
+- `resolve_for_write`: at filing time, returns the exact bytes to embed or fails, so no file is
+  written without a matching cover.
 
-**Readiness**: `core_complete` — which requires a *verified* cover — is the bar for
-every path to Ready: automatic write, explicit `/choose`, manual entry, artwork
-update, and the on-demand `/tracks/{id}/artwork/search` worker. A track with a
-missing, broken, or merely retryable cover stays in Review; the UI offers a
-"Search for cover art" action that re-runs the worker for that track.
+`core_complete` is the bar for every path to Ready: automatic, chosen, manual, new cover, cover
+search.
 
 ---
 
-## 9. Atomic, no-clobber publication
+## 12. Publishing without overwriting
 
-`publish_no_clobber` (`src/application/apply.rs:644`):
+`publish_no_clobber` (`src/application/apply.rs`):
 
 1. `fsync` the finished temporary file.
-2. List existing destination variants (`Name.ext`, `Name (2).ext`, …).
-3. If an existing output is **equivalent audio** (same file size + SHA-256, or same
-   Chromaprint fingerprint + ≤3s duration) **and already carries the exact artwork
-   that is about to be published**, reuse it and delete the temporary — never
-   creating a numbered copy. A stale output with missing or different cover art is
-   not reused; the fresh temporary is published instead, so reused files always
-   have valid matching artwork.
-4. Otherwise create a **hard link** from the temporary to the next free numbered
-   destination. `AlreadyExists` bumps the number. The source of the write is
-   excluded from equivalence checks so re-running your own output isn't mistaken for
-   a different recording.
+2. List existing variants (`Name.ext`, `Name (2).ext`, …).
+3. If one is the **same audio** (same size + SHA-256, or same fingerprint within 3 s) **and
+   already has the same cover**, keep it and delete the temporary file.
+4. Otherwise **hard-link** the temporary file to the next free name (`AlreadyExists` → next
+   number) and remove the temporary name.
 
-This makes publication atomic, never clobbers existing files, and never creates
-needless duplicates.
+Nothing is ever overwritten, and no needless numbered copies appear.
 
 ---
 
-## 10. Concurrency, rate limiting, and lifecycle
+## 13. Concurrency, tools and lifecycle
 
-Bounded concurrency lives in `AppState` (`src/app/state.rs`) and
-`scan::PipelineLimits` (`src/application/scan/mod.rs:532`):
+Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 
 | Resource | Limit |
 |---|---|
-| `scan_workers` (tag readers / scan jobs) | configurable, default 6 |
-| `fingerprint_workers` | default 3 |
-| `lookup_workers` (metadata lookups + artwork downloads) | default 3 |
-| SongRec recognition | hard cap 2 |
-| `write_workers` (tag writes) | default 2 |
-| MusicBrainz HTTP | 1 req/s |
+| Files read at once during a check | 6 |
+| Fingerprints | 3 |
+| Catalog lookups / cover downloads | 3 |
+| SongRec recognitions | 2 |
+| Tag writes | 2 |
+| MusicBrainz | 1 request/s |
+| Downloads | `MAGPIE_MAX_PARALLEL_DOWNLOADS` (default 2) + `MAGPIE_DOWNLOAD_PAUSE_SECONDS` |
 
-- A single DB **writer task** serializes persistence during scans; apply uses
-  per-operation transactions.
-- **Cancellation**: `POST /api/stop` sets a `cancelled` flag that every worker checks
-  at safe boundaries; SIGTERM/Ctrl+C asks the active workflow to stop, waits up to
-  30 s, drains HTTP, and closes SQLite.
-- **One workflow at a time**: an inbox cycle and a manual "File now" never run at
-  the same time (`try_claim_workflow`). Choices made in Review are filed by the next
-  cycle.
+- **External tools**: the integrity check, fingerprint, repair, rsgain, SongRec and the AudD
+  sample run through `infrastructure::process`: whether a tool is installed is checked once per
+  run, and every call has a timeout after which the process is killed (e.g. 3 min for a
+  fingerprint, 30 min for rsgain on one album). yt-dlp calls have their own timeouts
+  (`MAGPIE_MAX_DOWNLOAD_SECONDS` for a download, default 15 min).
+- **One workflow at a time**: an inbox cycle, "File now", auto-approve and "Check & fix" never run
+  together (`try_claim_workflow`). `POST /api/stop` asks the running one to stop at a safe point.
 
 ---
 
-## 11. Caching summary
+## 14. Caching
 
-| Cache | Key | Invalidated by |
+| Cache | Key | Lifetime |
 |---|---|---|
-| `provider_cache` | provider + search key | expiry (disposable, midnight cleanup) |
-| `fingerprint_cache` | path + size + mtime | file change / cache-limit eviction |
-| `integrity_cache` | path + size + mtime | explicit retry deletes the row |
-| `replaygain_cache` | path + size + mtime(ns) | file change |
-| `content_hash_cache` | path + size + mtime(ns) | file change |
-| `artwork_overrides` | path | overwritten when user confirms new cover |
+| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID and AudD 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily. |
+| `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | path + size + mtime | until the file changes; together capped at **100 MiB**, oldest first (at start, daily and hourly when idle) |
+| `artwork_overrides` | path | until you choose another cover |
 
-Fingerprint/integrity/ReplayGain caches share a 100 MiB budget; the oldest entries
-are evicted first (checked at startup and hourly while idle).
+After a cleanup that removed rows the database is compacted (`VACUUM`).
 
 ---
 
-## 12. API reference
+## 15. API reference
+
+All routes are under `/api` (`src/http/router.rs`).
 
 | Method & path | Purpose |
 |---|---|
-| `GET  /api/setup` | Read-only configuration and tool/provider status |
-| `GET  /api/status` | Workflow phase/progress + matched/review/failed counts |
-| `POST /api/inbox/check` | Check the inbox now instead of at the next interval |
-| `POST /api/stop` | Cancel current scan/write at a safe boundary |
-| `GET  /api/tracks` | All tracks + candidates |
-| `DELETE /api/tracks/{id}` | Remove a review file from disk (input folder only) |
-| `POST /api/tracks/retry-issues` | Repair + re-run failed/corrupt/retryable tracks |
-| `POST /api/tracks/auto-approve` | Bulk smart auto-select over Review |
-| `GET  /api/tracks/{id}/audio` | Range-stream the source file for playback |
-| `POST /api/tracks/{id}/choose` | Accept a candidate |
-| `POST /api/tracks/{id}/review` | Undo identification (back to Review) |
-| `PUT  /api/tracks/{id}/manual` | Save a manually entered candidate |
-| `PUT  /api/tracks/{id}/artwork` | Set + verify a cover URL / song link |
-| `POST /api/tracks/{id}/artwork/search` | Re-run the cover-art worker for a track |
-| `POST /api/source/resolve` | Resolve a Shazam/Spotify/YouTube/… link to metadata |
-| `GET  /api/candidates/{id}/artwork/preview`, etc. | Artwork previews |
-| `POST /api/write` | File all Ready tracks into the library now |
-| `GET  /api/me` | Who is using the page (or 401: log in) |
-| `GET  /api/login?token=` | Use a one-time login link (from `/web`), start a session |
-| `POST /api/logout` | End this browser's session |
-| `GET  /api/library/recent` | The songs filed most recently |
-| `POST /api/requests` | Read a link and queue its songs |
-| `GET  /api/requests` | The latest requests with progress counts |
-| `GET  /api/requests/{id}` | Every song of one request with its status |
-| `POST /api/requests/{id}/retry` | Queue a request's failed songs again |
+| `GET /health` | Database reachable? (no login) |
+| `GET /me` | Who is using the page, or 401 (no login) |
+| `GET /login?token=` | Use a one-time login link, start a session (no login) |
+| `POST /logout` | End this browser's session |
+| `GET /setup` | Read-only settings, tool and source status |
+| `GET /status` | What the background workflow is doing: phase, message, progress |
+| `POST /inbox/check` | Check the inbox now |
+| `POST /stop` | Stop the running workflow at a safe point |
+| `POST /write` | File all Ready songs now |
+| `GET /tracks` | All tracks with their candidates (a plain array) |
+| `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only) |
+| `POST /tracks/retry-issues` | Repair and re-run everything in Issues |
+| `POST /tracks/auto-approve` | Smart auto-select over Review (`approved`, `low_confidence`) |
+| `GET /tracks/{id}/audio` | Stream the file (range requests) |
+| `POST /tracks/{id}/choose` | Accept a candidate |
+| `POST /tracks/{id}/review` | Undo the choice |
+| `PUT /tracks/{id}/manual` | Save details typed by hand |
+| `PUT /tracks/{id}/artwork` | Set and verify a cover URL or song link |
+| `POST /tracks/{id}/artwork/search` | Search covers again |
+| `GET /tracks/{id}/artwork/preview` | The cover that will be embedded |
+| `GET /tracks/{id}/artwork/original` | The cover embedded in the file now |
+| `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie |
+| `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
+| `GET /library/recent` | The songs filed most recently |
+| `POST /requests` | Read a link and queue its songs |
+| `GET /requests` | The latest requests with progress counts |
+| `GET /requests/{id}` | Every song of one request with its status |
+| `POST /requests/{id}/retry` | Queue a request's failed songs again |
 
 ---
 
-## 13. Key source files
+## 16. Key source files
 
 | Area | File |
 |---|---|
-| Entry point, startup tasks, graceful shutdown | `src/main.rs` |
-| HTTP routes / API contract | `src/http/router.rs`, `src/http/handlers/*` |
-| Scan + identify pipeline (walk, file jobs, cascade, DB writer) | `src/application/scan/` (`mod.rs`, `process.rs`, `providers.rs`, `persist.rs`, `score.rs`) |
-| Catalog runner (provider cascade) | `src/application/scan/providers.rs` |
-| Duplicate detection | `src/application/input_dedup.rs` |
+| Startup, background loops, shutdown | `src/main.rs` |
+| Settings and fixed limits | `src/config.rs` |
+| App state, workflow claim | `src/app/state.rs` |
+| HTTP routes, login, security headers | `src/http/router.rs`, `src/http/auth.rs`, `src/http/mod.rs`, `src/http/handlers/*` |
+| Inbox check and identification | `src/application/scan/` (`mod.rs`, `process.rs`, `providers.rs`, `persist.rs`) |
+| Duplicates inside the inbox | `src/application/input_dedup.rs` |
 | Smart auto-selection | `src/application/smart_approval.rs` |
 | Metadata completion | `src/application/metadata_completion.rs` |
-| Cover-art worker (search, verify, reuse, apply-time fetch) | `src/application/artwork.rs` |
-| Apply service (prepare / write / publish) | `src/application/apply.rs` (+ endpoint `src/http/handlers/apply.rs`) |
-| Review / scan / workspace handlers | `src/http/handlers/tracks.rs`, `scan.rs`, `workspace.rs`, `queries.rs` |
-| Repository (track + candidate types and queries) | `src/infrastructure/db/tracks.rs` |
-| Audio read / integrity / fingerprint / replaygain / tag write / repair | `src/infrastructure/media/*` |
-| Provider integrations | `src/infrastructure/providers/*` |
-| App state, workflow, limits | `src/app/state.rs`, `src/application/scan/mod.rs` |
-| Configuration | `src/config.rs` |
-| SQLite schema | `migrations/*.sql` |
-| Library layout, trash, index, folder cover | `src/application/library.rs` |
-| Lyrics, album gain | `src/infrastructure/lyrics.rs`, `media/rsgain.rs` |
-| Configuration | `src/config.rs` |
-| Web page | `web/src/app/App.tsx` |
+| Cover worker | `src/application/artwork.rs` |
+| Filing | `src/application/apply.rs` |
+| Library layout, index, trash, playlists | `src/application/library.rs` |
+| Getting music from links | `src/acquire/` |
+| Telegram bot | `src/telegram/` |
+| Tracks and candidates in the database | `src/infrastructure/db/` |
+| Integrity, fingerprint, tags, repair, ReplayGain | `src/infrastructure/media/` |
+| Sources | `src/infrastructure/providers/` |
+| Lyrics, caches, tool runner | `src/infrastructure/lyrics.rs`, `provider_cache.rs`, `fingerprint_cache.rs`, `process.rs` |
+| Schema | `migrations/*.sql` |
+| Web page | `web/src/app/App.tsx` and `web/src/app/components/` |
 
 ---
 
-## 14. Summary flow
+## 17. Summary flow
 
 ```
-Inbox check (every minute)
-  ├─ walk inbox (skip .hidden/@nas, wait for files to settle) → read tags
-  │   → integrity check → fingerprint → dedup group
-  ├─ provider cascade → candidates → smart auto-select
-  │     ├─ auto-approved → metadata completion → cover verified → READY
-  │     └─ uncertain/unmatched/corrupt → REVIEW
-Review → choose / auto-select / manual / source-link / artwork / retry-issues
-  ├─ every path to READY requires core_complete, incl. a verified cover
-  └─ the next inbox cycle files what you approved
-File → per song: already in library? (skip or lossless upgrade) → ReplayGain
-     → verified cover → copy to temp → write+verify tags → atomic no-clobber publish
-     → original to trash → index → cover.jpg → lyrics
-     → after the batch: album gain (rsgain) → Navidrome's watcher sees the files
+Link (web / Telegram) → wanted → already in library? → yt-dlp → .magpie/staging ─┐
+Telegram file → .magpie/staging ──────────────────────────────────────────────────┤
+Your drop → inbox (waits until it stops changing) ────────────────────────────────┤
+                                                                                  ▼
+Inbox cycle (every minute)
+  ├─ read tags → integrity check → fingerprint → group duplicates
+  ├─ source cascade → candidates → smart auto-select
+  │     ├─ sure → completion → verified cover → READY
+  │     └─ unsure / unmatched → REVIEW;  corrupt → ISSUES
+  └─ file every READY song: already in library? (trash, or lossless upgrade)
+       → verified cover → temp copy → tags (verified) → no-clobber publish
+       → original to trash → index → cover.jpg → lyrics;  failure → ISSUES
+       → after the batch: rsgain per album folder → Navidrome's watcher sees the files
 ```

@@ -1,15 +1,13 @@
-use super::{ArtistCredit, Candidate};
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::{ArtistCredit, BROWSER_USER_AGENT, Candidate, nonempty};
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
 const PROVIDER: &str = "genius";
 const WEB_API_BASE: &str = "https://genius.com/api";
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/138 Safari/537.36";
 
 pub async fn search(
     pool: &SqlitePool,
@@ -89,48 +87,41 @@ fn search_query(title: &str, artist: Option<&str>) -> String {
 }
 
 async fn search_raw(pool: &SqlitePool, client: &Client, query: &str) -> Result<Value> {
-    let key = search_key(query);
-    if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        return Ok(value);
-    }
-    let value = request_json(
-        client
-            .get(format!("{WEB_API_BASE}/search/song"))
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .header("Accept", "application/json")
-            .query(&[("q", query)]),
+    cached(
+        pool,
+        PROVIDER,
+        &search_key(query),
+        Duration::days(7),
+        || {
+            request_json(
+                client
+                    .get(format!("{WEB_API_BASE}/search/song"))
+                    .query(&[("q", query)]),
+            )
+        },
     )
-    .await?;
-    ProviderCache::put(pool, PROVIDER, &key, &value, Utc::now() + Duration::days(7)).await?;
-    Ok(value)
+    .await
 }
 
 async fn song_detail(pool: &SqlitePool, client: &Client, id: i64) -> Result<Value> {
-    let key = format!("song:{id}");
-    if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        return Ok(value);
-    }
-    let value = request_json(
-        client
-            .get(format!("{WEB_API_BASE}/songs/{id}"))
+    cached(
+        pool,
+        PROVIDER,
+        &format!("song:{id}"),
+        Duration::days(14),
+        || request_json(client.get(format!("{WEB_API_BASE}/songs/{id}"))),
+    )
+    .await
+}
+
+/// Genius's web API answers browsers; it reports errors inside the JSON too.
+async fn request_json(request: RequestBuilder) -> Result<Value> {
+    let raw = super::request_json(
+        request
             .header("User-Agent", BROWSER_USER_AGENT)
             .header("Accept", "application/json"),
     )
     .await?;
-    ProviderCache::put(
-        pool,
-        PROVIDER,
-        &key,
-        &value,
-        Utc::now() + Duration::days(14),
-    )
-    .await?;
-    Ok(value)
-}
-
-async fn request_json(request: RequestBuilder) -> Result<Value> {
-    let response = request.send().await?.error_for_status()?;
-    let raw = response.json::<Value>().await?;
     if let Some(status) = raw["meta"]["status"].as_u64()
         && status != 200
     {
@@ -241,10 +232,6 @@ fn song_path(url: &str) -> Result<String> {
         bail!("Genius URL must point to a song lyrics page");
     }
     Ok(path.to_owned())
-}
-
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

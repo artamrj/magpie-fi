@@ -1,38 +1,23 @@
 use super::*;
-use crate::application::apply as apply_service;
-
-pub(super) use apply_service::{apply_ready_automatically, resolve_artwork};
+use crate::application::apply::{self as apply_service, Claim};
 
 pub async fn start_apply(State(s): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
-    if !s
-        .try_claim_workflow(WorkflowPhase::Apply, "Filing songs into the library", false)
-        .await
-    {
-        return Err(ApiError::conflict("workflow is already running"));
-    }
-    let prepared = match apply_service::prepare_apply(&s).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-            return Err(error.into());
+    let prepared = match apply_service::claim_ready(&s).await? {
+        Claim::Busy => return Err(ApiError::conflict("workflow is already running")),
+        Claim::NothingReady => {
+            return Err(ApiError::validation(
+                "No identified songs are ready to file",
+            ));
         }
+        Claim::Ready(prepared) => prepared,
     };
-    if prepared.selected_count == 0 {
-        s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-        return Err(ApiError::validation(
-            "No identified songs are ready to file",
-        ));
-    }
     let apply_service::PreparedApply {
         items,
         selected_count,
         outputs,
         duplicates_skipped,
     } = prepared;
-    let state = s.clone();
-    tokio::spawn(async move {
-        apply_service::finish_apply_workflow(state, items).await;
-    });
+    tokio::spawn(apply_service::run_claimed(s.clone(), items));
     Ok(Json(serde_json::json!({
         "started": true,
         "count": selected_count,

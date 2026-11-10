@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     prepare_folders(&config)?;
     resolve_folders(&mut config)?;
     let pool = infrastructure::db::connect(&config.db_path).await?;
-    infrastructure::db::cleanup(&pool, &config).await?;
+    infrastructure::db::cleanup(&pool).await?;
     infrastructure::db::run_daily_cache_cleanup_if_due(&pool).await?;
     purge_trash(&config).await;
     infrastructure::db::enforce_media_cache_limit(&pool).await?;
@@ -54,8 +54,7 @@ async fn main() -> Result<()> {
             {
                 tracing::warn!(%error, "daily disposable cache cleanup failed");
             }
-            let config = maintenance_state.config.read().await.clone();
-            purge_trash(&config).await;
+            purge_trash(&maintenance_state.config).await;
         }
     });
     let media_cache_state = state.clone();
@@ -78,13 +77,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         // Check the inbox at a fixed interval, or right away when someone asks
         // ("Check inbox now" in the web page). A cycle never runs twice at once.
-        let (interval, library_root) = {
-            let config = inbox_state.config.read().await;
-            (
-                Duration::from_secs(config.inbox_check_seconds),
-                PathBuf::from(&config.output_dir),
-            )
-        };
+        let interval = Duration::from_secs(inbox_state.config.inbox_check_seconds);
+        let library_root = PathBuf::from(&inbox_state.config.output_dir);
         // The library index is refreshed before the first check (so songs you
         // already own are recognised) and then every six hours.
         let mut next_index = tokio::time::Instant::now();
@@ -104,7 +98,6 @@ async fn main() -> Result<()> {
                 inbox_state
                     .finish_workflow(
                         types::WorkflowPhase::Failed,
-                        "failed",
                         format!("Inbox check failed: {error}"),
                     )
                     .await;
@@ -121,9 +114,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         // yt-dlp breaks whenever YouTube changes, so it is updated every day.
         loop {
-            let config = updater_state.config.read().await.clone();
+            let config = &updater_state.config;
             if config.ytdlp_self_update {
-                match acquire::ytdlp::self_update(&config).await {
+                match acquire::ytdlp::self_update(config).await {
                     Ok(message) => tracing::info!(%message, "yt-dlp update check"),
                     Err(error) => tracing::warn!(%error, "yt-dlp update failed"),
                 }

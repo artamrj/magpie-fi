@@ -37,11 +37,8 @@
   --error: #ff7f8f;
   --error-soft: rgba(255, 127, 143, 0.11);
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
-  --radius-sm: 7px;
   --radius-md: 10px;
-  --radius-lg: 14px;
   --topbar: 64px;
-  --sourcebar: 0px;
   --dock: 86px;
   --mobilenav: 0px;
 }
@@ -347,10 +344,6 @@ img {
   border-radius: 50%;
   background: var(--muted-2);
 }
-.connection-state.online i {
-  background: var(--success);
-  box-shadow: 0 0 0 3px var(--success-soft);
-}
 .connection-state.offline {
   color: var(--error);
 }
@@ -417,12 +410,6 @@ img {
   background: transparent;
 }
 
-.source-heading {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
 .source-icon {
   flex: none;
   width: 44px;
@@ -441,18 +428,6 @@ img {
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
-.source-heading div > p:last-child {
-  max-width: 200px;
-  margin-top: 5px;
-  overflow: hidden;
-  color: var(--text-soft);
-  font-size: 13px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.path-field,
-.drawer-content label,
 .source-resolver label,
 .editor-grid label {
   min-width: 0;
@@ -479,89 +454,12 @@ input {
 input::placeholder {
   color: var(--muted-2);
 }
-textarea {
-  width: 100%;
-  min-width: 0;
-  padding: 10px 13px;
-  resize: vertical;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  background: var(--input);
-  font: inherit;
-  line-height: 1.5;
-}
-textarea:hover {
-  border-color: var(--border-strong);
-}
-textarea:focus {
-  border-color: var(--accent);
-  outline: 0;
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.drawer-content label > small {
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.5;
-}
 input:hover {
   border-color: var(--border-strong);
 }
 input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.output-summary {
-  min-width: 0;
-  display: grid;
-  gap: 5px;
-  padding-left: 16px;
-  border-left: 1px solid var(--border);
-}
-.output-summary span {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-}
-.output-summary b {
-  overflow: hidden;
-  color: var(--text-soft);
-  font-size: 13px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.safety-state {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  border: 0;
-  border-radius: 8px;
-  white-space: nowrap;
-  text-align: left;
-}
-.safety-state.safe {
-  color: var(--success);
-  background: var(--success-soft);
-}
-.safety-state.destructive {
-  color: var(--error);
-  background: var(--error-soft);
-}
-.safety-state span {
-  display: grid;
-  gap: 1px;
-}
-.safety-state b {
-  font-size: 12px;
-}
-.safety-state small {
-  color: var(--muted);
-  font-size: 10px;
 }
 .primary-action {
   min-height: 42px;
@@ -666,7 +564,7 @@ input:focus {
 }
 
 .workspace {
-  height: calc(100vh - var(--topbar) - var(--sourcebar) - var(--dock) - var(--mobilenav));
+  height: calc(100vh - var(--topbar) - var(--dock) - var(--mobilenav));
   min-height: 410px;
   display: grid;
   grid-template-columns: minmax(520px, 0.9fr) minmax(560px, 1.1fr);
@@ -1329,9 +1227,6 @@ input:focus {
   margin-top: 5px;
   font-size: 15px;
   letter-spacing: -0.015em;
-}
-.section-heading h3 svg {
-  color: var(--muted-2);
 }
 .section-heading > span {
   color: var(--muted);
@@ -2151,9 +2046,6 @@ input:focus {
 .safe-note {
   color: var(--success);
 }
-.delete-note {
-  color: var(--error);
-}
 
 .drawer-layer {
   position: fixed;
@@ -2245,130 +2137,6 @@ input:focus {
   color: var(--muted);
   font-size: 11px;
 }
-.danger-toggle {
-  grid-template-columns: auto auto 1fr !important;
-  align-items: start;
-  gap: 9px !important;
-  padding: 11px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface-2);
-  cursor: pointer;
-}
-.automation-toggle {
-  grid-template-columns: auto auto 1fr !important;
-  align-items: start;
-  gap: 9px !important;
-  padding: 11px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface-2);
-  cursor: pointer;
-}
-.automation-toggle.enabled {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-}
-.automation-toggle input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-}
-.automation-toggle input:checked + .toggle-ui {
-  background: color-mix(in srgb, var(--accent) 55%, var(--surface-3));
-}
-.automation-toggle input:checked + .toggle-ui::after {
-  background: var(--accent);
-  transform: translateX(12px);
-}
-.automation-toggle input:focus-visible + .toggle-ui {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.automation-toggle > span:last-child {
-  display: grid;
-  gap: 3px;
-}
-.automation-toggle b {
-  color: var(--text-soft);
-  font-size: 12px;
-}
-.automation-toggle small {
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.5;
-}
-.automation-interval {
-  display: flex !important;
-  grid-template-columns: none !important;
-  align-items: center;
-  gap: 8px !important;
-  color: var(--muted);
-  font-size: 11px;
-}
-.automation-interval input {
-  width: 82px;
-  padding: 7px 9px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  color: var(--text);
-  background: var(--input);
-}
-.danger-toggle.enabled {
-  border-color: color-mix(in srgb, var(--error) 35%, var(--border));
-  background: var(--error-soft);
-}
-.danger-toggle input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-}
-.toggle-ui {
-  width: 28px;
-  height: 16px;
-  position: relative;
-  border-radius: 99px;
-  background: var(--border-strong);
-}
-.toggle-ui::after {
-  content: "";
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--muted);
-  transition:
-    transform 150ms ease,
-    background 150ms ease;
-}
-.danger-toggle input:checked + .toggle-ui {
-  background: color-mix(in srgb, var(--error) 55%, var(--surface-3));
-}
-.danger-toggle input:checked + .toggle-ui::after {
-  background: var(--error);
-  transform: translateX(12px);
-}
-.danger-toggle input:focus-visible + .toggle-ui {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.danger-toggle > span:last-child {
-  display: grid;
-  gap: 3px;
-}
-.danger-toggle b {
-  color: var(--text-soft);
-  font-size: 12px;
-}
-.danger-toggle small {
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.5;
-}
 .health-dot {
   display: flex;
   align-items: center;
@@ -2422,55 +2190,6 @@ input:focus {
   font-size: 10px;
   line-height: 1.5;
 }
-.source-key-settings {
-  padding: 18px 0;
-  border-bottom: 1px solid var(--border);
-}
-.source-key-settings summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  color: var(--text-soft);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  list-style: none;
-}
-.source-key-settings summary::-webkit-details-marker {
-  display: none;
-}
-.source-key-settings[open] summary svg {
-  transform: rotate(90deg);
-}
-.source-key-settings > p {
-  margin: 9px 0 13px;
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.5;
-}
-.key-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px;
-}
-.key-grid label > span {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.key-grid label i {
-  color: var(--success);
-  font-size: 10px;
-  font-style: normal;
-}
-.settings-drawer > footer {
-  flex: none;
-  display: flex;
-  justify-content: flex-end;
-  padding: 13px 20px;
-  border-top: 1px solid var(--border);
-  background: var(--surface-2);
-}
 
 @keyframes spin {
   to {
@@ -2498,6 +2217,139 @@ input:focus {
     transform: translateX(25px);
     opacity: 0;
   }
+}
+
+/* Get music */
+.get-music {
+  height: calc(100vh - var(--topbar) - var(--dock) - var(--mobilenav));
+  min-height: 410px;
+  overflow-y: auto;
+  padding: 24px max(16px, calc((100vw - 860px) / 2));
+  display: grid;
+  align-content: start;
+  gap: 18px;
+}
+.get-music-form {
+  display: grid;
+  gap: 10px;
+}
+.get-music-form label {
+  display: grid;
+  gap: 4px;
+}
+.get-music-form label b {
+  font-size: 18px;
+}
+.get-music-form label small,
+.request-title small,
+.song-status small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.get-music-input {
+  display: flex;
+  gap: 10px;
+}
+.request-list,
+.request-songs ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.request-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+}
+.request-card.failed {
+  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
+}
+.request-summary {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.request-summary[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+.request-kind {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.request-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.request-title b,
+.song-status b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-card progress {
+  width: 100%;
+  height: 4px;
+}
+.request-songs {
+  display: grid;
+  gap: 10px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.request-songs .compact-button {
+  justify-self: start;
+}
+.song-status {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  font-size: 13px;
+}
+.song-status span {
+  min-width: 0;
+  display: grid;
+}
+.song-status em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 40vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.song-status.filed em,
+.song-status.in_library em {
+  color: var(--success);
+}
+.song-status.review em {
+  color: var(--warning);
+}
+.song-status.failed em {
+  color: var(--error);
+}
+.request-source {
+  justify-self: start;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 @media (max-width: 1180px) {
@@ -2569,7 +2421,6 @@ input:focus {
   }
   :root {
     --topbar: 112px;
-    --sourcebar: 0px;
     --mobilenav: 42px;
   }
   .topbar-main {
@@ -2729,8 +2580,6 @@ input:focus {
 
 @media (max-width: 650px) {
   :root {
-    --topbar: 112px;
-    --sourcebar: 0px;
     --dock: 82px;
   }
   .topbar-main {
@@ -2811,7 +2660,6 @@ input:focus {
   .track-row .artwork-small {
     grid-column: 1;
   }
-  .row-number,
   .row-file {
     display: none;
   }
@@ -2904,8 +2752,7 @@ input:focus {
   .quality-strip {
     grid-template-columns: 1fr;
   }
-  .editor-grid,
-  .key-grid {
+  .editor-grid {
     grid-template-columns: 1fr;
   }
   .editor-grid label.wide {
@@ -2939,152 +2786,6 @@ input:focus {
     top: calc(var(--topbar) + 8px);
     right: 10px;
   }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    scroll-behavior: auto !important;
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
-/* Get music */
-.get-music {
-  height: calc(100vh - var(--topbar) - var(--sourcebar) - var(--dock) - var(--mobilenav));
-  min-height: 410px;
-  overflow-y: auto;
-  padding: 24px max(16px, calc((100vw - 860px) / 2));
-  display: grid;
-  align-content: start;
-  gap: 18px;
-}
-.get-music-form {
-  display: grid;
-  gap: 10px;
-}
-.get-music-form label {
-  display: grid;
-  gap: 4px;
-}
-.get-music-form label b {
-  font-size: 18px;
-}
-.get-music-form label small,
-.request-title small,
-.song-status small {
-  color: var(--muted);
-  font-size: 12px;
-}
-.get-music-input {
-  display: flex;
-  gap: 10px;
-}
-.request-list,
-.request-songs ol {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 10px;
-}
-.request-card {
-  display: grid;
-  gap: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-1);
-}
-.request-card.failed {
-  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
-}
-.request-summary {
-  display: grid;
-  grid-template-columns: auto 1fr auto auto;
-  align-items: center;
-  gap: 12px;
-  border: 0;
-  background: none;
-  padding: 0;
-  text-align: left;
-  cursor: pointer;
-}
-.request-summary[aria-expanded="true"] svg {
-  transform: rotate(90deg);
-}
-.request-kind {
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: capitalize;
-}
-.request-title {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-.request-title b,
-.song-status b {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.request-card progress {
-  width: 100%;
-  height: 4px;
-}
-.request-songs {
-  display: grid;
-  gap: 10px;
-  padding-top: 6px;
-  border-top: 1px solid var(--border);
-}
-.request-songs .compact-button {
-  justify-self: start;
-}
-.song-status {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  font-size: 13px;
-}
-.song-status span {
-  min-width: 0;
-  display: grid;
-}
-.song-status em {
-  font-style: normal;
-  font-size: 12px;
-  color: var(--muted);
-  max-width: 40vw;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.song-status.filed em,
-.song-status.in_library em {
-  color: var(--success);
-}
-.song-status.review em {
-  color: var(--warning);
-}
-.song-status.failed em {
-  color: var(--error);
-}
-.request-source {
-  justify-self: start;
-  color: var(--muted);
-  font-size: 12px;
-}
-@media (max-width: 640px) {
   .get-music-input {
     flex-direction: column;
   }
@@ -3124,4 +2825,15 @@ input:focus {
   padding: 0;
   display: grid;
   gap: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

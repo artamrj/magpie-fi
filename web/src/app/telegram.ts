@@ -1,7 +1,6 @@
 /** The Telegram Mini App bridge (telegram.org/js/telegram-web-app.js), when the page runs inside Telegram. */
 type TelegramWebApp = {
   initData: string;
-  initDataUnsafe: { start_param?: string };
   colorScheme: "light" | "dark";
   ready(): void;
   expand(): void;
@@ -28,11 +27,5 @@ export function askConfirm(message: string): Promise<boolean> {
   return Promise.resolve(window.confirm(message));
 }
 
-/** The view to open first: `?view=review` or `?view=get` (or the Mini App start parameter). */
-export function startView(): string | null {
-  return (
-    new URLSearchParams(window.location.search).get("view") ??
-    telegram?.initDataUnsafe.start_param ??
-    null
-  );
-}
+/** The view a bot link asks to open first (`?view=review`). */
+export const startView = new URLSearchParams(window.location.search).get("view");

@@ -60,10 +60,7 @@ async fn save(audio: &Path, track: &LrclibTrack) -> Result<Saved> {
         return Ok(Saved::Nothing);
     }
     let text = |value: &Option<String>| {
-        value
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        crate::infrastructure::providers::nonempty(value.as_deref())
             .map(|value| format!("{value}\n"))
     };
     if let Some(synced) = text(&track.synced_lyrics) {

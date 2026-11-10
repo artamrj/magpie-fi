@@ -1,9 +1,10 @@
-use super::Candidate;
-use crate::infrastructure::provider_cache::{ProviderCache, search_key};
+use super::{BROWSER_USER_AGENT, Candidate, browser_page, nonempty, request_json};
+use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
 use serde_json::Value;
 use sha1::Sha1;
@@ -19,8 +20,12 @@ const API_BASE: &str = "https://api.audiomack.com/v1";
 // bundle and uses it for public catalog requests. No user account is involved.
 const WEB_CONSUMER_KEY: &str = "audiomack-web";
 const WEB_CONSUMER_SECRET: &str = "bd8a07e9f23fbe9d808646b730f89b8e";
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/138 Safari/537.36";
+/// OAuth 1.0 percent-encodes everything except RFC 3986 unreserved characters.
+const OAUTH_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub async fn search(
@@ -36,62 +41,45 @@ pub async fn search(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let key = search_key(&query);
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let parameters = vec![
-            ("limit".to_owned(), "10".to_owned()),
-            ("page".to_owned(), "1".to_owned()),
-            ("q".to_owned(), query),
-            ("show".to_owned(), "music".to_owned()),
-            ("sort".to_owned(), "relevance".to_owned()),
-        ];
-        let url = signed_get_url("livesearch", &parameters)?;
-        let value = client
-            .get(url)
-            .header("Accept", "application/json")
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
+    let raw = cached(
+        pool,
+        PROVIDER,
+        &search_key(&query),
+        Duration::days(7),
+        || async {
+            let parameters = vec![
+                ("limit".to_owned(), "10".to_owned()),
+                ("page".to_owned(), "1".to_owned()),
+                ("q".to_owned(), query.clone()),
+                ("show".to_owned(), "music".to_owned()),
+                ("sort".to_owned(), "relevance".to_owned()),
+            ];
+            let url = signed_get_url("livesearch", &parameters)?;
+            let value = request_json(
+                client
+                    .get(url)
+                    .header("Accept", "application/json")
+                    .header("User-Agent", BROWSER_USER_AGENT),
+            )
             .await?;
-        reject_api_error(&value)?;
-        ProviderCache::put(pool, PROVIDER, &key, &value, Utc::now() + Duration::days(7)).await?;
-        value
-    };
+            reject_api_error(&value)?;
+            Ok(value)
+        },
+    )
+    .await?;
     Ok(parse_search_results(&raw))
 }
 
 pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result<Candidate> {
     let (canonical, slug) = song_url(url)?;
     let key = format!("song:{}", canonical.path().to_ascii_lowercase());
-    let raw = if let Some(value) = ProviderCache::get(pool, PROVIDER, &key).await? {
-        value
-    } else {
-        let html = client
-            .get(canonical.clone())
-            .header("Accept", "text/html,application/xhtml+xml")
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let value = music_object_from_page(&html, &slug)
+    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || async {
+        let html = browser_page(client, canonical.as_str()).await?;
+        music_object_from_page(&html, &slug)
             .or_else(|| json_ld_from_page(&html))
-            .ok_or_else(|| anyhow::anyhow!("Audiomack returned no usable song metadata"))?;
-        ProviderCache::put(
-            pool,
-            PROVIDER,
-            &key,
-            &value,
-            Utc::now() + Duration::days(14),
-        )
-        .await?;
-        value
-    };
+            .ok_or_else(|| anyhow::anyhow!("Audiomack returned no usable song metadata"))
+    })
+    .await?;
     let mut candidate = if raw["@type"].as_str() == Some("MusicRecording") {
         candidate_from_json_ld(&raw)
     } else {
@@ -161,18 +149,7 @@ fn signed_get_url_at(
 }
 
 fn oauth_encode(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut output = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            output.push(char::from(byte));
-        } else {
-            output.push('%');
-            output.push(char::from(HEX[(byte >> 4) as usize]));
-            output.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-    }
-    output
+    utf8_percent_encode(value, OAUTH_ENCODE).to_string()
 }
 
 fn reject_api_error(raw: &Value) -> Result<()> {
@@ -427,10 +404,6 @@ fn parse_iso_duration(value: &str) -> Option<f64> {
     Some(minutes.parse::<f64>().ok()? * 60.0 + seconds.strip_suffix('S')?.parse::<f64>().ok()?)
 }
 
-fn nonempty(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +459,11 @@ mod tests {
         assert!(song_url("https://audiomack.com/fomusic/song/saaren-tehran-kenaret").is_ok());
         assert!(song_url("https://audiomack.com/fomusic/album/example").is_err());
         assert!(song_url("https://example.com/fomusic/song/example").is_err());
+    }
+
+    #[test]
+    fn oauth_encoding_keeps_only_unreserved_characters() {
+        assert_eq!(oauth_encode("a b+c/~-._é"), "a%20b%2Bc%2F~-._%C3%A9");
     }
 
     #[test]

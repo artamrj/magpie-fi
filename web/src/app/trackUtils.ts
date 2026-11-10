@@ -1,4 +1,4 @@
-import type { Candidate, Track } from "@/api/types";
+import type { ArtworkStatus, Candidate, Track } from "../api/types";
 import type { IconName } from "./Icons";
 
 export const busyPhases = new Set(["scan", "fetch", "apply"]);
@@ -21,13 +21,35 @@ export function candidateConfidence(score: number) {
   return { label: "Weak match", tone: "weak" };
 }
 
-export function candidateSignals(track: Track, candidate: Candidate) {
-  let evidence: Record<string, unknown> = {};
-  try {
-    evidence = JSON.parse(candidate.score_breakdown || "{}");
-  } catch {
-    /* Compare available text directly. */
+type Evidence = {
+  title?: unknown;
+  artist?: unknown;
+  album_context?: unknown;
+  duration?: unknown;
+  sources?: unknown;
+  metadata_completion?: { score?: unknown; core_complete?: unknown; missing_fields?: unknown };
+};
+const evidenceCache = new WeakMap<Candidate, Evidence>();
+
+/** The parsed `score_breakdown` of a candidate, parsed once per candidate object. */
+function evidenceOf(candidate: Candidate): Evidence {
+  let evidence = evidenceCache.get(candidate);
+  if (!evidence) {
+    evidence = parseEvidence(candidate.score_breakdown);
+    evidenceCache.set(candidate, evidence);
   }
+  return evidence;
+}
+function parseEvidence(raw?: string): Evidence {
+  try {
+    return JSON.parse(raw || "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export function candidateSignals(track: Track, candidate: Candidate) {
+  const evidence = evidenceOf(candidate);
   return [
     comparisonSignal("Title", track.current_title, candidate.title, evidence.title),
     comparisonSignal("Artist", track.current_artist, candidate.artist, evidence.artist),
@@ -59,7 +81,7 @@ export function candidateVerdict(score: number, signals: Array<{ tone: string }>
   };
 }
 
-export function comparisonSignal(
+function comparisonSignal(
   label: string,
   original?: string,
   proposed?: string,
@@ -79,7 +101,7 @@ export function comparisonSignal(
   return { label, value: "Mismatch", tone: "warning" };
 }
 
-export function durationSignal(rawSimilarity?: unknown) {
+function durationSignal(rawSimilarity?: unknown) {
   if (typeof rawSimilarity !== "number")
     return { label: "Audio length", value: "Not checked", tone: "muted" };
   if (rawSimilarity >= 0.9) return { label: "Audio length", value: "Same", tone: "good" };
@@ -87,27 +109,20 @@ export function durationSignal(rawSimilarity?: unknown) {
   return { label: "Audio length", value: "Different", tone: "warning" };
 }
 
-export function normalizeText(value: string) {
+function normalizeText(value: string) {
   return value
     .toLocaleLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, "")
     .trim();
 }
 
-export function artworkStatusLabel(candidate: Candidate) {
-  switch (candidate.artwork_status) {
-    case "verified":
-      return "Verified cover";
-    case "searching":
-      return "Checking cover";
-    case "retryable_error":
-      return "Cover source unavailable";
-    case "cover_required":
-      return "Cover required";
-    default:
-      return candidate.cover_url ? "Catalog cover" : "No catalog cover";
-  }
-}
+export const artworkStatusLabels: Record<ArtworkStatus, string> = {
+  verified: "Verified cover",
+  searching: "Checking cover",
+  retryable_error: "Cover source unavailable",
+  cover_required: "Cover required",
+};
+
 export function formatDuration(seconds?: number) {
   if (!seconds || !Number.isFinite(seconds)) return undefined;
   const minutes = Math.floor(seconds / 60);
@@ -117,13 +132,10 @@ export function formatDuration(seconds?: number) {
 }
 
 export function isReview(track: Track) {
-  return track.stage === "review" && !isCompleted(track) && !isProblem(track);
+  return track.stage === "review" && !isProblem(track);
 }
 export function isReady(track: Track) {
-  return track.stage === "ready" && Boolean(track.selected_candidate_id) && !isCompleted(track);
-}
-export function isCompleted(track: Track) {
-  return track.status === "applied";
+  return track.stage === "ready" && Boolean(track.selected_candidate_id);
 }
 export function isProblem(track: Track) {
   if (track.stage === "skipped") return false;
@@ -142,18 +154,27 @@ export function selectedCandidate(track: Track) {
   return track.candidates.find((candidate) => candidate.id === track.selected_candidate_id);
 }
 
+const filterTests: Record<QueueFilter, (track: Track) => boolean> = {
+  all: () => true,
+  review: isReview,
+  problems: isProblem,
+  ready: isReady,
+};
+export function matchesFilter(track: Track, filter: QueueFilter) {
+  return filterTests[filter](track);
+}
+
 export function statusFor(track: Track): { label: string; tone: string; icon: IconName } {
-  if (isCompleted(track)) return { label: "Cleaned", tone: "success", icon: "check" };
-  if (track.status === "corrupt") return { label: "Damaged", tone: "error", icon: "alert" };
+  const error = (label: string) => ({ label, tone: "error", icon: "alert" as const });
+  if (track.status === "corrupt") return error("Damaged");
   if (track.stage === "skipped") return { label: "Skipped", tone: "muted", icon: "skip" };
-  if (track.is_missing) return { label: "File missing", tone: "error", icon: "alert" };
+  if (track.is_missing) return error("File missing");
   if (track.stage === "failed" || track.status === "failed" || track.status === "provider_error")
-    return { label: "Failed", tone: "error", icon: "alert" };
+    return error("Failed");
   if (track.stage === "review")
     return {
-      label: selectedCandidate(track)
-        ? "Needs review"
-        : track.candidates.length > 1
+      label:
+        selectedCandidate(track) || track.candidates.length > 1
           ? "Needs review"
           : track.candidates.length
             ? "Uncertain"
@@ -179,12 +200,11 @@ export function friendlyTrackError(track: Track) {
   return "magpie could not finish this track. Open technical details if you need the diagnostic message.";
 }
 
-export function queuePriority(track: Track) {
+function queuePriority(track: Track) {
   if (isReview(track)) return 0;
   if (isProblem(track)) return 1;
   if (isReady(track)) return 2;
-  if (isCompleted(track)) return 3;
-  return 4;
+  return 3;
 }
 
 export function compareTracks(first: Track, second: Track, order: QueueOrder) {
@@ -201,15 +221,15 @@ export function compareTracks(first: Track, second: Track, order: QueueOrder) {
   return compareText(trackTitle(first), trackTitle(second));
 }
 
-export function trackTitle(track: Track) {
+function trackTitle(track: Track) {
   const candidate = selectedCandidate(track) ?? track.candidates[0];
   return candidate?.title || track.current_title || fileStem(track.filename);
 }
-export function trackArtist(track: Track) {
+function trackArtist(track: Track) {
   const candidate = selectedCandidate(track) ?? track.candidates[0];
   return candidate?.artist || track.current_artist || "Unknown artist";
 }
-export function compareText(first: string, second: string) {
+function compareText(first: string, second: string) {
   return first.localeCompare(second, undefined, { numeric: true, sensitivity: "base" });
 }
 
@@ -224,13 +244,13 @@ export function filterTitle(filter: QueueFilter) {
   return {
     all: "Music queue",
     review: "Needs review",
-    problems: "Problems",
+    problems: "Issues",
     ready: "Ready to write",
   }[filter];
 }
 export function folderName(path: string) {
   const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] || "Choose folder";
+  return parts[parts.length - 1] ?? "";
 }
 export function fileStem(filename: string) {
   return filename.replace(/\.[^/.]+$/, "");
@@ -241,7 +261,7 @@ export function outputFilename(track: Track, candidate: Candidate) {
     : "";
   return `${safeName(candidate.artist || "Unknown Artist")} - ${safeName(candidate.title || "Unknown Title")}${extension}`;
 }
-export function safeName(value: string) {
+function safeName(value: string) {
   return value
     .replace(/[\\/:*?"<>|]/g, " ")
     .replace(/\s+/g, " ")
@@ -255,18 +275,6 @@ export function friendlyError(value: string) {
   return value;
 }
 
-export function artworkUrls(candidate?: Candidate) {
-  const urls: string[] = candidate?.cover_url ? [candidate.cover_url] : [];
-  try {
-    const alternatives = JSON.parse(candidate?.score_breakdown || "{}")?.artwork_candidates || [];
-    for (const artwork of alternatives)
-      if (typeof artwork?.url === "string") urls.push(artwork.url);
-  } catch {
-    /* Old evidence can be malformed. */
-  }
-  return [...new Set(urls)];
-}
-
 export function googleMetadataUrl(candidate: Candidate) {
   const artist = String(candidate.artist || "").replaceAll('"', "");
   const title = String(candidate.title || "").replaceAll('"', "");
@@ -274,20 +282,13 @@ export function googleMetadataUrl(candidate: Candidate) {
 }
 
 export function candidateSources(candidate: Candidate) {
-  try {
-    const sources = JSON.parse(candidate.score_breakdown || "{}")?.sources;
-    if (Array.isArray(sources) && sources.length)
-      return [
-        ...new Set<string>(
-          sources
-            .filter((source: unknown): source is string => typeof source === "string")
-            .map(providerName),
-        ),
-      ].join(" + ");
-  } catch {
-    /* Use primary provider. */
-  }
-  return providerName(candidate.provider || "catalog");
+  const { sources } = evidenceOf(candidate);
+  const names = Array.isArray(sources)
+    ? sources.filter((source): source is string => typeof source === "string").map(providerName)
+    : [];
+  return names.length
+    ? [...new Set(names)].join(" + ")
+    : providerName(candidate.provider || "catalog");
 }
 
 export function providerName(source: string) {
@@ -305,11 +306,8 @@ export function providerName(source: string) {
     radiojavan: "Radio Javan",
     shazam: "Shazam",
     songrec: "SongRec / Shazam",
-    "SongRec / Shazam": "SongRec / Shazam",
     soundcloud: "SoundCloud",
     spotify: "Spotify",
-    theaudiodb: "TheAudioDB",
-    wikidata: "Wikidata",
     youtube: "YouTube",
     ffmpeg: "FFmpeg",
     manual: "Manual entry",
@@ -319,17 +317,13 @@ export function providerName(source: string) {
 }
 
 export function metadataAudit(candidate: Candidate) {
-  try {
-    const stored = JSON.parse(candidate.score_breakdown || "{}")?.metadata_completion;
-    if (stored && typeof stored.score === "number" && Array.isArray(stored.missing_fields))
-      return {
-        score: stored.score,
-        coreComplete: stored.core_complete === true,
-        missing: stored.missing_fields as string[],
-      };
-  } catch {
-    /* Derive a display audit. */
-  }
+  const stored = evidenceOf(candidate).metadata_completion;
+  if (typeof stored?.score === "number" && Array.isArray(stored.missing_fields))
+    return {
+      score: stored.score,
+      coreComplete: stored.core_complete === true,
+      missing: stored.missing_fields as string[],
+    };
   const fields: Array<[string, boolean, number]> = [
     ["title", Boolean(candidate.title?.trim()), 18],
     ["artist", Boolean(candidate.artist?.trim()), 18],

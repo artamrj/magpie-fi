@@ -1,23 +1,29 @@
 # Security policy
 
-## Supported deployment
+magpie moves and deletes files in your music folder, so its web page must only be reachable by you.
 
-Ununknown is a single-user local application. Its API intentionally accepts file-system paths and
-can write corrected media or remove source files when that option is enabled. The server therefore
-refuses to bind to non-loopback addresses by default. The official container explicitly opts into
-an internal `0.0.0.0` bind so Docker networking can reach it, while `compose.yaml` publishes that
-port only on host loopback. Do not change `UNUNKNOWN_HOST` to `0.0.0.0`, or expose the app through a
-reverse proxy, tunnel, shared host, or public network.
+## How it is protected
 
-The bundled UI and API share one origin. Mutating browser requests with a non-loopback `Origin` are
-rejected. API responses use restrictive browser security headers and internal errors are logged
-without returning system details to the browser.
-
-Provider credentials entered in the UI are stored in the local SQLite database. On Unix, the
-database is forced to owner-only permissions. For managed installations, prefer the documented
-environment variables so credentials can be supplied by the process manager instead.
+- **Loopback only.** `compose.yaml` publishes the web page on `127.0.0.1` only, and magpie itself
+  refuses a non-loopback address unless the container opts in. Reach it from elsewhere with
+  `ssh -L` or Tailscale Funnel, never by publishing the port.
+- **Telegram is the login.** Without a bot token the page has no login, so magpie refuses to start
+  with `MAGPIE_PUBLIC_URL` but no Telegram. With Telegram, every API call except `/api/health`,
+  `/api/login` and `/api/me` needs a logged-in **owner** (guests use the bot and get 403):
+  - inside the Mini App, Telegram's signed `initData` (HMAC-SHA256 with a key derived from the bot
+    token, at most 24 hours old);
+  - in a browser, a one-time link from `/web` (valid 10 minutes) that starts a 30-day session
+    (`HttpOnly` cookie, `Secure` over HTTPS). Links and sessions are stored only as SHA-256 hashes.
+- **Same origin.** Write requests from another website's origin are rejected; responses carry a
+  strict Content-Security-Policy that only allows Telegram's Mini App script and frame.
+- **Secrets stay in `.env`** (`chmod 600 .env`). Nothing secret is stored in the database, and the
+  database file is created owner-only (`0600`). Bot API errors are logged without their URL, which
+  contains the bot token.
+- **Container:** runs as `PUID:PGID` (root only to fix folder owners, then `setpriv`), read-only root
+  filesystem, all capabilities dropped except the five the entrypoint needs, `no-new-privileges`.
 
 ## Reporting a vulnerability
 
-Please use GitHub's private security-advisory reporting flow for this repository. Do not include
-real provider credentials, private music files, or personally identifying file paths in a report.
+Use GitHub's private security advisory flow on
+[artamrj/magpie-fi](https://github.com/artamrj/magpie-fi/security/advisories/new). Do not include
+real tokens, private music files or personal file paths in a report.

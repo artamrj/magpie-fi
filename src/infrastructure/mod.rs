@@ -1,7 +1,9 @@
 pub mod db;
+pub mod file_stamp;
 pub mod fingerprint_cache;
 pub mod lyrics;
 pub mod media;
+pub mod process;
 pub mod provider_cache;
 pub mod providers;
 pub mod resilient_http;

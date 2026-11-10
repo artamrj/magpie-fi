@@ -34,22 +34,23 @@ pub struct Context {
     pub bot: Bot,
     pub config: TelegramConfig,
     pub username: String,
-    /// (chat, user) → the upload request still open for more files.
+    /// (chat, user) → the upload request still open for more files. Only
+    /// uploads of the last few seconds are kept.
     uploads: Mutex<HashMap<(i64, u64), (i64, Instant)>>,
 }
 
 /// Runs the bot until magpie stops. Does nothing without a bot token.
 pub async fn run(state: Arc<AppState>) {
-    let Some(config) = state.config.read().await.telegram.clone() else {
+    let Some(config) = state.config.telegram.clone() else {
         return;
     };
-    let bot = match Bot::new(&config) {
-        Ok(bot) => bot,
-        Err(error) => {
-            tracing::error!(%error, "Telegram client could not start");
-            return;
-        }
-    };
+    match Bot::new(&config.token) {
+        Ok(bot) => serve(state, config, bot).await,
+        Err(error) => tracing::error!(%error, "Telegram client could not start"),
+    }
+}
+
+async fn serve(state: Arc<AppState>, config: TelegramConfig, bot: Bot) {
     let me = loop {
         match bot.call::<_, User>("getMe", &json!({})).await {
             Ok(me) => break me,
@@ -87,7 +88,7 @@ pub async fn run(state: Arc<AppState>) {
         )
         .await;
     // Owners get a "magpie" button next to the message box that opens the web page.
-    if let Some(url) = mini_app_url(&state.config.read().await.public_url, "") {
+    if let Some(url) = mini_app_url(&state.config.public_url, "") {
         for owner in &config.owners {
             let _: Option<bool> = bot
                 .try_call(
@@ -337,8 +338,9 @@ async fn on_upload(
     let key = (chat, user.id);
     let request = {
         let mut uploads = context.uploads.lock().await;
+        uploads.retain(|_, (_, last)| last.elapsed() < UPLOAD_BATCH_WINDOW);
         match uploads.get(&key) {
-            Some((request, last)) if last.elapsed() < UPLOAD_BATCH_WINDOW => {
+            Some((request, _)) => {
                 let request = *request;
                 uploads.insert(key, (request, Instant::now()));
                 request
@@ -369,7 +371,7 @@ async fn on_upload(
     .await?;
     let context = context.clone();
     tokio::spawn(async move {
-        let config = context.state.config.read().await.clone();
+        let config = &context.state.config;
         let extension = std::path::Path::new(&file.name)
             .extension()
             .and_then(|value| value.to_str())
@@ -454,7 +456,7 @@ async fn on_command(
         "queue" => send(context, chat, &queue_text(context).await?, None).await,
         "health" => send(context, chat, &health_text(context).await, None).await,
         "web" if role == Role::Owner => {
-            let public_url = context.state.config.read().await.public_url.clone();
+            let public_url = context.state.config.public_url.clone();
             let base = public_url
                 .clone()
                 .unwrap_or_else(|| "http://127.0.0.1:7331".into());
@@ -511,7 +513,7 @@ async fn queue_text(context: &Context) -> Result<String> {
 }
 
 async fn health_text(context: &Context) -> String {
-    let config = context.state.config.read().await.clone();
+    let config = &context.state.config;
     let songs: i64 = sqlx::query_scalar("SELECT count(*) FROM library_items")
         .fetch_one(&context.state.pool)
         .await
@@ -525,7 +527,7 @@ async fn health_text(context: &Context) -> String {
          Library: {} {songs} songs\n\
          yt-dlp: {}",
         check(writable),
-        check(crate::acquire::ytdlp::available(&config)),
+        check(crate::acquire::ytdlp::available(config)),
     )
 }
 
@@ -600,56 +602,27 @@ async fn redeem_invite(context: &Context, chat: i64, user: &User, token: &str) -
 
 // ── Buttons ─────────────────────────────────────────────────────────────────
 
+/// Button data is `action` or `action:number[:number]`.
 async fn on_button(context: &Arc<Context>, query: &CallbackQuery) -> Result<()> {
-    let data = query.data.clone().unwrap_or_default();
-    let role = role(context, query.from.id).await;
-    let user = query.from.id.to_string();
+    let data = query.data.as_deref().unwrap_or_default();
+    let (action, argument) = data.split_once(':').unwrap_or((data, ""));
+    let mut numbers = argument
+        .split(':')
+        .map(|part| part.parse::<i64>().unwrap_or(-1));
+    let number = numbers.next().unwrap_or(-1);
+    if !may_press(context, query.from.id, action, number).await? {
+        answer(context, &query.id, "Not allowed").await;
+        return Ok(());
+    }
     let message = match &query.message {
         Some(MaybeInaccessibleMessage::Message(message)) => Some(message.as_ref()),
         _ => None,
     };
-    let (action, argument) = data.split_once(':').unwrap_or((data.as_str(), ""));
-    let number: i64 = argument
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .parse()
-        .unwrap_or(-1);
-
-    // Owners may press anything; others only buttons of their own requests.
-    let allowed = match action {
-        "invite" | "revoke" => role == Role::Owner,
-        "stop" | "retry" | "details" => {
-            role == Role::Owner
-                || (role == Role::Guest
-                    && store::requester_of_request(&context.state.pool, number)
-                        .await?
-                        .as_deref()
-                        == Some(user.as_str()))
-        }
-        "pick" | "drop" => {
-            role == Role::Owner
-                || (role == Role::Guest
-                    && store::requester_of_track(&context.state.pool, number)
-                        .await?
-                        .is_some_and(|(_, requester)| requester == user))
-        }
-        _ => false,
-    };
-    if !allowed {
-        answer(context, &query.id, "Not allowed").await;
-        return Ok(());
-    }
-
     match action {
         "stop" => {
             let stopped = store::stop_request(&context.state.pool, number).await?;
-            answer(
-                context,
-                &query.id,
-                &format!("Stopped {stopped} songs that had not started"),
-            )
-            .await;
+            let text = format!("Stopped {stopped} songs that had not started");
+            answer(context, &query.id, &text).await;
         }
         "retry" => {
             let queued = store::retry_failed(&context.state.pool, number).await?;
@@ -665,29 +638,8 @@ async fn on_button(context: &Arc<Context>, query: &CallbackQuery) -> Result<()> 
             }
         }
         "pick" => {
-            let candidate: i64 = argument
-                .split(':')
-                .nth(1)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(-1);
-            let result = crate::http::handlers::select_candidate(
-                axum::extract::State(context.state.clone()),
-                axum::extract::Path(TrackId(number)),
-                axum::Json(crate::http::handlers::SelectRequest {
-                    candidate_id: Some(CandidateId(candidate)),
-                }),
-            )
-            .await;
-            let reply = match result {
-                Ok(axum::Json(value)) if value["ready"] == true => {
-                    context.state.notify_automation_scheduler();
-                    "✅ Got it. Filing it now."
-                }
-                Ok(_) => {
-                    "Saved your choice, but no matching cover was found yet. Finish it on the web page under Review."
-                }
-                Err(_) => "That choice is no longer available. Open Review on the web page.",
-            };
+            let candidate = numbers.next().unwrap_or(-1);
+            let reply = pick_candidate(context, number, candidate).await;
             answer(context, &query.id, "").await;
             if let Some(message) = message {
                 edit(context, message.chat.id, message.message_id, reply, None).await;
@@ -698,10 +650,11 @@ async fn on_button(context: &Arc<Context>, query: &CallbackQuery) -> Result<()> 
                 axum::extract::State(context.state.clone()),
                 axum::extract::Path(TrackId(number)),
             )
-            .await;
+            .await
+            .is_ok();
             answer(context, &query.id, "").await;
             if let Some(message) = message {
-                let text = if removed.is_ok() {
+                let text = if removed {
                     "🗑 Removed. It won't be added."
                 } else {
                     "That song is already gone."
@@ -710,25 +663,11 @@ async fn on_button(context: &Arc<Context>, query: &CallbackQuery) -> Result<()> 
             }
         }
         "invite" => {
-            let token = invite_token();
-            sqlx::query("INSERT INTO telegram_invites(token,created_by,created_at) VALUES(?,?,?)")
-                .bind(&token)
-                .bind(i64::try_from(query.from.id).unwrap_or(-1))
-                .bind(chrono::Utc::now().to_rfc3339())
-                .execute(&context.state.pool)
-                .await?;
+            let link = create_invite(context, query.from.id).await?;
             answer(context, &query.id, "").await;
             if let Some(message) = message {
-                send(
-                    context,
-                    message.chat.id,
-                    &format!(
-                        "Send this link to your guest. It works once:\nhttps://t.me/{}?start=invite_{token}",
-                        context.username
-                    ),
-                    None,
-                )
-                .await;
+                let text = format!("Send this link to your guest. It works once:\n{link}");
+                send(context, message.chat.id, &text, None).await;
             }
         }
         "revoke" => {
@@ -752,6 +691,70 @@ async fn on_button(context: &Arc<Context>, query: &CallbackQuery) -> Result<()> 
         _ => answer(context, &query.id, "").await,
     }
     Ok(())
+}
+
+/// Owners may press anything; guests only buttons of their own requests.
+async fn may_press(context: &Context, user: u64, action: &str, number: i64) -> Result<bool> {
+    let role = role(context, user).await;
+    if role == Role::Owner {
+        return Ok(matches!(
+            action,
+            "invite" | "revoke" | "stop" | "retry" | "details" | "pick" | "drop"
+        ));
+    }
+    if role != Role::Guest {
+        return Ok(false);
+    }
+    let user = user.to_string();
+    let pool = &context.state.pool;
+    Ok(match action {
+        "stop" | "retry" | "details" => {
+            store::requester_of_request(pool, number).await?.as_deref() == Some(user.as_str())
+        }
+        "pick" | "drop" => store::requester_of_track(pool, number)
+            .await?
+            .is_some_and(|(_, requester)| requester == user),
+        _ => false,
+    })
+}
+
+/// Selects a candidate for a song waiting in review; returns the reply.
+async fn pick_candidate(context: &Context, track: i64, candidate: i64) -> &'static str {
+    let result = crate::http::handlers::select_candidate(
+        axum::extract::State(context.state.clone()),
+        axum::extract::Path(TrackId(track)),
+        axum::Json(crate::http::handlers::SelectRequest {
+            candidate_id: Some(CandidateId(candidate)),
+        }),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(value)) if value["ready"] == true => {
+            context.state.notify_automation_scheduler();
+            "✅ Got it. Filing it now."
+        }
+        Ok(_) => {
+            "Saved your choice, but no matching cover was found yet. Finish it on the web page under Review."
+        }
+        Err(_) => "That choice is no longer available. Open Review on the web page.",
+    }
+}
+
+/// A one-time invite link for a guest.
+async fn create_invite(context: &Context, owner: u64) -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
+    let token = hex::encode(bytes);
+    sqlx::query("INSERT INTO telegram_invites(token,created_by,created_at) VALUES(?,?,?)")
+        .bind(&token)
+        .bind(i64::try_from(owner).unwrap_or(-1))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&context.state.pool)
+        .await?;
+    Ok(format!(
+        "https://t.me/{}?start=invite_{token}",
+        context.username
+    ))
 }
 
 async fn details_text(context: &Context, request: i64) -> Result<String> {
@@ -801,17 +804,6 @@ pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
     })
 }
 
-fn invite_token() -> String {
-    use sha2::{Digest, Sha256};
-    let seed = format!(
-        "{:?}-{}-{:?}",
-        std::time::SystemTime::now(),
-        std::process::id(),
-        std::thread::current().id()
-    );
-    hex::encode(Sha256::digest(seed.as_bytes()))[..20].to_owned()
-}
-
 // ── Small helpers ───────────────────────────────────────────────────────────
 
 pub async fn send(
@@ -847,6 +839,17 @@ pub async fn send_with(
 }
 
 pub async fn edit(context: &Context, chat: i64, message: i32, text: &str, keyboard: Option<Value>) {
+    let _: Option<Value> = context
+        .bot
+        .try_call(
+            "editMessageText",
+            &edit_params(chat, message, text, keyboard),
+        )
+        .await;
+}
+
+/// `editMessageText` parameters for an HTML message without link previews.
+pub fn edit_params(chat: i64, message: i32, text: &str, keyboard: Option<Value>) -> Value {
     let mut params = json!({
         "chat_id": chat,
         "message_id": message,
@@ -857,7 +860,7 @@ pub async fn edit(context: &Context, chat: i64, message: i32, text: &str, keyboa
     if let Some(keyboard) = keyboard {
         params["reply_markup"] = keyboard;
     }
-    let _: Option<Value> = context.bot.try_call("editMessageText", &params).await;
+    params
 }
 
 async fn answer(context: &Context, query: &str, text: &str) {
@@ -1010,17 +1013,18 @@ mod tests {
             &directory.path().join("music"),
             &directory.path().join("data"),
         );
-        config.telegram = Some(TelegramConfig {
+        let telegram = TelegramConfig {
             token: "1:test".into(),
             owners: vec![OWNER as i64],
-            api_url: format!("http://{address}"),
-        });
+        };
+        config.telegram = Some(telegram.clone());
         let pool =
             crate::infrastructure::db::connect(directory.path().join("t.sqlite").to_str().unwrap())
                 .await
                 .unwrap();
         let state = Arc::new(AppState::new(config, pool));
-        tokio::spawn(run(state.clone()));
+        let bot = Bot::with_api_url(&format!("http://{address}"), &telegram.token).unwrap();
+        tokio::spawn(serve(state.clone(), telegram, bot));
         (directory, fake, state)
     }
 

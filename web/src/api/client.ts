@@ -1,4 +1,4 @@
-import { telegram } from "@/app/telegram";
+import { telegram } from "../app/telegram";
 
 const API_TIMEOUT_MS = 30_000;
 
@@ -25,21 +25,11 @@ export const api = async <T>(path: string, init?: RequestInit): Promise<T> => {
       signal: controller.signal,
       ...init,
     });
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      body = undefined;
-    }
+    const body: unknown = await response.json().catch(() => undefined);
     if (!response.ok) {
       const message =
-        (body &&
-        typeof body === "object" &&
-        "error" in body &&
-        typeof (body as { error?: unknown }).error === "string"
-          ? (body as { error: string }).error
-          : null) ??
-        response.statusText ??
+        (body as { error?: string } | undefined)?.error ||
+        response.statusText ||
         `Request failed (${response.status})`;
       throw new ApiError(response.status, message);
     }
@@ -53,3 +43,7 @@ export const api = async <T>(path: string, init?: RequestInit): Promise<T> => {
     window.clearTimeout(timer);
   }
 };
+
+/** POSTs `body` as JSON. */
+export const post = <T = unknown>(path: string, body: unknown = {}) =>
+  api<T>(path, { method: "POST", body: JSON.stringify(body) });

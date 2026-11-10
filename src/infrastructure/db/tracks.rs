@@ -1,17 +1,22 @@
 use crate::{
-    infrastructure::providers::Candidate,
+    infrastructure::providers::{ArtworkStatus, Candidate},
     types::{CandidateId, TrackId, TrackStage},
 };
 use serde::Serialize;
 use sqlx::FromRow;
 use std::collections::HashMap;
 
-pub const TRACK_FIELDS: &str = "id,path,output_path,filename,format,bitrate,duration,content_fingerprint,current_title,current_artist,current_album,current_album_artist,current_track_number,selected_candidate_id,status,error,is_missing,stage,stage_message,retry_count,next_retry_at";
+pub const TRACK_FIELDS: &str = "id,path,output_path,filename,format,bitrate,duration,content_fingerprint,current_title,current_artist,current_album,current_album_artist,current_track_number,selected_candidate_id,status,error,is_missing,stage,stage_message";
+
+/// Every candidate column except `raw_json`, which is only kept for the record.
+pub const CANDIDATE_FIELDS: &str = "id,track_id,provider,title,artist,artist_credits_json,album,album_artist,album_artist_credits_json,track_number,track_total,disc_number,disc_total,year,genre,composer,label,isrc,cover_url,artwork_candidates_json,artwork_status,artwork_message,musicbrainz_recording_id,musicbrainz_release_id,release_country,release_date,release_type,release_secondary_types,is_compilation,duration_delta,score_breakdown,musicbrainz_artist_id,musicbrainz_album_artist_id,score";
 
 #[derive(Clone, Debug, Serialize, FromRow)]
 pub struct Track {
     pub(crate) id: TrackId,
+    #[serde(skip_serializing)]
     pub(crate) path: String,
+    #[serde(skip_serializing)]
     pub(crate) output_path: Option<String>,
     pub(crate) filename: String,
     pub(crate) format: Option<String>,
@@ -31,22 +36,18 @@ pub struct Track {
     pub(crate) is_missing: bool,
     pub(crate) stage: TrackStage,
     pub(crate) stage_message: Option<String>,
-    pub(crate) retry_count: i64,
-    pub(crate) next_retry_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, FromRow)]
+#[derive(Clone, Debug, FromRow)]
 pub struct CandidateRow {
     pub(crate) id: CandidateId,
     pub(crate) track_id: TrackId,
     pub(crate) provider: String,
     pub(crate) title: Option<String>,
     pub(crate) artist: Option<String>,
-    #[serde(skip_serializing)]
     pub(crate) artist_credits_json: Option<String>,
     pub(crate) album: Option<String>,
     pub(crate) album_artist: Option<String>,
-    #[serde(skip_serializing)]
     pub(crate) album_artist_credits_json: Option<String>,
     pub(crate) track_number: Option<i64>,
     pub(crate) track_total: Option<i64>,
@@ -58,9 +59,8 @@ pub struct CandidateRow {
     pub(crate) label: Option<String>,
     pub(crate) isrc: Option<String>,
     pub(crate) cover_url: Option<String>,
-    #[serde(skip_serializing)]
     pub(crate) artwork_candidates_json: Option<String>,
-    pub(crate) artwork_status: String,
+    pub(crate) artwork_status: ArtworkStatus,
     pub(crate) artwork_message: Option<String>,
     pub(crate) musicbrainz_recording_id: Option<String>,
     pub(crate) musicbrainz_release_id: Option<String>,
@@ -74,43 +74,29 @@ pub struct CandidateRow {
     pub(crate) musicbrainz_artist_id: Option<String>,
     pub(crate) musicbrainz_album_artist_id: Option<String>,
     pub(crate) score: f64,
-    pub(crate) raw_json: Option<String>,
 }
 
 impl CandidateRow {
-    fn normalized_credits(&self) -> crate::domain::credits::Credits {
+    pub fn value(&self) -> Candidate {
         let artist =
             crate::domain::credits::prefer_latin_alias(self.artist.as_deref().unwrap_or_default());
-        crate::domain::credits::normalize_structured(
+        let credits = crate::domain::credits::normalize_structured(
             &artist,
             self.title.as_deref().unwrap_or_default(),
-            self.artist_credits_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default(),
-        )
-    }
-
-    pub fn value(&self) -> Candidate {
-        let credits = self.normalized_credits();
-        let artist_credits = credits.artists.clone();
-        let album_artist_credits = self
-            .album_artist_credits_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-            .unwrap_or_default();
+            json_or_default(self.artist_credits_json.as_deref()),
+        );
         Candidate {
             id: Some(self.id.0),
             provider: self.provider.clone(),
             title: credits.title,
             artist: credits.artist,
-            artist_credits,
+            artist_credits: credits.artists,
             album: self.album.clone(),
             album_artist: self
                 .album_artist
                 .as_deref()
                 .map(crate::domain::credits::prefer_latin_alias),
-            album_artist_credits,
+            album_artist_credits: json_or_default(self.album_artist_credits_json.as_deref()),
             track_number: self.track_number,
             track_total: self.track_total,
             disc_number: self.disc_number,
@@ -121,13 +107,8 @@ impl CandidateRow {
             label: self.label.clone(),
             isrc: self.isrc.clone(),
             cover_url: self.cover_url.clone(),
-            artwork_candidates: self
-                .artwork_candidates_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default(),
-            artwork_status: serde_json::from_value(serde_json::json!(self.artwork_status))
-                .unwrap_or_default(),
+            artwork_candidates: json_or_default(self.artwork_candidates_json.as_deref()),
+            artwork_status: self.artwork_status,
             artwork_message: self.artwork_message.clone(),
             recording_id: self.musicbrainz_recording_id.clone(),
             release_id: self.musicbrainz_release_id.clone(),
@@ -141,9 +122,14 @@ impl CandidateRow {
             artist_id: self.musicbrainz_artist_id.clone(),
             album_artist_id: self.musicbrainz_album_artist_id.clone(),
             score: self.score,
-            raw_json: self.raw_json.clone().unwrap_or_default(),
+            raw_json: String::new(),
         }
     }
+}
+
+fn json_or_default<T: serde::de::DeserializeOwned + Default>(raw: Option<&str>) -> T {
+    raw.and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +149,19 @@ pub async fn track(pool: &sqlx::SqlitePool, id: TrackId) -> Result<Track, TrackE
     .await?)
 }
 
+pub async fn candidate(
+    pool: &sqlx::SqlitePool,
+    id: CandidateId,
+) -> Result<Option<Candidate>, TrackError> {
+    let row: Option<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {CANDIDATE_FIELDS} FROM candidates WHERE id=?"
+    )))
+    .bind(id.0)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(CandidateRow::value))
+}
+
 pub async fn selected(
     pool: &sqlx::SqlitePool,
     id: TrackId,
@@ -171,22 +170,25 @@ pub async fn selected(
     let cid = track
         .selected_candidate_id
         .ok_or_else(|| TrackError::NotFound("track has no selected candidate".into()))?;
-    let row: CandidateRow = sqlx::query_as("SELECT * FROM candidates WHERE id=?")
-        .bind(cid.0)
-        .fetch_one(pool)
-        .await?;
-    Ok((track, row.value()))
+    let candidate = candidate(pool, cid)
+        .await?
+        .ok_or_else(|| TrackError::NotFound("selected candidate no longer exists".into()))?;
+    Ok((track, candidate))
 }
 
+/// Pairs each track with its selected candidate.
 pub async fn selected_for_tracks(
     pool: &sqlx::SqlitePool,
     tracks: Vec<Track>,
 ) -> Result<Vec<(Track, Candidate)>, TrackError> {
-    let rows: Vec<CandidateRow> = sqlx::query_as(
-        "SELECT candidates.* FROM candidates
-         JOIN tracks ON tracks.selected_candidate_id=candidates.id
-         WHERE tracks.selected_candidate_id IS NOT NULL",
-    )
+    let ids = tracks
+        .iter()
+        .filter_map(|track| track.selected_candidate_id.map(|id| id.0))
+        .collect::<Vec<_>>();
+    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {CANDIDATE_FIELDS} FROM candidates WHERE id IN (SELECT value FROM json_each(?))"
+    )))
+    .bind(serde_json::json!(ids).to_string())
     .fetch_all(pool)
     .await?;
     let mut candidates = rows
@@ -209,25 +211,33 @@ pub async fn selected_for_tracks(
 pub async fn candidates(
     pool: &sqlx::SqlitePool,
     id: TrackId,
-) -> Result<Vec<CandidateRow>, TrackError> {
-    Ok(
-        sqlx::query_as("SELECT * FROM candidates WHERE track_id=? ORDER BY score DESC")
-            .bind(id.0)
-            .fetch_all(pool)
-            .await?,
-    )
+) -> Result<Vec<Candidate>, TrackError> {
+    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {CANDIDATE_FIELDS} FROM candidates WHERE track_id=? ORDER BY score DESC"
+    )))
+    .bind(id.0)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(CandidateRow::value).collect())
 }
 
+/// The candidates of these tracks, best score first.
 pub async fn candidates_by_track(
     pool: &sqlx::SqlitePool,
-) -> Result<HashMap<TrackId, Vec<CandidateRow>>, TrackError> {
-    let rows: Vec<CandidateRow> =
-        sqlx::query_as("SELECT * FROM candidates ORDER BY track_id, score DESC")
-            .fetch_all(pool)
-            .await?;
-    let mut by_track = HashMap::<TrackId, Vec<CandidateRow>>::new();
+    tracks: impl IntoIterator<Item = TrackId>,
+) -> Result<HashMap<TrackId, Vec<Candidate>>, TrackError> {
+    let ids = tracks.into_iter().map(|id| id.0).collect::<Vec<_>>();
+    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {CANDIDATE_FIELDS} FROM candidates
+         WHERE track_id IN (SELECT value FROM json_each(?))
+         ORDER BY track_id, score DESC"
+    )))
+    .bind(serde_json::json!(ids).to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut by_track = HashMap::<TrackId, Vec<Candidate>>::new();
     for row in rows {
-        by_track.entry(row.track_id).or_default().push(row);
+        by_track.entry(row.track_id).or_default().push(row.value());
     }
     Ok(by_track)
 }

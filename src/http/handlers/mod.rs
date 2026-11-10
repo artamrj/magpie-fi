@@ -1,8 +1,12 @@
 use crate::{
-    app::AppState,
+    app::{AppState, state::Workflow},
     application::scan as scan_pipeline,
     http::error::{ApiError, ApiResult},
-    infrastructure::{media::tag_writer, providers::Candidate},
+    infrastructure::{
+        db::tracks::{self as track_db, Track},
+        media::tag_writer,
+        providers::Candidate,
+    },
     types::{CandidateId, TrackId, WorkflowPhase},
 };
 use anyhow::Result;
@@ -13,15 +17,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 
-pub(super) use crate::infrastructure::db::tracks::{CandidateRow, Track};
-
 mod apply;
-mod queries;
 mod requests;
 mod scan;
 mod settings;
 mod tracks;
-mod workspace;
 
 pub use apply::start_apply;
 pub use requests::{create_request, list_requests, recent_library, request_songs, retry_request};
@@ -32,7 +32,11 @@ pub use tracks::{
     original_artwork_preview, remove_track, resolve_source, return_to_review, search_artwork,
     select_candidate, track_audio, update_artwork,
 };
-pub use workspace::workspace;
+
+/// `GET /api/status`: what the background workflow is doing.
+pub async fn workspace(State(s): State<Arc<AppState>>) -> Json<Workflow> {
+    Json(s.workflow.read().await.clone())
+}
 
 #[derive(Deserialize)]
 pub struct SelectRequest {
@@ -80,15 +84,8 @@ pub struct WorkspaceTrack {
 }
 
 #[derive(Serialize)]
-pub struct TrackPage {
-    items: Vec<WorkspaceTrack>,
-    total: i64,
-}
-
-#[derive(Serialize)]
 pub struct AutoApproveResult {
     approved: u64,
-    remaining: i64,
     low_confidence: u64,
     unavailable: u64,
 }
