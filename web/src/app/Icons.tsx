@@ -12,17 +12,20 @@ export type IconName =
   | "info"
   | "library"
   | "link"
+  | "logout"
   | "music"
   | "pause"
   | "play"
   | "plus"
   | "refresh"
   | "search"
+  | "send"
   | "shield"
   | "skip"
   | "sparkles"
   | "trash"
   | "user"
+  | "users"
   | "x";
 
 const paths: Record<IconName, React.ReactNode> = {
@@ -76,6 +79,12 @@ const paths: Record<IconName, React.ReactNode> = {
       <path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" />
     </>
   ),
+  logout: (
+    <>
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <path d="m16 17 5-5-5-5M21 12H9" />
+    </>
+  ),
   music: (
     <>
       <path d="M9 18V5l10-2v13" />
@@ -101,6 +110,12 @@ const paths: Record<IconName, React.ReactNode> = {
     <>
       <circle cx="11" cy="11" r="7" />
       <path d="m20 20-4-4" />
+    </>
+  ),
+  send: (
+    <>
+      <path d="M21 3 3 10.5l7 2.5 2.5 7.5z" />
+      <path d="M21 3 10 13" />
     </>
   ),
   shield: (
@@ -130,6 +145,14 @@ const paths: Record<IconName, React.ReactNode> = {
     <>
       <circle cx="12" cy="8" r="4" />
       <path d="M4 21a8 8 0 0 1 16 0" />
+    </>
+  ),
+  users: (
+    <>
+      <circle cx="9" cy="8" r="3.5" />
+      <path d="M2.5 20a6.5 6.5 0 0 1 13 0" />
+      <path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" />
+      <path d="M18 14.2a6.5 6.5 0 0 1 3.5 5.8" />
     </>
   ),
   x: <path d="M6 6l12 12M18 6 6 18" />,

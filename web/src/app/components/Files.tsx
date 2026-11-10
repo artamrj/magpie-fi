@@ -866,7 +866,6 @@ function refreshAfterSave(queryClient: QueryClient) {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: queryKeys.files }),
     queryClient.invalidateQueries({ queryKey: queryKeys.artists }),
-    queryClient.invalidateQueries({ queryKey: queryKeys.recent }),
   ]);
 }
 

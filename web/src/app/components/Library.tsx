@@ -1,20 +1,21 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { post } from "../../api/client";
-import { queryKeys, useArtistsQuery, useMeQuery, useRecentSongsQuery } from "../../api/queries";
+import { queryKeys, useArtistsQuery } from "../../api/queries";
 import type { ArtistChanged, ArtistSummary, Setup } from "../../api/types";
 import { Icon } from "../Icons";
-import { askConfirm, haptic, telegram } from "../telegram";
-import { providerName } from "../trackUtils";
+import { askConfirm, haptic } from "../telegram";
 import { EmptyState, ListSkeleton } from "./EmptyStates";
 import type { Feedback } from "./ReviewList";
+import { StatusSection } from "./Status";
 import { Cell, Field, PageTitle, Section, Sheet, Spinner, Tag } from "./ui";
 
 const SEPARATORS = /\s+(?:&|x|X|×|و|with|With|vs\.?|feat\.?|ft\.?|featuring)\s+|\s*[,،]\s*/;
 const MOVE_WARNING =
   "Their tags are rewritten and they move to the right artist folder. Navidrome may count them as new songs, so play counts can start again.";
 
-/** Everything that is filed: numbers, artists (with fixes for wrong names), and status. */
+/** The Artists page: every artist in the library, with fixes for wrong names. On a phone or in
+    Telegram the server status sits at the bottom; a wide window shows it in the sidebar. */
 export function Library({
   setup,
   wide,
@@ -25,8 +26,6 @@ export function Library({
   feedback: Feedback;
 }) {
   const artists = useArtistsQuery();
-  const recent = useRecentSongsQuery();
-  const me = useMeQuery();
   const [search, setSearch] = useState("");
   const [openId, setOpenId] = useState<number>();
   const all = useMemo(() => artists.data ?? [], [artists.data]);
@@ -40,17 +39,6 @@ export function Library({
   }, [all, search]);
   const suspicious = shown.filter((artist) => artist.looks_like_several);
   const open = all.find((artist) => artist.id === openId);
-  const sourcesReady = Object.values(setup.sources).filter(Boolean).length;
-  const sourcesTotal = Object.keys(setup.sources).length;
-  const missingSources = Object.entries(setup.sources)
-    .filter(([, ok]) => !ok)
-    .map(([name]) => providerName(name));
-
-  const logOut = async () => {
-    await post("/logout").catch(() => undefined);
-    window.location.reload();
-  };
-
   const artistRow = (artist: ArtistSummary) => (
     <Cell
       key={artist.id}
@@ -74,7 +62,10 @@ export function Library({
 
   const content = (
     <>
-      <PageTitle title="Library" subtitle="Everything magpie-fi has filed for Navidrome." />
+      <PageTitle
+        title="Artists"
+        subtitle="Rename, join or split the artists of your filed songs."
+      />
       <div className="stats">
         <div>
           <b>{setup.library_songs.toLocaleString()}</b>
@@ -83,10 +74,6 @@ export function Library({
         <div>
           <b>{artists.isPending ? "…" : all.length.toLocaleString()}</b>
           <small>artists</small>
-        </div>
-        <div>
-          <b>{recent.isPending ? "…" : `+${recent.data?.length ?? 0}`}</b>
-          <small>added lately</small>
         </div>
       </div>
       <label className="search-field">
@@ -101,31 +88,13 @@ export function Library({
         />
       </label>
 
-      {(recent.data?.length ?? 0) > 0 && (
-        <Section title="Added recently">
-          {recent.data!.slice(0, 6).map((song, index) => (
-            <Cell
-              key={`${song.added_at}-${index}`}
-              lead={
-                <span className="artwork artwork-small">
-                  <Icon name="music" size={18} />
-                </span>
-              }
-              title={song.title ?? "Unknown title"}
-              subtitle={[song.artist, song.album].filter(Boolean).join(" · ")}
-              trailing={<span>{addedWhen(song.added_at)}</span>}
-            />
-          ))}
-        </Section>
-      )}
-
       {artists.isPending ? (
         <section className="section">
           <ListSkeleton rows={4} />
         </section>
       ) : all.length === 0 ? (
         <EmptyState
-          icon="music"
+          icon="users"
           title="No artists yet"
           description="Artists appear here once their songs are filed."
         />
@@ -139,7 +108,7 @@ export function Library({
               {suspicious.map(artistRow)}
             </Section>
           )}
-          <Section title="Artists">
+          <Section title={suspicious.length > 0 ? "All artists" : undefined}>
             {shown.filter((artist) => !artist.looks_like_several).map(artistRow)}
             {shown.length === 0 && (
               <Cell title="No artist matches" subtitle="Try another spelling" />
@@ -148,60 +117,7 @@ export function Library({
         </>
       )}
 
-      <Section title="Status" footer="Settings live in the server’s .env file (MAGPIE_…).">
-        <Cell
-          lead={
-            <Icon
-              name="check"
-              style={{ color: setup.telegram.configured ? "var(--good)" : "var(--hint)" }}
-            />
-          }
-          title={setup.telegram.configured ? "Telegram bot is on" : "Telegram bot is off"}
-          subtitle={
-            setup.telegram.configured
-              ? `${setup.telegram.owners ?? 0} ${setup.telegram.owners === 1 ? "owner" : "owners"} · ${setup.telegram.guests ?? 0} ${setup.telegram.guests === 1 ? "guest" : "guests"} · files up to 20 MB`
-              : "Set MAGPIE_TELEGRAM_BOT_TOKEN and MAGPIE_TELEGRAM_OWNERS"
-          }
-        />
-        <Cell
-          lead={
-            <Icon
-              name={missingSources.length ? "alert" : "check"}
-              style={{ color: missingSources.length ? "var(--warn)" : "var(--good)" }}
-            />
-          }
-          title={`${sourcesReady} of ${sourcesTotal} sources ready`}
-          subtitle={
-            missingSources.length
-              ? `Missing: ${missingSources.join(", ")}`
-              : "Catalogs, fingerprinting and tools are all available"
-          }
-        />
-        <Cell
-          lead={<Icon name="folder" />}
-          title="Folders"
-          subtitle={`${setup.library_dir || "library"} · inbox checked every ${setup.inbox_check_seconds} s · trash kept ${setup.trash_days} days`}
-        />
-        <Cell
-          lead={<Icon name="music" />}
-          title="Downloads and extras"
-          subtitle={[
-            setup.ytdlp
-              ? `${setup.audio_format === "best" ? "source codec kept" : setup.audio_format.toUpperCase()}, ${setup.max_parallel_downloads} at a time`
-              : "yt-dlp missing: links cannot be downloaded",
-            setup.lyrics ? "lyrics on" : "lyrics off",
-            setup.rsgain ? "album loudness" : "track loudness only",
-          ].join(" · ")}
-        />
-        {!telegram && me.data?.via === "session" && (
-          <Cell
-            tone="link"
-            lead={<Icon name="x" />}
-            title="Log out of this browser"
-            onClick={() => void logOut()}
-          />
-        )}
-      </Section>
+      {!wide && <StatusSection setup={setup} />}
     </>
   );
 
@@ -445,15 +361,4 @@ function ArtistActions({
       {busy && <Cell title="Working…" lead={<Spinner />} />}
     </Section>
   );
-}
-
-function addedWhen(iso: string) {
-  const date = new Date(iso);
-  const today = new Date();
-  if (date.toDateString() === today.toDateString())
-    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-  const yesterday = new Date(today);
-  yesterday.setDate(today.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
-  return date.toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }

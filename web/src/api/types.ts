@@ -34,13 +34,6 @@ export type Me = {
   role: "owner" | "guest";
   via: "telegram" | "session" | "local";
 };
-/** A song filed recently (GET /api/library/recent). */
-export type RecentSong = {
-  title?: string;
-  artist?: string;
-  album?: string;
-  added_at: string;
-};
 /** A link someone asked for (GET /api/requests). */
 export type MusicRequest = {
   id: number;
