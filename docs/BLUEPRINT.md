@@ -450,7 +450,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 |---|---|---|
 | 1 | One language or two? | **One Rust program, one image.** The Python bot was ported and deleted: one queue, one database, one set of tests. |
 | 2 | Navidrome in the stack? | **No.** First planned as part of `compose.yaml` with API calls (scan, search, share links); dropped: the file watcher is enough, and users already run Navidrome their own way. |
-| 3 | Telegram library | **`frankenstein` for types only**, requests through magpie-fi's own HTTP client (one reqwest version), own small router. |
+| 3 | Telegram library | **No library.** Our own Bot API types (`src/telegram/types.rs`, only the fields in use), requests through magpie-fi's own HTTP client (one reqwest version), own small router. `frankenstein` was dropped in Nov 2026: it did not know Bot API 10.x (widgets, rich messages, ephemeral replies, button styles). |
 | 4 | Self-hosted Bot API server for files over 20 MB? | **No.** One more container and Telegram app keys for little gain; the bot explains the limit. |
 | 5 | Base image | **Debian trixie slim**, because yt-dlp and Deno need glibc. |
 | 6 | Where settings live | **Environment only.** One place to look; the page shows, doesn't edit. |

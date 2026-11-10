@@ -215,10 +215,14 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 | Part | File | Job |
 |---|---|---|
-| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client and frankenstein's types. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
-| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners and guests, random one-time invite tokens, links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
+| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
+| Types | `types.rs` | The Bot API types the bot reads, written by hand (Bot API 10.4). Only the fields in use; unknown fields are ignored, so a new API version never breaks reading updates. |
+| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners, guests and strangers, sends a message to the right handler, Mini App links, small send/edit/answer/react helpers. |
+| Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
+| Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
+| Buttons | `actions.rs` | One `Action` type for every button: its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), who may press it (owners anything, guests only their own requests and songs), and what it does. |
 | Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
-| Texts | `texts.rs` | Every message the bot sends, and the progress bar. |
+| Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. |
 
 ## 7. Web page login (`src/http/auth.rs`)
 

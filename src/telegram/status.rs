@@ -2,7 +2,7 @@
 //! sender when a song waits in review. Reads the same tables as the web page,
 //! every few seconds; a message is only edited when its text changed.
 
-use super::{Context, api, edit_params, react, send_with, texts};
+use super::{Context, actions::Action, api, edit_params, react, send_with, texts};
 use crate::acquire::store;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -72,15 +72,13 @@ async fn refresh(context: &Context) -> Result<()> {
 fn keyboard(summary: &store::RequestSummary, finished: bool) -> Option<Value> {
     let mut row = Vec::new();
     if !finished && summary.working > 0 && summary.total > 1 {
-        row.push(json!({"text": "⏹ Stop", "callback_data": format!("stop:{}", summary.id)}));
+        row.push(Action::Stop(summary.id).button(texts::STOP));
     }
     if finished && summary.failed > 0 {
-        row.push(
-            json!({"text": "🔁 Retry failed", "callback_data": format!("retry:{}", summary.id)}),
-        );
+        row.push(Action::Retry(summary.id).button(texts::RETRY_FAILED));
     }
     if summary.failed > 0 || summary.review > 0 {
-        row.push(json!({"text": "ℹ️ Details", "callback_data": format!("details:{}", summary.id)}));
+        row.push(Action::Details(summary.id).button(texts::DETAILS));
     }
     Some(json!({"inline_keyboard": if row.is_empty() { vec![] } else { vec![row] }}))
 }
@@ -94,21 +92,15 @@ async fn ask_reviews(context: &Context) -> Result<()> {
             Some(artist) => format!("{artist} – {}", question.title),
             None => question.title.clone(),
         };
-        let mut text = format!(
-            "🤔 Not sure which song this is:\n<b>{}</b>",
-            texts::escape(&song)
-        );
-        if let Some(reason) = question.reason.as_deref() {
-            text.push_str(&format!("\n<i>{}</i>", texts::escape(reason)));
-        }
-        let rows =
+        let (answer, rows) =
             match super::mini_app_track_url(&context.state.config.public_url, question.track_id) {
-                Some(url) => {
-                    text.push_str("\n\nChoose the right one in the app.");
-                    vec![vec![super::mini_app_button("🎵 Choose in the app", &url)]]
-                }
-                None => chat_choices(context, &question, &mut text).await?,
+                Some(url) => (
+                    texts::ReviewAnswer::InApp,
+                    vec![vec![super::mini_app_button(texts::CHOOSE_IN_APP, &url)]],
+                ),
+                None => chat_choices(context, &question).await?,
             };
+        let text = texts::review_question(&song, question.reason.as_deref(), &answer);
         let sent = send_with(
             context,
             question.chat_id,
@@ -128,8 +120,7 @@ async fn ask_reviews(context: &Context) -> Result<()> {
 async fn chat_choices(
     context: &Context,
     question: &store::ReviewQuestion,
-    text: &mut String,
-) -> Result<Vec<Vec<Value>>> {
+) -> Result<(texts::ReviewAnswer, Vec<Vec<Value>>)> {
     let candidates: Vec<Choice> = sqlx::query_as(
         "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
          ORDER BY score DESC LIMIT 3",
@@ -140,22 +131,22 @@ async fn chat_choices(
     let mut rows: Vec<Vec<Value>> = candidates
         .iter()
         .map(|choice| {
-            vec![json!({
-                "text": shorten(&choice.label(), 60),
-                "callback_data": format!("pick:{}:{}", question.track_id, choice.id),
-            })]
+            let pick = Action::Pick {
+                track: question.track_id,
+                candidate: choice.id,
+            };
+            vec![pick.button(&shorten(&choice.label(), 60))]
         })
         .collect();
-    rows.push(vec![json!({
-        "text": "🗑 None of these",
-        "callback_data": format!("drop:{}", question.track_id),
-    })]);
-    text.push_str(if candidates.is_empty() {
-        "\n\nI found nothing that fits. Open Review on the web page to type it in."
+    rows.push(vec![
+        Action::Drop(question.track_id).button(texts::NONE_OF_THESE),
+    ]);
+    let answer = if candidates.is_empty() {
+        texts::ReviewAnswer::NothingFound
     } else {
-        "\n\nIs it one of these?"
-    });
-    Ok(rows)
+        texts::ReviewAnswer::InChat
+    };
+    Ok((answer, rows))
 }
 
 /// A candidate offered as an answer button.
