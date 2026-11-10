@@ -45,7 +45,7 @@ export function ProcessingDock({
                 ? "Processing stopped"
                 : workflow?.phase === "finish"
                   ? "Writing complete"
-                  : "magpie is watching the inbox"}
+                  : "magpie-fi is watching the inbox"}
           </b>
           <small>
             {busy

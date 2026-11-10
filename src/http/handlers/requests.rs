@@ -22,7 +22,7 @@ pub async fn create_request(
         .unwrap_or_else(|_| raw.to_owned());
     let Some(link) = links::classify(&url) else {
         return Err(ApiError::validation(
-            "magpie can read Spotify, Apple Music, Deezer, YouTube, YouTube Music and Shazam links",
+            "magpie-fi can read Spotify, Apple Music, Deezer, YouTube, YouTube Music and Shazam links",
         ));
     };
     let id = store::create_request(&s.pool, &link.url, link.scope, "web", None).await?;

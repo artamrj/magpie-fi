@@ -1,4 +1,4 @@
-name: magpie
+name: magpie-fi
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - "scripts/docker-entrypoint.sh"
-      - ".github/workflows/magpie.yml"
+      - ".github/workflows/magpie-fi.yml"
   pull_request:
     paths:
       - "src/**"
@@ -22,14 +22,14 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - "scripts/docker-entrypoint.sh"
-      - ".github/workflows/magpie.yml"
+      - ".github/workflows/magpie-fi.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: magpie-${{ github.ref }}
+  group: magpie-fi-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

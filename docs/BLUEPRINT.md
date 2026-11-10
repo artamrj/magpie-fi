@@ -5,13 +5,13 @@
 > A self-hosted music service for you and a few people: **send a link or a file → it lands in
 > your library, correctly tagged, ready for Navidrome.**
 
-This is the design document: what magpie is, how it is built, the rules it follows and what comes
-next. How to install and use it is in [README.md](README.md); the exact algorithms are in
-[docs/TECHNICAL-OVERVIEW.md](docs/TECHNICAL-OVERVIEW.md).
+This is the design document: what magpie-fi is, how it is built, the rules it follows and what comes
+next. What it does is in [README.md](../README.md); the exact algorithms are in
+[TECHNICAL-OVERVIEW.md](TECHNICAL-OVERVIEW.md).
 
 Contents
 
-1. [What magpie is](#1-what-magpie-is)
+1. [What magpie-fi is](#1-what-magpie-fi-is)
 2. [Principles](#2-principles)
 3. [Architecture](#3-architecture)
 4. [Identification and decisions](#4-identification-and-decisions)
@@ -24,9 +24,9 @@ Contents
 
 ---
 
-## 1. What magpie is
+## 1. What magpie-fi is
 
-magpie-fi is **one Rust program, `magpie`, with a React web page, in one Docker image**
+magpie-fi is **one Rust program with a React web page, in one Docker image**
 (`ghcr.io/artamrj/magpie-fi`). It:
 
 - **gets songs** from links (Spotify, Apple Music, Deezer, YouTube / YouTube Music, Shazam) sent
@@ -56,20 +56,20 @@ only for the song list, the audio comes from YouTube); not Lidarr (no "monitor e
    `.env`), one queue, one tag writer, one duplicate index. Every job is done in exactly one place.
 2. **Your files are sacred.** Nothing is overwritten (atomic, no-clobber publish). Originals go to
    a trash with retention, never straight to `rm`. Existing library files are indexed, not moved
-   or renamed. Only magpie writes into `library/`.
+   or renamed. Only magpie-fi writes into `library/`.
 3. **Sure → file, unsure → ask.** A song is filed automatically only when the evidence is strong
    (audio recognition or several agreeing sources, matching length, matching version). Everything
    else waits for you. A wrong guess never goes silently into the library.
 4. **One pipeline for every input.** A link, a Telegram file and a dropped file all end up as a
-   file in the inbox or in `.magpie/staging/` and go through the same identification and filing.
+   file in the inbox or in `.magpie-fi/staging/` and go through the same identification and filing.
 5. **One copy per recording.** Duplicates are found by proof (same bytes, same fingerprint, same
    ISRC or MusicBrainz ID with matching length), never by title alone. A lossless copy replaces a
    lossy one; anything else that is already there goes to the trash.
-6. **No Navidrome API.** magpie only writes files (songs, `cover.jpg`, `.lrc`, `.m3u8`).
+6. **No Navidrome API.** magpie-fi only writes files (songs, `cover.jpg`, `.lrc`, `.m3u8`).
    Navidrome's file watcher picks them up. No Navidrome credentials, no coupling to its versions.
 7. **Tools are bundled programs.** ffmpeg, fpcalc, SongRec, rsgain, yt-dlp and Deno ship in the
    image and are run with timeouts. A missing optional tool turns a feature off, it doesn't stop
-   magpie.
+   magpie-fi.
 8. **Boring to run.** Settings only in `.env`, loopback-only port, read-only container, survives
    restarts (queue, buttons and review state live in the database).
 
@@ -84,7 +84,7 @@ src/
 ├── main.rs        startup, background loops, HTTP server, graceful shutdown
 ├── config.rs      MAGPIE_* settings and the fixed worker limits
 ├── app/           shared state: database pool, HTTP client, workflow slot
-├── acquire/       links → wanted songs → YouTube Music match → yt-dlp → .magpie/staging
+├── acquire/       links → wanted songs → YouTube Music match → yt-dlp → .magpie-fi/staging
 ├── application/
 │   ├── scan/      inbox check: walk, read, integrity, fingerprint, source cascade, persist
 │   ├── input_dedup.rs · smart_approval.rs · metadata_completion.rs · artwork.rs
@@ -113,9 +113,9 @@ were kept on purpose (§8).
               ▼                                                    ▼
  ┌─ acquire ──────────────────────────────────────────────────────────────────────────┐
  │ read the link → one `wanted` row per song → already in the library? → stop          │
- │ else best YouTube Music match → yt-dlp (stream copy) → .magpie/staging/ + link tags │
+ │ else best YouTube Music match → yt-dlp (stream copy) → .magpie-fi/staging/ + tags   │
  └───────────────────────────────────────┬────────────────────────────────────────────┘
- Telegram file → .magpie/staging/ ───────┤
+ Telegram file → .magpie-fi/staging/ ────┤
  your drop → MUSIC_ROOT/inbox/ ──────────┤ (waits until the file stops changing)
                                          ▼
  ┌─ inbox cycle (every minute) ────────────────────────────────────────────────────────┐
@@ -140,13 +140,13 @@ were kept on purpose (§8).
 | Telegram bot | continuously (long polling) | commands, links, files, buttons; status messages every 3 s |
 | Daily maintenance | at start if due, then at midnight | expired source answers, media-cache limit, trash purge |
 | Media-cache limit | hourly, when idle | keep analysis caches under 100 MiB |
-| yt-dlp update | daily | update the copy in `DATA_ROOT/magpie/bin` |
+| yt-dlp update | daily | update the copy in `DATA_ROOT/magpie-fi/bin` |
 
 Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at a time.
 
 ### 3.4 Web page, Mini App and Telegram
 
-- One axum server serves the API and the built web page from disk (`/usr/share/magpie` in the
+- One axum server serves the API and the built web page from disk (`/usr/share/magpie-fi` in the
   image), so everything comes from one origin, as Telegram's Mini App rules require.
 - The web page has **Get music** (paste a link, follow it to the library), **All tracks**,
   **Review**, **Issues**, **Ready**, an inspector with audio and cover previews, a manual
@@ -160,12 +160,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 ### 3.5 The image and deployment
 
 - `ghcr.io/artamrj/magpie-fi`, linux/amd64 + linux/arm64, Debian trixie slim (yt-dlp and Deno
-  need glibc). Contains `magpie`, the web page, ffmpeg/ffprobe, fpcalc, `songrec-lib-cli`,
+  need glibc). Contains `magpie-fi`, the web page, ffmpeg/ffprobe, fpcalc, `songrec-lib-cli`,
   rsgain, yt-dlp (zipapp, self-updating), Deno and tini.
-- `compose.yaml` has one service, `magpie`: port `127.0.0.1:7331`, `MUSIC_ROOT` mounted whole at
-  `/music` (so moves are renames), `DATA_ROOT/magpie` at `/data`, `config/ytdlp` read-only for an
+- `compose.yaml` has one service, `magpie-fi`: port `127.0.0.1:7331`, `MUSIC_ROOT` mounted whole at
+  `/music` (so moves are renames), `DATA_ROOT/magpie-fi` at `/data`, `config/ytdlp` read-only for an
   optional `cookies.txt`.
-- The entrypoint creates magpie's folders, fixes their owner to `PUID:PGID` (never your existing
+- The entrypoint creates magpie-fi's folders, fixes their owner to `PUID:PGID` (never your existing
   music files) and drops to that user.
 - Releases: a `v*` tag builds and pushes the image (Trivy scan included). Dependabot updates
   Cargo, npm, GitHub Actions and Docker base images monthly.
@@ -174,7 +174,7 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 
 ## 4. Identification and decisions
 
-Details and exact weights: [TECHNICAL-OVERVIEW §8–11](docs/TECHNICAL-OVERVIEW.md#8-library-index-and-duplicates).
+Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8-library-index-and-duplicates).
 
 - **Evidence from the file.** Tags, length, a decode check (damaged files go to Issues and can be
   repaired), a Chromaprint fingerprint, or SHA-256 when fingerprinting fails.
@@ -209,7 +209,7 @@ backups and for other tools; both are kept clean and consistent.
 
 ```text
 MUSIC_ROOT/                         one filesystem: every move is an atomic rename
-├── library/                        Navidrome's music folder; only magpie writes here
+├── library/                        Navidrome's music folder; only magpie-fi writes here
 │   ├── Radiohead/
 │   │   ├── OK Computer (1997)/
 │   │   │   ├── cover.jpg
@@ -221,14 +221,14 @@ MUSIC_ROOT/                         one filesystem: every move is an atomic rena
 │   ├── Googoosh/Pol (2000)/        names stay in their own script (NFC)
 │   ├── Various Artists/Pulp Fiction (1994)/01 - Dick Dale & His Del-Tones - Misirlou.m4a
 │   └── Playlists/Arta - Road Trip.m3u8      relative paths
-├── inbox/                          your drop zone; magpie empties it
-└── .magpie/                        hidden work area
+├── inbox/                          your drop zone; magpie-fi empties it
+└── .magpie-fi/                     hidden work area
     ├── staging/                    downloads and Telegram files on their way
     └── trash/<date>/               originals and replaced files, kept MAGPIE_TRASH_DAYS (30)
-DATA_ROOT/magpie/                   magpie.sqlite, bin/yt-dlp (keep on a local SSD)
+DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a local SSD)
 ```
 
-- `inbox/` is only for you; magpie's own downloads go to `.magpie/staging/`.
+- `inbox/` is only for you; magpie-fi's own downloads go to `.magpie-fi/staging/`.
 - Downloads are deleted after filing; your own originals go to the trash.
 - Playlists live inside the library because Navidrome's `PlaylistsPath` is relative to it.
 
@@ -257,7 +257,7 @@ DATA_ROOT/magpie/                   magpie.sqlite, bin/yt-dlp (keep on a local S
   same cover, then nothing new is written.
 - **Never re-encode.** YouTube's own Opus/AAC stream is kept; FLAC stays FLAC.
 
-### 5.3 What magpie writes
+### 5.3 What magpie-fi writes
 
 | What | Notes |
 |---|---|
@@ -275,8 +275,7 @@ Navidrome never sees a half-tagged file and never sees a retag and a move in one
 
 ### 5.4 Navidrome
 
-Recommended Navidrome settings are in the README ([Navidrome](README.md#navidrome)): file watcher
-on, playlists auto-imported from `Playlists`, `Scanner.PurgeMissing = "never"`, `.lrc` lyrics and
+Recommended Navidrome settings: file watcher on, playlists auto-imported from `Playlists`, `Scanner.PurgeMissing = "never"`, `.lrc` lyrics and
 `cover.*` first.
 
 ---
@@ -286,7 +285,7 @@ on, playlists auto-imported from `Playlists`, `Scanner.PurgeMissing = "never"`, 
 **Configuration** is environment only (`.env`, `MAGPIE_*`). The web page shows it but cannot
 change it. Worker counts are fixed in `src/config.rs`.
 
-**One SQLite file**, `DATA_ROOT/magpie/magpie.sqlite`: WAL, `synchronous=NORMAL`, file mode
+**One SQLite file**, `DATA_ROOT/magpie-fi/magpie-fi.sqlite`: WAL, `synchronous=NORMAL`, file mode
 `0600`. Keep it on a local disk, not a network share.
 
 | Area | Tables |
@@ -305,17 +304,15 @@ change it. Worker counts are fixed in `src/config.rs`.
 - File analysis (fingerprint, integrity, content hash) is keyed by path, size and mtime, and
   capped at 100 MiB together; the oldest rows go first.
 
-**Trash.** `MUSIC_ROOT/.magpie/trash/<date>/`, one folder per day, emptied after
+**Trash.** `MUSIC_ROOT/.magpie-fi/trash/<date>/`, one folder per day, emptied after
 `MAGPIE_TRASH_DAYS`. Restoring a song is a file move.
 
-**Backups.** Back up `.env`, `DATA_ROOT/magpie/` and the library. Navidrome's own database
+**Backups.** Back up `.env`, `DATA_ROOT/magpie-fi/` and the library. Navidrome's own database
 (users, play counts, stars) is backed up on Navidrome's side.
 
 ---
 
 ## 7. Security model
-
-Summary; details in [SECURITY.md](SECURITY.md).
 
 - The port is published on `127.0.0.1` only. Remote access is `ssh -L` or Tailscale Funnel.
 - Without Telegram there is no login, so a public address without Telegram is refused at start.
@@ -332,7 +329,7 @@ Summary; details in [SECURITY.md](SECURITY.md).
 |---|---|---|
 | 1 | One language or two? | **One Rust program, one image.** The Python bot was ported and deleted: one queue, one database, one set of tests. |
 | 2 | Navidrome in the stack? | **No.** First planned as part of `compose.yaml` with API calls (scan, search, share links); dropped: the file watcher is enough, and users already run Navidrome their own way. |
-| 3 | Telegram library | **`frankenstein` for types only**, requests through magpie's own HTTP client (one reqwest version), own small router. |
+| 3 | Telegram library | **`frankenstein` for types only**, requests through magpie-fi's own HTTP client (one reqwest version), own small router. |
 | 4 | Self-hosted Bot API server for files over 20 MB? | **No.** One more container and Telegram app keys for little gain; the bot explains the limit. |
 | 5 | Base image | **Debian trixie slim**, because yt-dlp and Deno need glibc. |
 | 6 | Where settings live | **Environment only.** One place to look; the page shows, doesn't edit. |
@@ -351,7 +348,7 @@ Summary; details in [SECURITY.md](SECURITY.md).
 | 19 | A song fails while filing | **It goes to Issues** instead of being retried every cycle; the others continue. |
 | 20 | Persian music | Tags and folders in the original script, NFC-normalised. |
 | 21 | Dependency updates | **Dependabot**, monthly. yt-dlp updates itself daily. |
-| 22 | Project name | **magpie-fi**: crate `magpie-fi`, binary `magpie`, prefix `MAGPIE_`. |
+| 22 | Project name | **magpie-fi** everywhere: crate, binary, image, compose service, folders (`.magpie-fi/`, `magpie-fi.sqlite`). Settings keep the short prefix `MAGPIE_`. |
 
 ---
 
@@ -359,7 +356,7 @@ Summary; details in [SECURITY.md](SECURITY.md).
 
 ### Done
 
-- **Phase 1 — One home.** ununknown became `magpie`: inbox checked every minute, §5 layout,
+- **Phase 1 — One home.** ununknown became `magpie-fi`: inbox checked every minute, §5 layout,
   permanent library index (no duplicates, lossless replaces lossy), trash, `cover.jpg`, LRCLIB
   lyrics, album ReplayGain, release types, settings only in the environment.
 - **Phase 2 — Getting music.** Links from Spotify, Apple Music, Deezer, YouTube and Shazam;
@@ -372,7 +369,11 @@ Summary; details in [SECURITY.md](SECURITY.md).
 - **Cleanup (Nov 2026).** Navidrome and the Cloudflare Tunnel left `compose.yaml`; the entrypoint
   prepares the folders itself; ReplayGain only from rsgain; fewer sources; failed filings go to
   Issues; per-source cache lifetimes; bounded media caches; tool timeouts; covers only through
-  magpie's own endpoints; unused tables and columns dropped.
+  magpie-fi's own endpoints; unused tables and columns dropped.
+- **One name (Nov 2026).** The program, image, compose service and folders are all called
+  magpie-fi. `.magpie/` and `magpie.sqlite` are moved to the new names on first start, and
+  everyone logs in once more (new cookie name). Coming from an earlier version, move
+  `DATA_ROOT/magpie` to `DATA_ROOT/magpie-fi` on the host before starting.
 
 ### Next (Phase 5 — better than a subscription)
 
@@ -404,5 +405,5 @@ magpie-fi grew out of two earlier projects, kept in this repository's history:
 fixed a folder of music (the identification engine, review page and safe publishing), and
 [sync-me-maybe](https://github.com/artamrj/sync-me-maybe), a Python Telegram bot that fetched
 songs from links (link reading, YouTube Music matching, status messages, guests). In November
-2026 ununknown became `magpie` and the bot was rewritten in Rust inside it; the Python code was
+2026 ununknown became `magpie-fi` and the bot was rewritten in Rust inside it; the Python code was
 deleted. Git history has the details of the merge.

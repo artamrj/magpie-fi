@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.12
 #
-# The magpie-fi image: the magpie program, its web page, and every tool it
+# The magpie-fi image: the program, its web page, and every tool it
 # calls (ffmpeg, fpcalc, SongRec, rsgain, yt-dlp + Deno). Debian because
 # yt-dlp and Deno need glibc.
 #
@@ -76,7 +76,7 @@ COPY src/ ./src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --locked --release && \
-    cp target/release/magpie /tmp/magpie
+    cp target/release/magpie-fi /tmp/magpie-fi
 
 FROM mirror.gcr.io/library/debian:trixie-slim AS runtime
 ARG VERSION=dev
@@ -96,13 +96,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     command -v ffmpeg && command -v ffprobe && command -v fpcalc && \
     command -v python3 && command -v rsgain && command -v setpriv && command -v tini && \
-    groupadd --system --gid 10001 magpie && \
-    useradd --system --no-create-home --uid 10001 --gid magpie magpie && \
-    mkdir -p /data /music /usr/share/magpie
+    groupadd --system --gid 10001 magpie-fi && \
+    useradd --system --no-create-home --uid 10001 --gid magpie-fi magpie-fi && \
+    mkdir -p /data /music /usr/share/magpie-fi
 
-COPY --from=backend /tmp/magpie /usr/local/bin/magpie
+COPY --from=backend /tmp/magpie-fi /usr/local/bin/magpie-fi
 COPY --from=songrec /opt/songrec/bin/songrec-lib-cli /usr/local/bin/songrec-lib-cli
-COPY --from=web /build/web/dist/ /usr/share/magpie/
+COPY --from=web /build/web/dist/ /usr/share/magpie-fi/
 COPY --from=downloads /out-yt-dlp /usr/local/bin/yt-dlp
 COPY --from=downloads /out-deno /usr/local/bin/deno
 COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
@@ -118,7 +118,7 @@ ENV PUID=10001 \
     MAGPIE_ALLOW_NON_LOOPBACK=true \
     MAGPIE_DATA_DIR=/data \
     MAGPIE_MUSIC_ROOT=/music \
-    MAGPIE_WEB_DIR=/usr/share/magpie \
+    MAGPIE_WEB_DIR=/usr/share/magpie-fi \
     MAGPIE_SONGREC_BIN=/usr/local/bin/songrec-lib-cli \
     MAGPIE_YTDLP_BIN=/usr/local/bin/yt-dlp \
     MAGPIE_YTDLP_SELF_UPDATE=true \
@@ -130,4 +130,4 @@ EXPOSE 7331
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7331/api/health"]
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["/usr/local/bin/magpie"]
+CMD ["/usr/local/bin/magpie-fi"]

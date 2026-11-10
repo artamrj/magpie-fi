@@ -286,7 +286,7 @@ export function TrackInspector({
         <section className="inspector-section">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">magpie suggestions</p>
+              <p className="eyebrow">magpie-fi suggestions</p>
               <h3>Choose the recording that matches this file</h3>
             </div>
             <span>{track.candidates.length} options</span>
@@ -324,7 +324,7 @@ export function TrackInspector({
           <section className="inspector-section">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">magpie suggestion</p>
+                <p className="eyebrow">magpie-fi suggestion</p>
                 <h3>Review exactly what will change</h3>
               </div>
               <button className="text-button" onClick={() => setEditing(!editing)}>

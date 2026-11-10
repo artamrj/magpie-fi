@@ -198,7 +198,7 @@ pub async fn read(
         .songs
         .retain(|song| !song.title.trim().is_empty());
     if collection.songs.is_empty() {
-        bail!("this link has no songs that magpie can read");
+        bail!("this link has no songs that magpie-fi can read");
     }
     collection.songs.truncate(config.max_collection_tracks);
     Ok(collection)

@@ -59,7 +59,7 @@ struct PlannedSource {
     available: bool,
 }
 
-/// Where the track goes in the library (BLUEPRINT.md §5). Songs of an album
+/// Where the track goes in the library (docs/BLUEPRINT.md §5). Songs of an album
 /// that is already in the library join its folder and year. The format is
 /// sniffed again from the file, because an old scan may have trusted a wrong
 /// extension (for example AAC audio in a file named `.mp3`).
@@ -692,7 +692,7 @@ fn temporary_destination(destination: &Path, track_id: i64) -> PathBuf {
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("audio");
-    parent.join(format!(".{stem}.magpie-{track_id}.{extension}"))
+    parent.join(format!(".{stem}.magpie-fi-{track_id}.{extension}"))
 }
 
 enum Filing {
@@ -1106,7 +1106,7 @@ async fn paths_resolve_to_same_target(source: &Path, destination: &Path) -> Resu
     Ok(source == destination)
 }
 
-/// Moves the original to the trash (or deletes it when it was one of magpie's
+/// Moves the original to the trash (or deletes it when it was one of magpie-fi's
 /// own downloads), but only after the filed song exists.
 async fn trash_source_after_output(
     source: &Path,
@@ -1696,7 +1696,7 @@ mod tests {
     fn temporary_destination_keeps_audio_extension() {
         assert_eq!(
             temporary_destination(std::path::Path::new("/output/Artist - Song.mp3"), 42),
-            PathBuf::from("/output/.Artist - Song.magpie-42.mp3")
+            PathBuf::from("/output/.Artist - Song.magpie-fi-42.mp3")
         );
     }
 

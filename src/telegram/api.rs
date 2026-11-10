@@ -1,5 +1,5 @@
 //! A small Telegram Bot API client: frankenstein's typed parameters and
-//! results, sent with magpie's own HTTP client.
+//! results, sent with magpie-fi's own HTTP client.
 //!
 //! Bot API URLs contain the bot token, so every HTTP error drops its URL
 //! before it can reach a log, the database or a message.

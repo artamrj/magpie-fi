@@ -27,7 +27,7 @@ jobs:
         working-directory: web
         run: npm audit --package-lock-only --audit-level=high
 
-  magpie:
+  magpie-fi:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

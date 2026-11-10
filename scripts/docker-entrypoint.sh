@@ -1,5 +1,5 @@
 #!/bin/sh
-# Prepares magpie's folders, then runs magpie as PUID:PGID so every file in the
+# Prepares magpie-fi's folders, then runs magpie-fi as PUID:PGID so every file in the
 # library belongs to the host user. Compose should not use `user:` (some NAS
 # runtimes reject it); the container starts as root and drops privileges here.
 set -eu
@@ -35,16 +35,21 @@ fi
 
 wanted="${runtime_uid}:${runtime_gid}"
 
-# magpie's own folders. The database folder is magpie's alone, so it is fixed
+# magpie-fi's own folders. The database folder is magpie-fi's alone, so it is fixed
 # recursively. For the music only the top folders are touched: your existing
 # music files are never re-owned.
-mkdir -p "$data_dir" "$music_root/inbox" "$music_root/library" "$music_root/.magpie/trash"
+# Versions before the rename used .magpie/: move it once, before the new one exists.
+if [ -d "$music_root/.magpie" ] && [ ! -e "$music_root/.magpie-fi" ]; then
+    echo "Moving $music_root/.magpie to $music_root/.magpie-fi"
+    mv "$music_root/.magpie" "$music_root/.magpie-fi"
+fi
+mkdir -p "$data_dir" "$music_root/inbox" "$music_root/library" "$music_root/.magpie-fi/trash"
 if [ "$(stat -c '%u:%g' "$data_dir")" != "$wanted" ]; then
     echo "Setting ownership of $data_dir to $wanted"
     chown -R "$wanted" "$data_dir"
 fi
 for folder in "$music_root" "$music_root/inbox" "$music_root/library" \
-              "$music_root/.magpie" "$music_root/.magpie/trash"; do
+              "$music_root/.magpie-fi" "$music_root/.magpie-fi/trash"; do
     [ "$(stat -c '%u:%g' "$folder")" = "$wanted" ] || chown "$wanted" "$folder"
 done
 

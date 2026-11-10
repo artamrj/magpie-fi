@@ -1,4 +1,4 @@
-//! The Telegram bot, inside magpie. It reads messages with long polling,
+//! The Telegram bot, inside magpie-fi. It reads messages with long polling,
 //! turns links and audio files into requests (the same queue the web page
 //! uses), and keeps one status message per request up to date (`status.rs`).
 
@@ -39,7 +39,7 @@ pub struct Context {
     uploads: Mutex<HashMap<(i64, u64), (i64, Instant)>>,
 }
 
-/// Runs the bot until magpie stops. Does nothing without a bot token.
+/// Runs the bot until magpie-fi stops. Does nothing without a bot token.
 pub async fn run(state: Arc<AppState>) {
     let Some(config) = state.config.telegram.clone() else {
         return;
@@ -87,14 +87,14 @@ async fn serve(state: Arc<AppState>, config: TelegramConfig, bot: Bot) {
             ]}),
         )
         .await;
-    // Owners get a "magpie" button next to the message box that opens the web page.
+    // Owners get a "magpie-fi" button next to the message box that opens the web page.
     if let Some(url) = mini_app_url(&state.config.public_url, "") {
         for owner in &config.owners {
             let _: Option<bool> = bot
                 .try_call(
                     "setChatMenuButton",
                     &json!({"chat_id": owner, "menu_button": {
-                        "type": "web_app", "text": "magpie", "web_app": {"url": url}
+                        "type": "web_app", "text": "magpie-fi", "web_app": {"url": url}
                     }}),
                 )
                 .await;
@@ -472,9 +472,9 @@ async fn on_command(
                     ""
                 }
             );
-            let keyboard = public_url
-                .is_some()
-                .then(|| json!({"inline_keyboard": [[{"text": "🌐 Open magpie", "url": link}]]}));
+            let keyboard = public_url.is_some().then(
+                || json!({"inline_keyboard": [[{"text": "🌐 Open magpie-fi", "url": link}]]}),
+            );
             send_with(context, chat, &text, None, keyboard).await
         }
         "guests" if role == Role::Owner => {
@@ -943,7 +943,7 @@ mod tests {
             .push((method.clone(), params.clone()));
         let result = match method.as_str() {
             "getMe" => {
-                json!({"id": 1, "is_bot": true, "first_name": "magpie", "username": "magpie_test_bot"})
+                json!({"id": 1, "is_bot": true, "first_name": "magpie-fi", "username": "magpie_fi_test_bot"})
             }
             "getUpdates" => {
                 let pending: Vec<Value> = fake.updates.lock().unwrap().drain(..).collect();
@@ -1046,7 +1046,7 @@ mod tests {
         fake.push(button(4, OWNER, "invite"));
         let invite = wait_for(&fake, "sendMessage", "start=invite_").await;
         let link = invite["text"].as_str().unwrap();
-        assert!(link.contains("https://t.me/magpie_test_bot?start=invite_"));
+        assert!(link.contains("https://t.me/magpie_fi_test_bot?start=invite_"));
         let token = link
             .split("start=invite_")
             .nth(1)

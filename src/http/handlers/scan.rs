@@ -20,7 +20,7 @@ pub async fn run_automatic_cycle(state: Arc<AppState>) -> Result<()> {
     if state.workflow_running().await {
         return Ok(());
     }
-    let scanned = scan_pipeline::run_automatic(state.clone()).await?;
+    let scanned = crate::application::scan::run_automatic(state.clone()).await?;
     if state.workflow_cancelled().await {
         return Ok(());
     }
@@ -196,7 +196,7 @@ async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>)
             .await;
         return Ok(());
     }
-    scan_pipeline::retry_files(state, retry_paths).await
+    crate::application::scan::retry_files(state, retry_paths).await
 }
 
 #[cfg(test)]

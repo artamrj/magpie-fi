@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     let frontend = frontend_directory()?;
 
     let mut config = config::Config::from_env()?;
+    move_old_names(&config)?;
     prepare_folders(&config)?;
     resolve_folders(&mut config)?;
     let pool = infrastructure::db::connect(&config.db_path).await?;
@@ -147,7 +148,7 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(http::security_headers));
 
-    tracing::info!(%address, web = ?frontend, "magpie is ready");
+    tracing::info!(%address, web = ?frontend, "magpie-fi is ready");
     axum::serve(TcpListener::bind(address).await?, app)
         .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await?;
@@ -189,6 +190,41 @@ async fn purge_trash(config: &config::Config) {
 
 /// Creates the inbox, library, trash and database folders so a fresh install
 /// starts without manual steps.
+/// Versions before the magpie-fi rename used `MUSIC_ROOT/.magpie/` and
+/// `magpie.sqlite`. Moves them to the new names once, before anything creates
+/// the new ones. Nothing is moved when the new name already exists.
+fn move_old_names(config: &config::Config) -> Result<()> {
+    let move_once = |old: &Path, new: &Path| -> Result<()> {
+        if old.exists() && !new.exists() {
+            std::fs::rename(old, new).with_context(|| {
+                format!("could not move {} to {}", old.display(), new.display())
+            })?;
+            tracing::info!(from = %old.display(), to = %new.display(), "moved to the magpie-fi name");
+        }
+        Ok(())
+    };
+    if let Some(work_folder) = config.trash_dir.parent()
+        && let Some(music_root) = work_folder.parent()
+    {
+        move_once(&music_root.join(".magpie"), work_folder)?;
+    }
+    let database = Path::new(&config.db_path);
+    if let Some(folder) = database.parent() {
+        let old_database = folder.join("magpie.sqlite");
+        // The WAL files belong to the old database: move them only with it.
+        if old_database.exists() && !database.exists() {
+            for suffix in ["-wal", "-shm"] {
+                move_once(
+                    &folder.join(format!("magpie.sqlite{suffix}")),
+                    &folder.join(format!("magpie-fi.sqlite{suffix}")),
+                )?;
+            }
+            move_once(&old_database, database)?;
+        }
+    }
+    Ok(())
+}
+
 fn prepare_folders(config: &config::Config) -> Result<()> {
     let database_folder = Path::new(&config.db_path)
         .parent()
@@ -244,7 +280,7 @@ fn frontend_directory() -> Result<Option<PathBuf>> {
     if let Ok(executable) = std::env::current_exe()
         && let Some(bin_directory) = executable.parent()
     {
-        candidates.push(bin_directory.join("../share/magpie"));
+        candidates.push(bin_directory.join("../share/magpie-fi"));
     }
     candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("web/dist"));
     Ok(candidates
@@ -304,6 +340,39 @@ fn duration_until_next_local_midnight() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_folder_and_database_names_are_moved_once() {
+        let root = tempfile::tempdir().unwrap();
+        let music = root.path().join("music");
+        let data = root.path().join("data");
+        std::fs::create_dir_all(music.join(".magpie/trash")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(music.join(".magpie/trash/song.mp3"), b"x").unwrap();
+        std::fs::write(data.join("magpie.sqlite"), b"db").unwrap();
+        std::fs::write(data.join("magpie.sqlite-wal"), b"wal").unwrap();
+        let config = config::Config::with_folders(&music, &data);
+
+        move_old_names(&config).unwrap();
+
+        assert!(!music.join(".magpie").exists());
+        assert!(music.join(".magpie-fi/trash/song.mp3").exists());
+        assert_eq!(std::fs::read(data.join("magpie-fi.sqlite")).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(data.join("magpie-fi.sqlite-wal")).unwrap(),
+            b"wal"
+        );
+
+        // A second old copy never replaces what already has the new name.
+        std::fs::write(data.join("magpie.sqlite"), b"stale").unwrap();
+        std::fs::write(data.join("magpie.sqlite-wal"), b"stale").unwrap();
+        move_old_names(&config).unwrap();
+        assert_eq!(std::fs::read(data.join("magpie-fi.sqlite")).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(data.join("magpie-fi.sqlite-wal")).unwrap(),
+            b"wal"
+        );
+    }
 
     #[test]
     fn listen_address_accepts_loopback_by_default() {

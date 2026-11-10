@@ -20,15 +20,15 @@ export function Gate({ children }: { children: React.ReactNode }) {
       <div className="gate">
         <EmptyState
           icon={guest ? "music" : "shield"}
-          title={guest ? "This page is for owners" : "Log in to magpie"}
+          title={guest ? "This page is for owners" : "Log in to magpie-fi"}
           description={
             guest
-              ? "Send songs and links to the magpie bot in Telegram instead."
+              ? "Send songs and links to the magpie-fi bot in Telegram instead."
               : telegram
                 ? "Telegram didn't confirm who you are. Close this page and open it again from the bot."
                 : status === 401
-                  ? "Send /web to your magpie bot in Telegram. It answers with a login link for this browser."
-                  : "magpie isn't answering. Check that it is running."
+                  ? "Send /web to your magpie-fi bot in Telegram. It answers with a login link for this browser."
+                  : "magpie-fi isn't answering. Check that it is running."
           }
           action={!guest && status !== 401 ? "Try again" : undefined}
           onAction={() => void me.refetch()}

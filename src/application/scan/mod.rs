@@ -114,7 +114,7 @@ async fn discover_files_in_background(root: PathBuf) -> Result<(Vec<PathBuf>, Ve
 
 /// Inbox and staging files that are new or changed since the last check. An
 /// inbox file that changed within `settle` is probably still being copied, so
-/// it waits for the next check; magpie's own downloads are complete when they
+/// it waits for the next check; magpie-fi's own downloads are complete when they
 /// appear in staging. Files that are gone are forgotten.
 async fn automatic_pending_files(
     pool: &sqlx::SqlitePool,
@@ -537,7 +537,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(pending.is_empty());
-        // magpie's own downloads skip the wait.
+        // magpie-fi's own downloads skip the wait.
         let pending = automatic_pending_files(&pool, vec![], vec![source], Duration::from_secs(60))
             .await
             .unwrap();

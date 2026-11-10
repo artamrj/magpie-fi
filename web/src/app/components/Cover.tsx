@@ -4,7 +4,7 @@ import { Icon } from "../Icons";
 
 type Size = "small" | "medium" | "large";
 
-/** A cover served by magpie; a music-note placeholder when there is none. */
+/** A cover served by magpie-fi; a music-note placeholder when there is none. */
 function Cover({ src, alt, size }: { src?: string; alt: string; size: Size }) {
   const [failed, setFailed] = useState<string>();
   if (!src || failed === src)

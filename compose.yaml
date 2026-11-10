@@ -1,17 +1,17 @@
 # magpie-fi
 #
-#   links (web page, Telegram) ─► magpie downloads ─┐
-#   your drops ─► MUSIC_ROOT/inbox ─────────────────┼─► magpie ─► MUSIC_ROOT/library ─► navidrome ─► your apps
-#   files sent to the Telegram bot ─────────────────┘
+#   links (web page, Telegram) ─► magpie-fi downloads ─┐
+#   your drops ─► MUSIC_ROOT/inbox ────────────────────┼─► magpie-fi ─► MUSIC_ROOT/library ─► navidrome ─► your apps
+#   files sent to the Telegram bot ────────────────────┘
 #
-# magpie identifies every new song, files it into the library (BLUEPRINT.md §5)
-# and moves originals to MUSIC_ROOT/.magpie/trash.
-# Settings: .env (see .env.example). Setup: README.md.
+# magpie-fi identifies every new song, files it into the library (docs/BLUEPRINT.md §5)
+# and moves originals to MUSIC_ROOT/.magpie-fi/trash.
+# Settings: .env (see .env.example). How it works: docs/BLUEPRINT.md.
 
 name: magpie-fi
 
 services:
-  magpie:
+  magpie-fi:
     build: .
     image: ghcr.io/artamrj/magpie-fi:${MAGPIE_TAG:-latest}
     restart: unless-stopped
@@ -47,7 +47,7 @@ services:
       MAGPIE_LASTFM_KEY: "${MAGPIE_LASTFM_KEY:-}"
     volumes:
       - ${MUSIC_ROOT:-./music}:/music
-      - ${DATA_ROOT:-./data}/magpie:/data
+      - ${DATA_ROOT:-./data}/magpie-fi:/data
       - ./config/ytdlp:/config:ro
     read_only: true
     tmpfs:

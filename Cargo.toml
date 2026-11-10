@@ -7,7 +7,7 @@ description = "Your own music service: identifies, tags and files every song for
 repository = "https://github.com/artamrj/magpie-fi"
 
 [[bin]]
-name = "magpie"
+name = "magpie-fi"
 path = "src/main.rs"
 
 [dependencies]

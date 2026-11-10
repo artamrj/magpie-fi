@@ -1,4 +1,4 @@
-//! The library: where every song is filed (BLUEPRINT.md §5), the trash that
+//! The library: where every song is filed (docs/BLUEPRINT.md §5), the trash that
 //! keeps originals for a while, and the permanent index that remembers every
 //! recording in the library so the same song is never filed twice.
 
@@ -599,7 +599,7 @@ pub async fn write_playlist(library: &Path, name: &str, songs: &[String]) -> Res
     Ok(())
 }
 
-/// Removes a file that magpie created itself (a download in staging) or moves
+/// Removes a file that magpie-fi created itself (a download in staging) or moves
 /// anything else to the trash.
 pub async fn discard_original(
     trash: &Path,

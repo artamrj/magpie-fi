@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-pub const COOKIE: &str = "magpie_session";
+pub const COOKIE: &str = "magpie_fi_session";
 const SESSION_DAYS: i64 = 30;
 const LINK_MINUTES: i64 = 10;
 /// Mini App data older than this is not accepted.
@@ -78,7 +78,7 @@ pub async fn require_login(
     match identity {
         None => error(
             StatusCode::UNAUTHORIZED,
-            "Log in: send /web to your magpie bot",
+            "Log in: send /web to your magpie-fi bot",
         ),
         Some(identity) if identity.role != Role::Owner => error(
             StatusCode::FORBIDDEN,
@@ -277,7 +277,7 @@ pub async fn login(
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(
-                "<p>This login link was already used or is too old. Send /web to your magpie bot for a new one.</p>",
+                "<p>This login link was already used or is too old. Send /web to your magpie-fi bot for a new one.</p>",
             ),
         )
             .into_response();
@@ -342,7 +342,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     let mut response = Json(serde_json::json!({"logged_out": true})).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("magpie_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        HeaderValue::from_static("magpie_fi_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
     );
     response
 }
@@ -355,7 +355,7 @@ pub async fn me(State(state): State<Arc<AppState>>, request: Request) -> Respons
     let Some(identity) = request.extensions().get::<Identity>().cloned() else {
         return error(
             StatusCode::UNAUTHORIZED,
-            "Log in: send /web to your magpie bot",
+            "Log in: send /web to your magpie-fi bot",
         );
     };
     let mut response = Json(identity.clone()).into_response();
@@ -500,10 +500,10 @@ mod tests {
             StatusCode::OK
         );
 
-        let link = create_login_link(&state.pool, 100, "https://magpie.example")
+        let link = create_login_link(&state.pool, 100, "https://magpie-fi.example")
             .await
             .unwrap();
-        let path = link.trim_start_matches("https://magpie.example");
+        let path = link.trim_start_matches("https://magpie-fi.example");
         let response = get(&router, path, &[]).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let cookie = response.headers()[header::SET_COOKIE]
@@ -615,7 +615,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("theme=dark; magpie_session=abc"),
+            HeaderValue::from_static("theme=dark; magpie_fi_session=abc"),
         );
         assert_eq!(cookie(&headers, COOKIE).as_deref(), Some("abc"));
         assert_eq!(cookie(&headers, "missing"), None);

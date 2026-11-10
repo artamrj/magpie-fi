@@ -70,7 +70,7 @@ pub async fn remove_track(
         ));
     }
 
-    // Your own files go to the trash; magpie's downloads are simply deleted.
+    // Your own files go to the trash; magpie-fi's downloads are simply deleted.
     crate::application::library::discard_original(
         &cfg.trash_dir,
         &cfg.staging_dir,

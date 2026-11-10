@@ -1,6 +1,6 @@
 //! The download worker. For every wanted song:
 //! already in the library? → find the right YouTube Music upload → download it
-//! into `.magpie/staging/` → write what the link said as tags → hand it to the
+//! into `.magpie-fi/staging/` → write what the link said as tags → hand it to the
 //! inbox cycle, which identifies and files it like any other new music.
 
 use super::{

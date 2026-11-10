@@ -69,7 +69,7 @@ export function App() {
   const [mobileInspector, setMobileInspector] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => {
     if (telegram) return telegram.colorScheme;
-    const saved = localStorage.getItem("magpie-theme");
+    const saved = localStorage.getItem("magpie-fi-theme") ?? localStorage.getItem("magpie-theme");
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
@@ -103,7 +103,7 @@ export function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("magpie-theme", theme);
+    localStorage.setItem("magpie-fi-theme", theme);
   }, [theme]);
 
   useEffect(() => {
@@ -137,7 +137,7 @@ export function App() {
       const result = await post<{ already_running: boolean }>("/inbox/check");
       setNotice(
         result.already_running
-          ? "magpie is already working on the inbox."
+          ? "magpie-fi is already working on the inbox."
           : "Checking the inbox now.",
       );
       await invalidateStatusAndTracks();
@@ -202,7 +202,7 @@ export function App() {
     if (
       damaged &&
       !(await askConfirm(
-        `magpie will try to salvage ${damaged} damaged ${damaged === 1 ? "file" : "files"} by skipping unreadable frames and re-encoding the valid audio. Each damaged original is kept next to the repaired file as a .magpie-damaged backup. Continue?`,
+        `magpie-fi will try to salvage ${damaged} damaged ${damaged === 1 ? "file" : "files"} by skipping unreadable frames and re-encoding the valid audio. Each damaged original is kept next to the repaired file as a .magpie-fi-damaged backup. Continue?`,
       ))
     )
       return;
@@ -498,7 +498,7 @@ export function App() {
                       ? "Audio files will appear here as they are discovered and identified."
                       : workflow?.phase === "finish"
                         ? `New songs are in your library: ${setup.library_dir}.`
-                        : "Drop music into the inbox folder. magpie checks it every minute."
+                        : "Drop music into the inbox folder. magpie-fi checks it every minute."
                   }
                 />
               ) : visibleTracks.length === 0 ? (

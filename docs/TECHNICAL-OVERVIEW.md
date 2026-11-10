@@ -1,13 +1,13 @@
-# magpie — Technical Overview
+# magpie-fi — Technical Overview
 
-magpie is the program at the heart of magpie-fi. It gets songs from links (Telegram bot, web
+magpie-fi is one program. It gets songs from links (Telegram bot, web
 page), files sent to the bot and an inbox folder; checks that each file can be decoded;
 identifies it through a cascade of online sources; lets you approve or correct uncertain matches;
 and files each song into the library with verified cover art, lyrics and ReplayGain, moving the
 original to a trash folder. The identification engine comes from the earlier *ununknown* project.
 
 This document describes how it works: the parts, the data, and the exact steps a song goes
-through. The design and its reasons are in [BLUEPRINT.md](../BLUEPRINT.md).
+through. The design and its reasons are in [BLUEPRINT.md](BLUEPRINT.md).
 
 ---
 
@@ -22,10 +22,10 @@ through. The design and its reasons are in [BLUEPRINT.md](../BLUEPRINT.md).
 └─────────────▲──────────────┘                     │
               │ HTTP 127.0.0.1:7331                │
 ┌─────────────┴────────────────────────────────────▼───────────────┐
-│ magpie (Rust, axum + tokio + SQLite/sqlx)                        │
+│ magpie-fi (Rust, axum + tokio + SQLite/sqlx)                     │
 │                                                                  │
 │  http: router → auth → handlers        telegram: bot, status     │
-│  acquire: links → wanted → yt-dlp → .magpie/staging              │
+│  acquire: links → wanted → yt-dlp → .magpie-fi/staging           │
 │  application:                                                    │
 │    scan (walk · process · providers · persist)                   │
 │    input_dedup · smart_approval · metadata_completion · artwork  │
@@ -42,13 +42,13 @@ through. The design and its reasons are in [BLUEPRINT.md](../BLUEPRINT.md).
 ```
 
 - **Web page** (`web/`): React, built with Vite and served from disk by the same process
-  (`MAGPIE_WEB_DIR`, `/usr/share/magpie` in the image). It polls `/api/status`, `/api/tracks`
+  (`MAGPIE_WEB_DIR`, `/usr/share/magpie-fi` in the image). It polls `/api/status`, `/api/tracks`
   and `/api/requests`.
 - **Program** (`src/`): one binary. Heavy work (decoding, fingerprinting, network lookups, tag
   writing) runs with bounded concurrency (§13).
 - **Storage**: one SQLite file plus caches in it. Settings come only from `MAGPIE_*` environment
   variables (`src/config.rs`).
-- magpie never calls Navidrome. Navidrome's file watcher sees new files and playlists.
+- magpie-fi never calls Navidrome. Navidrome's file watcher sees new files and playlists.
 
 ---
 
@@ -112,7 +112,7 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
 
 `scan::run_automatic` (`src/application/scan/mod.rs`):
 
-1. Walk the inbox and `.magpie/staging/` off the async runtime, skipping files and folders whose
+1. Walk the inbox and `.magpie-fi/staging/` off the async runtime, skipping files and folders whose
    name starts with `.` or `@` (unfinished downloads, NAS metadata).
 2. Keep files that are new or changed since the last check (`automatic_scan_files`). Inbox files
    must also be unchanged for `MAGPIE_INBOX_SETTLE_SECONDS`; staging files don't wait.
@@ -151,10 +151,10 @@ In Review you can:
   `POST /api/tracks/{id}/artwork/search`.
 - **Undo** (`POST /api/tracks/{id}/review`): clears the choice, keeps the candidates.
 - **Remove** (`DELETE /api/tracks/{id}`): only unresolved Review songs inside the inbox or
-  staging. Your files go to the trash; magpie's downloads are deleted.
+  staging. Your files go to the trash; magpie-fi's downloads are deleted.
 - **Check & fix** (`POST /api/tracks/retry-issues`): re-runs everything in Issues. Corrupt files
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
-  original as a `.magpie-damaged` backup.
+  original as a `.magpie-fi-damaged` backup.
 
 The Telegram bot asks about Telegram songs in Review with up to three candidates and calls the
 same choose/remove logic.
@@ -173,7 +173,7 @@ step now. `src/application/apply.rs`:
    - **Cover**: fetch the verified bytes; no usable cover → back to Review.
    - **Copy** to a temporary file in the album folder, **write and verify tags** and the
      embedded cover, **publish** without overwriting anything (§12).
-   - **Original to trash** (`.magpie/trash/<date>/…`), only after the new file exists. A replaced
+   - **Original to trash** (`.magpie-fi/trash/<date>/…`), only after the new file exists. A replaced
      lossy copy and its lyrics go there too. Downloads from staging are deleted instead.
    - **Index** the new file, write `cover.jpg` into the album folder if it has none, save LRCLIB
      lyrics as `.lrc` (synced) or `.txt` (`MAGPIE_LYRICS`). None of these extras can undo the filing.
@@ -192,7 +192,7 @@ step now. `src/application/apply.rs`:
 | Queue | `store.rs` | `requests`, `wanted`, `playlists`. Retries after 30 s, 2 min, 10 min; then failed. A request's `title` falls back to its first song. |
 | Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first, ordinary videos only as a strict fallback. |
 | yt-dlp | `ytdlp.rs` | YouTube Music search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
-| Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie/staging/` → write the link's title/artist/album/ISRC as tags. |
+| Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie-fi/staging/` → write the link's title/artist/album/ISRC as tags. |
 
 Downloads are then identified and filed by the normal inbox cycle. When a download is filed, or
 found to be in the library already, `acquire::downloaded_file_done` records the library path and
@@ -202,7 +202,7 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 | Part | File | Job |
 |---|---|---|
-| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie's HTTP client and frankenstein's types. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
+| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client and frankenstein's types. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
 | Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners and guests, random one-time invite tokens, links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
 | Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
 | Texts | `texts.rs` | Every message the bot sends, and the progress bar. |
@@ -219,7 +219,7 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
     `/api/login` starts a 30-day session (`HttpOnly` cookie; `SameSite=None; Secure` over HTTPS).
   - Only owners get through; guests get 403.
 - Write requests from a foreign `Origin` are rejected. The CSP allows Telegram's Mini App script
-  and framing by `web.telegram.org`, nothing else. Covers are always loaded through magpie's own
+  and framing by `web.telegram.org`, nothing else. Covers are always loaded through magpie-fi's own
   preview endpoints, never from catalog URLs.
 - The Mini App opens on Review with `?view=review`.
 
@@ -229,7 +229,7 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 **Library index.** `library_items` (`src/application/library.rs`) keeps one row per audio file in
 the library: path, size, mtime, duration, content key (fingerprint or SHA-256), ISRC, MusicBrainz
-recording ID, format and bitrate. It is filled when magpie files a song and by
+recording ID, format and bitrate. It is filled when magpie-fi files a song and by
 `library::index_library` (at start and every six hours), which also indexes music added by hand
 and forgets deleted files. A new song is the same recording as a library file when the content
 is identical, or when the fingerprint, ISRC or MusicBrainz recording ID match **and** the durations
@@ -304,7 +304,7 @@ applied, and genres are filled. Only real MusicBrainz IDs are ever written to Mu
 
 All HTTP goes through one client with timeouts (`resilient_http` adds a DNS-over-HTTPS fallback
 for known catalog hosts) and through `provider_cache`. MusicBrainz is limited to one request per
-second. `RUST_LOG=magpie=debug` logs what every source returned or why it was skipped.
+second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was skipped.
 
 ---
 
@@ -418,7 +418,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /tracks/{id}/artwork/search` | Search covers again |
 | `GET /tracks/{id}/artwork/preview` | The cover that will be embedded |
 | `GET /tracks/{id}/artwork/original` | The cover embedded in the file now |
-| `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie |
+| `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie-fi |
 | `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
 | `GET /library/recent` | The songs filed most recently |
 | `POST /requests` | Read a link and queue its songs |
@@ -457,10 +457,10 @@ All routes are under `/api` (`src/http/router.rs`).
 ## 17. Summary flow
 
 ```
-Link (web / Telegram) → wanted → already in library? → yt-dlp → .magpie/staging ─┐
-Telegram file → .magpie/staging ──────────────────────────────────────────────────┤
-Your drop → inbox (waits until it stops changing) ────────────────────────────────┤
-                                                                                  ▼
+Link (web / Telegram) → wanted → already in library? → yt-dlp → .magpie-fi/staging ──┐
+Telegram file → .magpie-fi/staging ──────────────────────────────────────────────────┤
+Your drop → inbox (waits until it stops changing) ───────────────────────────────────┤
+                                                                                     ▼
 Inbox cycle (every minute)
   ├─ read tags → integrity check → fingerprint → group duplicates
   ├─ source cascade → candidates → smart auto-select

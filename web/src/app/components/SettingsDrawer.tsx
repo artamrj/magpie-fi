@@ -45,7 +45,7 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
             </dl>
             <p className="settings-hint">
               New music in the inbox is checked every {setup.inbox_check_seconds} seconds. Songs
-              magpie is sure about are filed automatically; the rest wait here in Review.
+              magpie-fi is sure about are filed automatically; the rest wait here in Review.
             </p>
           </section>
           <section>
@@ -80,7 +80,7 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
           <ProviderStatus sources={setup.sources} />
           <p className="settings-hint">
             To change settings, edit the <code>MAGPIE_…</code> values in the server&apos;s{" "}
-            <code>.env</code> file and restart magpie.
+            <code>.env</code> file and restart magpie-fi.
           </p>
           {me.data?.via === "session" && (
             <button className="compact-button" onClick={() => void logOut()}>

@@ -1,6 +1,5 @@
 use crate::{
     app::{AppState, state::Workflow},
-    application::scan as scan_pipeline,
     http::error::{ApiError, ApiResult},
     infrastructure::{
         db::tracks::{self as track_db, Track},

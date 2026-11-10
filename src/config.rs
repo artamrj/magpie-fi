@@ -41,9 +41,9 @@ pub struct Config {
     pub input_dir: String,
     /// `MUSIC_ROOT/library`: the finished library Navidrome plays.
     pub output_dir: String,
-    /// `MUSIC_ROOT/.magpie/trash`: originals and replaced files, kept for `trash_days`.
+    /// `MUSIC_ROOT/.magpie-fi/trash`: originals and replaced files, kept for `trash_days`.
     pub trash_dir: PathBuf,
-    /// `MUSIC_ROOT/.magpie/staging`: downloads waiting to be identified and filed.
+    /// `MUSIC_ROOT/.magpie-fi/staging`: downloads waiting to be identified and filed.
     pub staging_dir: PathBuf,
     /// The data folder (database, the self-updated yt-dlp).
     pub data_dir: PathBuf,
@@ -88,11 +88,11 @@ impl Config {
     pub fn with_folders(music_root: &Path, data_dir: &Path) -> Self {
         let path = |value: PathBuf| value.to_string_lossy().into_owned();
         Self {
-            db_path: path(data_dir.join("magpie.sqlite")),
+            db_path: path(data_dir.join("magpie-fi.sqlite")),
             input_dir: path(music_root.join("inbox")),
             output_dir: path(music_root.join("library")),
-            trash_dir: music_root.join(".magpie").join("trash"),
-            staging_dir: music_root.join(".magpie").join("staging"),
+            trash_dir: music_root.join(".magpie-fi").join("trash"),
+            staging_dir: music_root.join(".magpie-fi").join("staging"),
             data_dir: data_dir.to_path_buf(),
             inbox_check_seconds: 60,
             inbox_settle_seconds: 30,
@@ -279,12 +279,15 @@ mod tests {
         .unwrap();
         assert_eq!(config.input_dir, "/srv/music/inbox");
         assert_eq!(config.output_dir, "/srv/music/library");
-        assert_eq!(config.trash_dir, PathBuf::from("/srv/music/.magpie/trash"));
+        assert_eq!(
+            config.trash_dir,
+            PathBuf::from("/srv/music/.magpie-fi/trash")
+        );
         assert_eq!(
             config.staging_dir,
-            PathBuf::from("/srv/music/.magpie/staging")
+            PathBuf::from("/srv/music/.magpie-fi/staging")
         );
-        assert_eq!(config.db_path, "/data/magpie.sqlite");
+        assert_eq!(config.db_path, "/data/magpie-fi.sqlite");
     }
 
     #[test]
@@ -334,15 +337,18 @@ mod tests {
 
     #[test]
     fn a_public_address_requires_the_telegram_login() {
-        assert!(from(&[("MAGPIE_PUBLIC_URL", "https://magpie.example")]).is_err());
+        assert!(from(&[("MAGPIE_PUBLIC_URL", "https://magpie-fi.example")]).is_err());
         let config = from(&[
-            ("MAGPIE_PUBLIC_URL", "https://magpie.example/"),
+            ("MAGPIE_PUBLIC_URL", "https://magpie-fi.example/"),
             ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
             ("MAGPIE_TELEGRAM_OWNERS", "1"),
         ])
         .unwrap();
-        assert_eq!(config.public_url.as_deref(), Some("https://magpie.example"));
-        assert!(from(&[("MAGPIE_PUBLIC_URL", "magpie.example")]).is_err());
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://magpie-fi.example")
+        );
+        assert!(from(&[("MAGPIE_PUBLIC_URL", "magpie-fi.example")]).is_err());
     }
 
     #[test]

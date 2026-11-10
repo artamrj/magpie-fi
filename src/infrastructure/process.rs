@@ -26,7 +26,7 @@ pub async fn run(mut command: Command, timeout: Duration) -> Result<Output> {
 }
 
 /// Does `program <argument>` (usually `--version`) run successfully? Each
-/// program is probed once; the answer is remembered until magpie restarts.
+/// program is probed once; the answer is remembered until magpie-fi restarts.
 pub fn available(program: impl Into<PathBuf>, argument: &str) -> bool {
     static KNOWN: OnceLock<Mutex<HashMap<(PathBuf, String), bool>>> = OnceLock::new();
     let key = (program.into(), argument.to_owned());
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn missing_programs_are_not_available() {
-        assert!(!available("magpie-no-such-program", "--version"));
-        assert!(!available("magpie-no-such-program", "--version"));
+        assert!(!available("magpie-fi-no-such-program", "--version"));
+        assert!(!available("magpie-fi-no-such-program", "--version"));
     }
 }

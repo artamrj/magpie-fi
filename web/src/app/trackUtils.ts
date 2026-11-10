@@ -197,7 +197,7 @@ export function friendlyTrackError(track: Track) {
   if (track.status === "corrupt")
     return "The audio stream could not be decoded safely. This file will not be written.";
   if (track.is_missing) return "The source file is no longer available at its original location.";
-  return "magpie could not finish this track. Open technical details if you need the diagnostic message.";
+  return "magpie-fi could not finish this track. Open technical details if you need the diagnostic message.";
 }
 
 function queuePriority(track: Track) {
@@ -271,7 +271,7 @@ export function friendlyError(value: string) {
   if (/fetch|network|load failed/i.test(value))
     return "The local service is not responding. Make sure ./dev.sh is running, then reconnect.";
   if (/permission|denied/i.test(value))
-    return `${value} Check that magpie can read the inbox and write to the library folder.`;
+    return `${value} Check that magpie-fi can read the inbox and write to the library folder.`;
   return value;
 }
 

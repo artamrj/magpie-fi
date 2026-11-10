@@ -44,7 +44,7 @@ pub async fn repair(pool: &SqlitePool, path: &Path) -> Result<RepairResult> {
         .and_then(|value| value.to_str())
         .unwrap_or("audio");
     let temporary = path.with_file_name(format!(
-        ".{filename}.magpie-repair-{}-{stamp}.{extension}",
+        ".{filename}.magpie-fi-repair-{}-{stamp}.{extension}",
         std::process::id()
     ));
     let backup = unused_backup_path(path);
@@ -189,17 +189,20 @@ fn unused_backup_path(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("audio");
-    let first = path.with_file_name(format!("{filename}.magpie-damaged"));
+    let first = path.with_file_name(format!("{filename}.magpie-fi-damaged"));
     if !first.exists() {
         return first;
     }
     for suffix in 2..10_000 {
-        let candidate = path.with_file_name(format!("{filename}.magpie-damaged-{suffix}"));
+        let candidate = path.with_file_name(format!("{filename}.magpie-fi-damaged-{suffix}"));
         if !candidate.exists() {
             return candidate;
         }
     }
-    path.with_file_name(format!("{filename}.magpie-damaged-{}", std::process::id()))
+    path.with_file_name(format!(
+        "{filename}.magpie-fi-damaged-{}",
+        std::process::id()
+    ))
 }
 
 fn bounded_diagnostic(stderr: &[u8]) -> String {
