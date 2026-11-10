@@ -121,14 +121,25 @@ function RequestCard({
   onRetry: () => void;
 }) {
   const percent = request.total ? Math.round((request.done / request.total) * 100) : 0;
+  // Songs and uploaded files are named after their song; albums and playlists have a title.
   const title =
-    request.title ?? (request.kind === "track" && request.total ? undefined : request.url);
+    request.title ??
+    (request.kind === "album" || request.kind === "playlist" ? request.url : undefined);
   return (
     <li className={`request-card ${request.status}`}>
       <button className="request-summary" onClick={onToggle} aria-expanded={open}>
-        <span className="request-kind">{request.kind}</span>
+        <span className="request-kind">
+          {request.kind === "upload" ? "Telegram" : request.kind}
+        </span>
         <span className="request-title">
-          <b>{title ?? <SongTitle requestId={request.id} />}</b>
+          <b>
+            {title ??
+              (request.kind === "upload" && request.total > 1 ? (
+                `${request.total} files`
+              ) : (
+                <SongTitle requestId={request.id} />
+              ))}
+          </b>
           <small>
             {request.status === "reading"
               ? "Reading the link…"
@@ -194,9 +205,11 @@ function RequestSongs({ request, onRetry }: { request: MusicRequest; onRetry: ()
           </li>
         ))}
       </ol>
-      <a className="request-source" href={request.url} target="_blank" rel="noreferrer">
-        Open the original link
-      </a>
+      {request.url && (
+        <a className="request-source" href={request.url} target="_blank" rel="noreferrer">
+          Open the original link
+        </a>
+      )}
     </div>
   );
 }

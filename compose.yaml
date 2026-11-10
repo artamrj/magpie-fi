@@ -1,9 +1,11 @@
 # magpie-fi
 #
-#   your drops, the bot ─► MUSIC_ROOT/inbox ─► magpie ─► MUSIC_ROOT/library ─► navidrome ─► your apps
+#   links (web page, Telegram) ─► magpie downloads ─┐
+#   your drops ─► MUSIC_ROOT/inbox ─────────────────┼─► magpie ─► MUSIC_ROOT/library ─► navidrome ─► your apps
+#   files sent to the Telegram bot ─────────────────┘
 #
-# magpie identifies every new song in the inbox, files it into the library
-# (BLUEPRINT.md §5) and moves the original to MUSIC_ROOT/.magpie/trash.
+# magpie identifies every new song, files it into the library (BLUEPRINT.md §5)
+# and moves originals to MUSIC_ROOT/.magpie/trash.
 # Settings: .env (see .env.example). Setup: README.md.
 
 name: magpie-fi
@@ -38,6 +40,10 @@ services:
       MAGPIE_MAX_COLLECTION_TRACKS: "${MAGPIE_MAX_COLLECTION_TRACKS:-}"
       # Used only when config/ytdlp/cookies.txt exists.
       MAGPIE_YTDLP_COOKIES: /config/cookies.txt
+      MAGPIE_TELEGRAM_BOT_TOKEN: "${MAGPIE_TELEGRAM_BOT_TOKEN:-}"
+      MAGPIE_TELEGRAM_OWNERS: "${MAGPIE_TELEGRAM_OWNERS:-}"
+      MAGPIE_TELEGRAM_API_URL: "${MAGPIE_TELEGRAM_API_URL:-}"
+      MAGPIE_RHYME: "${MAGPIE_RHYME:-}"
       MAGPIE_ACOUSTID_KEY: "${MAGPIE_ACOUSTID_KEY:-}"
       MAGPIE_AUDD_TOKEN: "${MAGPIE_AUDD_TOKEN:-}"
       MAGPIE_SPOTIFY_CLIENT_ID: "${MAGPIE_SPOTIFY_CLIENT_ID:-}"
@@ -54,6 +60,7 @@ services:
       - ${MUSIC_ROOT:-./music}:/music
       - ${DATA_ROOT:-./data}/magpie:/data
       - ./config/ytdlp:/config:ro
+      - tgapi-files:/var/lib/telegram-bot-api:ro
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -92,36 +99,21 @@ services:
       start_period: 20s
       retries: 3
 
-  # Temporary Telegram bridge (BLUEPRINT.md §8): the old Python bot drops its
-  # downloads into the inbox until Telegram moves into magpie (Phase 3).
-  # Links pasted into magpie's own web page do not need it.
-  # Start it with: docker compose --profile bot up -d
-  bot:
-    profiles: [bot]
-    build: ./bot
-    image: ghcr.io/artamrj/magpie-fi-bot:${MAGPIE_TAG:-latest}
+  # Optional: Telegram's own Bot API server, so people can send files up to
+  # 2 GB instead of 20 MB. Needs TELEGRAM_API_ID / TELEGRAM_API_HASH from
+  # https://my.telegram.org and MAGPIE_TELEGRAM_API_URL=http://tgapi:8081 in .env.
+  # Start it with: docker compose --profile tgapi up -d
+  tgapi:
+    profiles: [tgapi]
+    image: aiogram/telegram-bot-api:latest
     restart: unless-stopped
     environment:
-      PUID: "${PUID:-1000}"
-      PGID: "${PGID:-1000}"
-      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
-      ALLOWED_TELEGRAM_USER_IDS: "${ALLOWED_TELEGRAM_USER_IDS:-}"
-      # The bot's "music folder" is the inbox. Its temp folder sits inside the same
-      # mount so finished files appear with one rename; magpie skips dot-folders.
-      MUSIC_DIR: /music
-      DOWNLOAD_TMP_DIR: /music/.incoming
-      DATA_DIR: /data
-      AUDIO_FORMAT: "${MAGPIE_AUDIO_FORMAT:-m4a}"
-      METADATA_LOOKUP: "true"
-      # magpie fetches lyrics when it files the song.
-      LYRICS: "false"
-      MAX_PARALLEL_DOWNLOADS: "${MAGPIE_MAX_PARALLEL_DOWNLOADS:-2}"
-      DOWNLOAD_PAUSE_SECONDS: "${MAGPIE_DOWNLOAD_PAUSE_SECONDS:-3}"
-      MAX_COLLECTION_TRACKS: "${MAGPIE_MAX_COLLECTION_TRACKS:-1000}"
-      YTDLP_COOKIES_FILE: "${YTDLP_COOKIES_FILE:-}"
-      RECEIVED_STICKER_ID: "${RECEIVED_STICKER_ID:-}"
-      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
+      TELEGRAM_LOCAL: "1"
     volumes:
-      - ${MUSIC_ROOT:-./music}/inbox:/music
-      - ${DATA_ROOT:-./data}/bot:/data
-      - ./config/ytdlp:/config:ro
+      - tgapi-files:/var/lib/telegram-bot-api
+
+volumes:
+  # Files received by the tgapi helper; magpie reads them from the same path.
+  tgapi-files:

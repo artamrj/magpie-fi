@@ -20,6 +20,15 @@ pub struct NavidromeConfig {
     pub password: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelegramConfig {
+    pub token: String,
+    /// Telegram user IDs that may use the bot and invite guests.
+    pub owners: Vec<i64>,
+    /// `https://api.telegram.org`, or a self-hosted Bot API server for files over 20 MB.
+    pub api_url: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioFormat {
     M4a,
@@ -45,6 +54,9 @@ pub struct Config {
     pub trash_days: u64,
     pub lyrics: bool,
     pub navidrome: Option<NavidromeConfig>,
+    pub telegram: Option<TelegramConfig>,
+    /// The magpie rhyme at the end of finished Telegram requests.
+    pub rhyme: bool,
     /// `m4a` or `opus`: YouTube's own audio stream, never re-encoded to another lossy format.
     pub audio_format: AudioFormat,
     pub max_parallel_downloads: usize,
@@ -94,6 +106,8 @@ impl Config {
             trash_days: 30,
             lyrics: true,
             navidrome: None,
+            telegram: None,
+            rhyme: true,
             audio_format: AudioFormat::M4a,
             max_parallel_downloads: 2,
             download_pause_seconds: 3,
@@ -192,6 +206,28 @@ impl Config {
             ),
         };
 
+        config.telegram = match get("MAGPIE_TELEGRAM_BOT_TOKEN") {
+            None => None,
+            Some(token) => {
+                let owners = parse_user_ids(&get("MAGPIE_TELEGRAM_OWNERS").unwrap_or_default())?;
+                if owners.is_empty() {
+                    bail!(
+                        "MAGPIE_TELEGRAM_OWNERS needs at least one Telegram user ID \
+                         (send /id to the bot to see yours)"
+                    );
+                }
+                Some(TelegramConfig {
+                    token,
+                    owners,
+                    api_url: get("MAGPIE_TELEGRAM_API_URL")
+                        .unwrap_or_else(|| "https://api.telegram.org".into())
+                        .trim_end_matches('/')
+                        .to_owned(),
+                })
+            }
+        };
+        config.rhyme = flag("MAGPIE_RHYME", true)?;
+
         let text = |field: &mut String, name: &str| {
             if let Some(value) = get(name) {
                 *field = value;
@@ -236,6 +272,19 @@ impl Config {
         self.max_download_seconds = self.max_download_seconds.clamp(30, 6 * 60 * 60);
         self.max_collection_tracks = self.max_collection_tracks.clamp(1, 10_000);
     }
+}
+
+/// "123, 456;789" → [123, 456, 789].
+fn parse_user_ids(value: &str) -> Result<Vec<i64>> {
+    value
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("'{part}' in MAGPIE_TELEGRAM_OWNERS is not a user ID"))
+        })
+        .collect()
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -326,6 +375,28 @@ mod tests {
             Some(PathBuf::from("/config/cookies.txt"))
         );
         assert!(from(&[("MAGPIE_AUDIO_FORMAT", "mp3")]).is_err());
+    }
+
+    #[test]
+    fn telegram_needs_a_token_and_owners() {
+        assert!(from(&[]).unwrap().telegram.is_none());
+        assert!(from(&[("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc")]).is_err());
+        let config = from(&[
+            ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
+            ("MAGPIE_TELEGRAM_OWNERS", "123, 456;789"),
+            ("MAGPIE_TELEGRAM_API_URL", "http://tgapi:8081/"),
+        ])
+        .unwrap();
+        let telegram = config.telegram.unwrap();
+        assert_eq!(telegram.owners, vec![123, 456, 789]);
+        assert_eq!(telegram.api_url, "http://tgapi:8081");
+        assert!(
+            from(&[
+                ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
+                ("MAGPIE_TELEGRAM_OWNERS", "me")
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,9 +1,7 @@
 name: release
 
-# Push a tag like v0.1.0 to publish the images with that version:
-#   ghcr.io/<owner>/magpie-fi      (the magpie program)
-#   ghcr.io/<owner>/magpie-fi-bot  (temporary Telegram bridge, removed in Phase 3)
-# Tags: 0.1.0, v0.1.0, 0.1, 0, latest; linux/amd64 + linux/arm64.
+# Push a tag like v0.1.0 to publish ghcr.io/<owner>/magpie-fi with that version
+# (tags: 0.1.0, v0.1.0, 0.1, 0, latest; linux/amd64 + linux/arm64).
 
 on:
   push:
@@ -24,15 +22,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/magpie-fi
+  IMAGE: ghcr.io/${{ github.repository_owner }}/magpie-fi
 
 jobs:
   image:
-    name: Build ${{ matrix.component }} ${{ matrix.suffix }}
+    name: Build ${{ matrix.suffix }}
     strategy:
       fail-fast: false
       matrix:
-        component: [magpie, bot]
         platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
@@ -41,16 +38,6 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             suffix: arm64
-          # magpie blocks on fixable CRITICAL/HIGH findings.
-          # The temporary bot image only reports them.
-          - component: magpie
-            context: .
-            image_suffix: ""
-            trivy_exit_code: "1"
-          - component: bot
-            context: bot
-            image_suffix: "-bot"
-            trivy_exit_code: "0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -90,16 +77,16 @@ jobs:
       - name: Build and push native image
         uses: docker/build-push-action@v7
         with:
-          context: ${{ matrix.context }}
+          context: .
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.IMAGE_PREFIX }}${{ matrix.image_suffix }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
           build-args: |
             VERSION=${{ steps.version.outputs.value }}
             VCS_REF=${{ steps.version.outputs.sha }}
             SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=release-${{ matrix.component }}-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=release-${{ matrix.component }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=release-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.suffix }}
           provenance: mode=max
           sbom: true
 
@@ -109,9 +96,10 @@ jobs:
           TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
           version: v0.72.0
-          image-ref: ${{ env.IMAGE_PREFIX }}${{ matrix.image_suffix }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
+          image-ref: ${{ env.IMAGE }}:${{ steps.version.outputs.value }}-${{ matrix.suffix }}
           format: table
-          exit-code: ${{ matrix.trivy_exit_code }}
+          # Block on fixable CRITICAL/HIGH findings.
+          exit-code: "1"
           # Block on problems that have a fix. Debian lists many findings that have
           # no fixed package yet; those are reported by the weekly security audit.
           ignore-unfixed: true
@@ -164,17 +152,15 @@ jobs:
           MINOR: ${{ steps.version.outputs.minor }}
           MAJOR: ${{ steps.version.outputs.major }}
         run: |
-          for image in "$IMAGE_PREFIX" "$IMAGE_PREFIX-bot"; do
-            docker buildx imagetools create \
-              --tag "$image:$VERSION" \
-              --tag "$image:$RELEASE_TAG" \
-              --tag "$image:$MINOR" \
-              --tag "$image:$MAJOR" \
-              --tag "$image:latest" \
-              "$image:$VERSION-amd64" \
-              "$image:$VERSION-arm64"
-            docker buildx imagetools inspect "$image:$VERSION"
-          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:$RELEASE_TAG" \
+            --tag "$IMAGE:$MINOR" \
+            --tag "$IMAGE:$MAJOR" \
+            --tag "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" \
+            "$IMAGE:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
 
       - name: Create GitHub Release
         env:

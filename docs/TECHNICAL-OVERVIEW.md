@@ -230,6 +230,15 @@ that is already in the library, `acquire::downloaded_file_done` records the libr
 rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths). Downloads are
 deleted after filing instead of going to the trash.
 
+## 4c. Telegram (`src/telegram/`)
+
+| Part | File | Job |
+|---|---|---|
+| Client | `api.rs` | Bot API calls with magpie's HTTP client and frankenstein's types; waits on "retry after", ignores "message is not modified"; file download (cloud API up to 20 MB, or a local Bot API server whose files are shared read-only). |
+| Bot | `mod.rs` | Long polling (offset kept in `telegram_state`), owners and guests (`telegram_guests`, one-time `telegram_invites`), links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
+| Status | `status.rs` | Every 3 s: redraws each open request's status message when its text changed, closes it when nothing is on the way or waiting for review, and asks about Telegram songs that wait in review (candidate buttons call the same choose/remove handlers as the web page). |
+| Texts | `texts.rs` | Every message the bot sends, the progress bar and the rhyme. |
+
 ## 5a. Library index
 
 `library_items` (`src/application/library.rs`) keeps one row per audio file in the

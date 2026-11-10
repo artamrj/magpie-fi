@@ -19,6 +19,19 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "reachable": crate::infrastructure::navidrome::ping(&s.client, navidrome).await.is_ok(),
         }),
     };
+    let guests: i64 = sqlx::query_scalar("SELECT count(*) FROM telegram_guests")
+        .fetch_one(&s.pool)
+        .await
+        .unwrap_or_default();
+    let telegram = match cfg.telegram.as_ref() {
+        None => serde_json::json!({"configured": false}),
+        Some(telegram) => serde_json::json!({
+            "configured": true,
+            "owners": telegram.owners.len(),
+            "guests": guests,
+            "large_files": !telegram.api_url.contains("api.telegram.org"),
+        }),
+    };
     let library_songs: i64 = sqlx::query_scalar("SELECT count(*) FROM library_items")
         .fetch_one(&s.pool)
         .await
@@ -31,6 +44,7 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "inbox_check_seconds": cfg.inbox_check_seconds,
         "lyrics": cfg.lyrics,
         "navidrome": navidrome,
+        "telegram": telegram,
         "library_songs": library_songs,
         "rsgain": crate::infrastructure::media::rsgain::available(),
         "ytdlp": crate::acquire::ytdlp::available(&cfg),

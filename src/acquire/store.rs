@@ -199,10 +199,11 @@ pub async fn mark_identifying(
     pool: &SqlitePool,
     id: i64,
     staging_path: &Path,
-    youtube_id: &str,
+    youtube_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE wanted SET status='identifying',staging_path=?,youtube_id=?,error=NULL,updated_at=?
+        "UPDATE wanted SET status='identifying',staging_path=?,
+           youtube_id=coalesce(?,youtube_id),error=NULL,updated_at=?
          WHERE id=?",
     )
     .bind(staging_path.to_string_lossy().as_ref())
@@ -324,6 +325,187 @@ pub async fn playlist_for_request(
     Ok(Some((name, paths)))
 }
 
+// ── Telegram ────────────────────────────────────────────────────────────────
+
+/// Remembers where a request came from in Telegram and its status message.
+pub async fn attach_telegram(
+    pool: &SqlitePool,
+    request_id: i64,
+    chat_id: i64,
+    user_message_id: i32,
+    status_message_id: i32,
+) -> Result<()> {
+    sqlx::query("UPDATE requests SET chat_id=?,user_message_id=?,status_message_id=? WHERE id=?")
+        .bind(chat_id)
+        .bind(user_message_id)
+        .bind(status_message_id)
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A request for audio files sent to the bot.
+pub async fn create_upload_request(pool: &SqlitePool, requested_by: &str) -> Result<i64> {
+    let now = now();
+    Ok(sqlx::query(
+        "INSERT INTO requests(url,kind,origin,requested_by,status,created_at,updated_at)
+         VALUES('','upload','telegram',?,'ready',?,?)",
+    )
+    .bind(requested_by)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .last_insert_rowid())
+}
+
+/// One sent audio file, downloading from Telegram.
+pub async fn add_upload(
+    pool: &SqlitePool,
+    request_id: i64,
+    title: &str,
+    artist: Option<&str>,
+    duration: Option<f64>,
+) -> Result<i64> {
+    Ok(sqlx::query(
+        "INSERT INTO wanted(request_id,position,title,artist,duration,status,updated_at)
+         VALUES(?,(SELECT coalesce(max(position),0)+1 FROM wanted WHERE request_id=?),?,?,?,
+                'downloading',?)",
+    )
+    .bind(request_id)
+    .bind(request_id)
+    .bind(title)
+    .bind(artist)
+    .bind(duration)
+    .bind(now())
+    .execute(pool)
+    .await?
+    .last_insert_rowid())
+}
+
+pub async fn mark_failed(pool: &SqlitePool, id: i64, error: &str) -> Result<()> {
+    sqlx::query("UPDATE wanted SET status='failed',error=?,updated_at=? WHERE id=?")
+        .bind(error)
+        .bind(now())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Songs of a request that have not started yet are dropped.
+pub async fn stop_request(pool: &SqlitePool, request_id: i64) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE wanted SET status='failed',error='Stopped',updated_at=?
+         WHERE request_id=? AND status='pending'",
+    )
+    .bind(now())
+    .bind(request_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct OpenStatus {
+    pub id: i64,
+    pub chat_id: i64,
+    pub status_message_id: i64,
+    pub user_message_id: Option<i64>,
+    pub status_text: Option<String>,
+}
+
+/// Telegram requests whose status message is not final yet.
+pub async fn open_telegram_requests(pool: &SqlitePool) -> Result<Vec<OpenStatus>> {
+    Ok(sqlx::query_as(
+        "SELECT id,chat_id,status_message_id,user_message_id,status_text FROM requests
+         WHERE chat_id IS NOT NULL AND status_message_id IS NOT NULL AND closed=0",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn set_status_text(
+    pool: &SqlitePool,
+    request_id: i64,
+    text: &str,
+    closed: bool,
+) -> Result<()> {
+    sqlx::query("UPDATE requests SET status_text=?,closed=?,updated_at=? WHERE id=?")
+        .bind(text)
+        .bind(closed)
+        .bind(now())
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A finished request gets a live status message again (retry pressed).
+pub async fn reopen(pool: &SqlitePool, request_id: i64) -> Result<()> {
+    sqlx::query("UPDATE requests SET closed=0 WHERE id=?")
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReviewQuestion {
+    pub wanted_id: i64,
+    pub chat_id: i64,
+    pub title: String,
+    pub artist: Option<String>,
+    pub track_id: i64,
+    pub reason: Option<String>,
+}
+
+/// Songs sent from Telegram that wait in review and were not asked about yet.
+pub async fn unasked_reviews(pool: &SqlitePool) -> Result<Vec<ReviewQuestion>> {
+    Ok(sqlx::query_as(
+        "SELECT w.id AS wanted_id,r.chat_id,w.title,w.artist,t.id AS track_id,
+           t.stage_message AS reason
+         FROM wanted w JOIN requests r ON r.id=w.request_id
+         JOIN tracks t ON t.path=w.staging_path
+         WHERE r.chat_id IS NOT NULL AND w.status='identifying' AND t.stage='review'
+           AND w.review_message_id IS NULL",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn set_review_message(pool: &SqlitePool, wanted_id: i64, message_id: i32) -> Result<()> {
+    sqlx::query("UPDATE wanted SET review_message_id=? WHERE id=?")
+        .bind(message_id)
+        .bind(wanted_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Who asked for the song in this review track, and in which chat.
+pub async fn requester_of_track(pool: &SqlitePool, track_id: i64) -> Result<Option<(i64, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT r.id,coalesce(r.requested_by,'') FROM tracks t
+         JOIN wanted w ON w.staging_path=t.path JOIN requests r ON r.id=w.request_id
+         WHERE t.id=? LIMIT 1",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn requester_of_request(pool: &SqlitePool, request_id: i64) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT requested_by FROM requests WHERE id=?")
+            .bind(request_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
 // ── What the web page shows ─────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, sqlx::FromRow)]
@@ -345,6 +527,14 @@ pub struct RequestSummary {
 }
 
 pub async fn list_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<RequestSummary>> {
+    summaries(pool, None, limit).await
+}
+
+pub async fn request_summary(pool: &SqlitePool, id: i64) -> Result<Option<RequestSummary>> {
+    Ok(summaries(pool, Some(id), 1).await?.into_iter().next())
+}
+
+async fn summaries(pool: &SqlitePool, id: Option<i64>, limit: i64) -> Result<Vec<RequestSummary>> {
     Ok(sqlx::query_as(
         "SELECT r.id,r.url,r.kind,r.title,r.owner,r.status,r.error,r.created_at,
            count(w.id) AS total,
@@ -356,8 +546,11 @@ pub async fn list_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<RequestS
          FROM requests r
          LEFT JOIN wanted w ON w.request_id=r.id
          LEFT JOIN tracks t ON t.path=w.staging_path AND w.status='identifying'
+         WHERE ? IS NULL OR r.id=?
          GROUP BY r.id ORDER BY r.id DESC LIMIT ?",
     )
+    .bind(id)
+    .bind(id)
     .bind(limit)
     .fetch_all(pool)
     .await?)
@@ -476,7 +669,7 @@ mod tests {
         let a = claim_next(&pool).await.unwrap().unwrap();
         let b = claim_next(&pool).await.unwrap().unwrap();
         let staging = directory.path().join("w1.m4a");
-        mark_identifying(&pool, a.id, &staging, "yt-a")
+        mark_identifying(&pool, a.id, &staging, Some("yt-a"))
             .await
             .unwrap();
         let library_b = directory.path().join("B.m4a");

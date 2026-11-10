@@ -515,7 +515,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='reference_files'",
@@ -551,7 +551,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tracks")
                 .fetch_one(&pool)
@@ -606,7 +606,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM tracks WHERE path='/input/keep.mp3'"

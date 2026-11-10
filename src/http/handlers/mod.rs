@@ -36,7 +36,7 @@ pub use workspace::workspace;
 
 #[derive(Deserialize)]
 pub struct SelectRequest {
-    candidate_id: Option<CandidateId>,
+    pub(crate) candidate_id: Option<CandidateId>,
 }
 
 #[derive(Deserialize)]

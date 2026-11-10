@@ -1,23 +1,24 @@
 # 🐦 magpie-fi
 
-Your own music service. Paste a Spotify, Apple Music, Deezer or YouTube link, or drop music
-into a folder. magpie gets the songs, identifies them, fixes their tags, cover, lyrics and
+Your own music service. Send a Spotify, Apple Music, Deezer or YouTube link to your Telegram
+bot or paste it in the web page, or drop music into a folder. magpie gets the songs, identifies them, fixes their tags, cover, lyrics and
 loudness, files them into a clean library, and [Navidrome](https://www.navidrome.org) plays
 them on every device. No subscription.
 
-The full plan is in [BLUEPRINT.md](BLUEPRINT.md). magpie-fi grew out of two earlier projects
-whose history is kept in this repository: [ununknown](https://github.com/artamrj/ununknown)
-became the magpie program, and [sync-me-maybe](https://github.com/artamrj/sync-me-maybe) is
-the Telegram bot in [`bot/`](bot/) until it is rewritten into magpie (Phase 3).
+It is **one program in one Docker image**, next to Navidrome. The full plan is in
+[BLUEPRINT.md](BLUEPRINT.md). magpie-fi grew out of two earlier projects whose history is kept
+in this repository: [ununknown](https://github.com/artamrj/ununknown) (identifying and filing)
+and [sync-me-maybe](https://github.com/artamrj/sync-me-maybe) (the Telegram bot, rewritten in
+Rust inside magpie).
 
 ## How it works
 
 ```text
-a link ──► magpie downloads ──┐
-your drops ─► MUSIC_ROOT/inbox ┼─► magpie ─► MUSIC_ROOT/library ─► Navidrome ─► your apps
-Telegram bot (optional) ───────┘     │
-                                     ├─ sure?      → filed automatically
-                                     └─ not sure?  → waits for you in Review (web page)
+links (Telegram, web page) ─► magpie downloads ─┐
+files sent to the bot ──────────────────────────┼─► magpie ─► MUSIC_ROOT/library ─► Navidrome ─► your apps
+your drops ─► MUSIC_ROOT/inbox ─────────────────┘     │
+                                                      ├─ sure?      → filed automatically
+                                                      └─ not sure?  → asks you (Telegram or web page)
 ```
 
 ### Getting music from a link
@@ -90,15 +91,23 @@ Then:
 3. **Review:** open `http://127.0.0.1:7331` on the server. From another computer, run
    `ssh -L 7331:127.0.0.1:7331 <server>` first.
 
-### Telegram (optional, temporary bridge)
+### Telegram
 
-Set `TELEGRAM_BOT_TOKEN` and `ALLOWED_TELEGRAM_USER_IDS` in `.env`, then:
+1. Create a bot with [@BotFather](https://t.me/BotFather) and put its token in `.env` as
+   `MAGPIE_TELEGRAM_BOT_TOKEN`.
+2. Start magpie, send `/id` to your bot, and put the number in `.env` as
+   `MAGPIE_TELEGRAM_OWNERS` (several owners: `123,456`). Run `docker compose up -d` again.
+3. Send the bot a song, album or playlist link, or audio files.
 
-```bash
-docker compose --profile bot up -d --build
-```
+Each request gets one message that updates as songs arrive (“2 of 12 in your library ·
+3 on the way”). Buttons let you stop, retry failed songs, or see what went wrong. When magpie
+isn't sure which song you sent, it asks with up to three choices. Owners can invite guests
+with `/guests` (a one-time link). `/help`, `/queue`, `/health` and `/id` do what they say.
 
-Send a song link or an audio file to the bot. It downloads into the inbox, and magpie files it.
+**Files over 20 MB** (FLAC albums): Telegram only lets bots download 20 MB through its cloud
+service. Get an API ID and hash at <https://my.telegram.org>, set `TELEGRAM_API_ID`,
+`TELEGRAM_API_HASH` and `MAGPIE_TELEGRAM_API_URL=http://tgapi:8081` in `.env`, and start the
+helper with `docker compose --profile tgapi up -d`. Files up to 2 GB then work.
 
 ### Music you already have
 
@@ -113,7 +122,7 @@ Send a song link or an audio file to the bot. It downloads into the inbox, and m
 
 ```text
 MUSIC_ROOT/
-├── inbox/                 drop new music here (also where the bot downloads)
+├── inbox/                 drop new music here
 ├── library/               the clean library; Navidrome reads it, only magpie writes it
 │   ├── Artist/Album (Year)/01 - Title.flac · 01 - Title.lrc · cover.jpg
 │   └── Playlists/
@@ -122,7 +131,6 @@ DATA_ROOT/
 ├── magpie/                magpie's database and caches
 ├── navidrome/             Navidrome: users, play counts, stars (back this up)
 ├── navidrome-backup/      Navidrome's daily backup
-└── bot/                   the Telegram bridge's database
 ```
 
 Keep `MUSIC_ROOT` on one disk, so moving a song from the inbox to the library is instant. Put
@@ -138,11 +146,10 @@ page's status panel shows the current values. To change one, edit `.env` and run
 
 These go away in later phases (see [BLUEPRINT.md §8](BLUEPRINT.md#8-roadmap)):
 
-- The Telegram bot is still the old Python bridge: it says "Completed" when its download
-  finishes, and its playlists don't become Navidrome playlists. Paste links into the web page
-  instead, or wait for Phase 3.
 - Spotify playlists: only the songs Spotify's public page shows are read (about the first 100).
-- Telegram limits bots to files of 20 MB, so large FLAC uploads fail (Phase 3).
+- The web page has no login yet, so it is only reachable on the server itself (or through an
+  SSH tunnel). Phase 4 opens it inside Telegram, with Telegram as the login.
+- "Stop" in Telegram drops the songs that have not started; a download already running finishes.
 
 ## Development
 
@@ -165,7 +172,7 @@ How identification works in detail: [docs/TECHNICAL-OVERVIEW.md](docs/TECHNICAL-
 
 ## Releases
 
-Push a tag like `v0.1.0`. GitHub Actions builds `ghcr.io/artamrj/magpie-fi` (and the temporary
-`ghcr.io/artamrj/magpie-fi-bot`) for amd64 and arm64. Set `MAGPIE_TAG=0.1.0` in `.env` to pin it.
+Push a tag like `v0.1.0`. GitHub Actions builds `ghcr.io/artamrj/magpie-fi` for amd64 and
+arm64. Set `MAGPIE_TAG=0.1.0` in `.env` to pin it.
 New GHCR packages are private: make them public in the package settings, or run
 `docker login ghcr.io` on the server.

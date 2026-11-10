@@ -103,7 +103,7 @@ async fn process(state: &Arc<AppState>, row: WantedRow) {
         Ok(Outcome::Downloaded { path, youtube_id }) => {
             tracing::info!(song = %label, file = %path.display(), "downloaded; identifying next");
             if let Err(error) =
-                store::mark_identifying(&state.pool, row.id, &path, &youtube_id).await
+                store::mark_identifying(&state.pool, row.id, &path, Some(&youtube_id)).await
             {
                 tracing::warn!(%error, "could not record a download");
             }

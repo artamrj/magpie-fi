@@ -33,8 +33,7 @@ for folder in \
     "$music_root/.magpie/trash" \
     "$data_root/navidrome" \
     "$data_root/navidrome-backup" \
-    "$data_root/magpie" \
-    "$data_root/bot"; do
+    "$data_root/magpie"; do
     mkdir -p "$folder"
     echo "ok  $folder"
 done
@@ -44,7 +43,7 @@ if [ "$(id -u)" = "0" ]; then
     chown "$puid:$pgid" \
         "$music_root" "$music_root/inbox" "$music_root/library" "$music_root/library/Playlists" \
         "$music_root/.magpie" "$music_root/.magpie/trash" \
-        "$data_root" "$data_root/navidrome" "$data_root/navidrome-backup" "$data_root/magpie" "$data_root/bot"
+        "$data_root" "$data_root/navidrome" "$data_root/navidrome-backup" "$data_root/magpie"
     echo "Owner set to $puid:$pgid"
 elif [ "$(id -u)" != "$puid" ]; then
     echo "Note: you are not uid $puid. If Navidrome cannot write to $data_root/navidrome," >&2

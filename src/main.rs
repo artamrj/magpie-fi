@@ -5,6 +5,7 @@ mod config;
 mod domain;
 mod http;
 mod infrastructure;
+mod telegram;
 mod types;
 
 use anyhow::{Context, Result, bail};
@@ -115,6 +116,7 @@ async fn main() -> Result<()> {
         }
     });
     tokio::spawn(acquire::worker::run(state.clone()));
+    tokio::spawn(telegram::run(state.clone()));
     let updater_state = state.clone();
     tokio::spawn(async move {
         // yt-dlp breaks whenever YouTube changes, so it is updated every day.

@@ -30,23 +30,6 @@ updates:
         update-types:
           - "version-update:semver-major"
 
-  # yt-dlp breaks when YouTube changes, so the bot is checked weekly.
-  - package-ecosystem: "uv"
-    directory: "/bot"
-    schedule:
-      interval: "weekly"
-      time: "04:15"
-      timezone: "Europe/Berlin"
-    open-pull-requests-limit: 3
-    groups:
-      youtube:
-        patterns:
-          - "yt-dlp*"
-          - "ytmusicapi"
-      python-dependencies:
-        patterns:
-          - "*"
-
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -62,7 +45,6 @@ updates:
   - package-ecosystem: "docker"
     directories:
       - "/"
-      - "/bot"
     schedule:
       interval: "monthly"
       time: "04:30"

@@ -5,7 +5,6 @@
 target
 web/node_modules
 web/dist
-bot
 docs
 config
 data

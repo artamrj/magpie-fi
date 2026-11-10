@@ -12,13 +12,14 @@ export type Setup = {
   audio_format: string;
   max_parallel_downloads: number;
   navidrome: { configured: boolean; url?: string; reachable?: boolean };
+  telegram: { configured: boolean; owners?: number; guests?: number; large_files?: boolean };
   sources: Record<string, boolean>;
 };
 /** A link someone asked for (GET /api/requests). */
 export type MusicRequest = {
   id: number;
   url: string;
-  kind: "track" | "album" | "playlist";
+  kind: "track" | "album" | "playlist" | "upload";
   title?: string;
   owner?: string;
   status: "reading" | "ready" | "failed";

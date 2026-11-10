@@ -42,6 +42,7 @@ const emptySetup: Setup = {
   audio_format: "m4a",
   max_parallel_downloads: 2,
   navidrome: { configured: false },
+  telegram: { configured: false },
   sources: {},
 };
 

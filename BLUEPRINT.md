@@ -626,16 +626,16 @@ python-telegram-bot 22.8 stops at Bot API 10.0 and aiogram 3.31 at 10.3.
 
 ## 7. Repository layout of this folder
 
-One Rust crate at the root (`core/` was moved there with its history; `bot/` stays only until
-Phase 3). The folders inherited from ununknown keep their names; new parts get their own
-top-level module.
+One Rust crate at the root (`core/` was moved there with its history; the Python bot was
+rewritten into `telegram/` and deleted). The folders inherited from ununknown keep their names;
+new parts get their own top-level module.
 
 ```text
 magpie-fi/                       ← this folder is still called navidrome-arta on disk
 ├── BLUEPRINT.md  README.md  SECURITY.md  LICENSE
 ├── Cargo.toml  Cargo.lock       crate "magpie-fi", binary "magpie"
 ├── Dockerfile                   the one image (Debian + ffmpeg, fpcalc, SongRec, rsgain, yt-dlp, Deno)
-├── compose.yaml                 magpie + navidrome  (profile "bot": the temporary Telegram bridge)
+├── compose.yaml                 magpie + navidrome  (profile "tgapi": Telegram files up to 2 GB)
 ├── .env.example                 every setting, all MAGPIE_*
 ├── config/navidrome.toml  config/ytdlp/
 ├── migrations/                  one database schema
@@ -649,12 +649,11 @@ magpie-fi/                       ← this folder is still called navidrome-arta 
 │   ├── domain/                  audio reading, matcher, credits, genres
 │   ├── infrastructure/          db, providers (20 sources), media tools, lyrics, navidrome
 │   ├── http/                    API routes and handlers (incl. requests.rs)
-│   └── telegram/                Phase 3
+│   └── telegram/                NEW (Phase 3): bot, status messages, review questions, guests
 ├── web/                         React: review workbench + Get music (Mini App in Phase 4)
-├── bot/                         old Python bot — deleted in Phase 3
 ├── scripts/                     docker-entrypoint.sh, setup-folders.sh
 ├── docs/TECHNICAL-OVERVIEW.md
-└── .github/workflows/           magpie.yml · bot.yml · release.yml · security.yml
+└── .github/workflows/           magpie.yml · release.yml · security.yml
 ```
 
 ### 7.1 Where every part of the old projects goes
@@ -775,16 +774,29 @@ Turned ununknown into the magpie program and gave it a real library.
 - ✅ Done when pasting a Spotify playlist link gives a Navidrome playlist in the same order, every
   song stored once, and pasting it again downloads nothing.
 
-### Phase 3 — Telegram in Rust → one image
-Port the bot's "talk to people" half. After this phase, magpie-fi is one image.
-- `telegram/` with `frankenstein`: commands, links, uploads (with batching), the status message
-  (Preparing → Downloading → Identifying → In your library ▶ Play), Stop / Rerun failed / details
-  buttons kept for 30 days, guest invites, `/web` login link, the magpie rhyme.
-- Review in Telegram: one compact message with 3 coloured candidate buttons + "Open review".
-- Reactions as quick acks; DM topics (Requests · Review · New in library) as an option.
-- Optional `tgapi` profile for files up to 2 GB.
-- ⛔ Deletes: **`bot/` completely**, the Phase 0 bridge, the `magpie-fi-bot` image, Python from CI.
-- ✅ Done when everything the old bot did works from the one image, and `bot/` is gone.
+### Phase 3 — Telegram in Rust → one image ✅ built (2026-11-10)
+magpie-fi is now one program in one image; the Python bot is gone.
+- `src/telegram/`: long polling, owners from `MAGPIE_TELEGRAM_OWNERS`, guests invited by owners
+  with a one-time link (`/guests`) and kept in the database (the old bot forgot them on restart).
+- Links → the same request queue as the web page. Audio files → `.magpie/staging/` and the
+  normal pipeline (files forwarded together become one request). The old bot stored uploads raw;
+  now they are identified, tagged and filed like everything else.
+- One status message per request, edited as songs move ("2 of 12 in your library · 3 on the way"),
+  with Stop, Retry failed and Details buttons that work after restarts (they point at the request
+  in the database). 👀 on your message when it arrives, 👌 or 🤷 when it is finished.
+- Review in Telegram: "Not sure which song this is" with up to three candidates and "None of
+  these", using the same choose/remove logic as the web page.
+- `/start` `/help` (with the whole rhyme) `/queue` `/health` `/id` `/guests`, hidden `/seven`;
+  the rhyme line on finished requests (`MAGPIE_RHYME`).
+- Optional `tgapi` profile (Telegram's own Bot API server) for files up to 2 GB.
+- `frankenstein` is used for Telegram's types only; requests go through magpie's own HTTP client
+  (its built-in client would have pulled in a second reqwest version).
+- Tested against a fake Telegram server in the test suite (strangers, owners, invites, guests,
+  buttons, status messages). Not yet tested with a real bot token, nor the `tgapi` helper.
+- ⛔ Deleted: `bot/` (≈8,000 lines of Python), the bot container and image, Python CI and
+  Dependabot entries.
+- Moved to Phase 4: the `/web` login link (the web page has no login yet) and "Open review" /
+  "▶ Play" buttons (they need an address reachable from your phone). DM topics were left out.
 
 ### Phase 4 — The workbench in your pocket
 - The web page opens inside Telegram as a **Mini App** (`@tma.js/sdk`, Telegram theme colours,
