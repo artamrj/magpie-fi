@@ -317,33 +317,10 @@ export function SongScreen({
 }
 
 function Hero({ track, candidate }: { track: Track; candidate?: Candidate }) {
-  const audioRef = useRef<HTMLAudioElement | undefined>(undefined);
-  const [playing, setPlaying] = useState(false);
-  useEffect(() => {
-    audioRef.current?.pause();
-    audioRef.current = undefined;
-    setPlaying(false);
-  }, [track.id]);
-  useEffect(
-    () => () => {
-      audioRef.current?.pause();
-    },
-    [],
-  );
   const playable = !track.is_missing && track.status !== "corrupt" && track.stage !== "skipped";
-  const toggle = () => {
-    if (!audioRef.current) {
-      const audio = new Audio(`/api/tracks/${track.id}/audio`);
-      audio.onended = () => setPlaying(false);
-      audioRef.current = audio;
-    }
-    if (playing) audioRef.current.pause();
-    else void audioRef.current.play().catch(() => setPlaying(false));
-    setPlaying(!playing);
-  };
   const title = candidate?.title || track.current_title || fileStem(track.filename);
   const artist = candidate?.artist || track.current_artist;
-  const facts = [formatDuration(track.duration), track.format?.toUpperCase()].filter(Boolean);
+  const facts = [track.format?.toUpperCase(), formatDuration(track.duration)].filter(Boolean);
   return (
     <div className="hero">
       {candidate ? (
@@ -351,21 +328,91 @@ function Hero({ track, candidate }: { track: Track; candidate?: Candidate }) {
       ) : (
         <OriginalCover track={track} size="large" />
       )}
-      <div>
+      <div className="hero-main">
         <h2 dir="auto">{title}</h2>
         {artist && <p dir="auto">{artist}</p>}
         {playable ? (
-          <button type="button" className="play-chip" onClick={toggle}>
-            <i>
-              <Icon name={playing ? "pause" : "play"} size={14} />
-            </i>
-            {playing ? "Playing" : "Listen"}
-            {facts.length ? ` · ${facts.join(" · ")}` : ""}
-          </button>
+          <Player key={track.id} src={`/api/tracks/${track.id}/audio`} duration={track.duration} />
         ) : (
           facts.length > 0 && <p>{facts.join(" · ")}</p>
         )}
+        {playable && facts.length > 0 && <p className="hero-facts">{facts.join(" · ")}</p>}
       </div>
+    </div>
+  );
+}
+
+/** Play, pause and seek anywhere in the song. The audio loads on the first play only. */
+function Player({ src, duration }: { src: string; duration?: number }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [time, setTime] = useState(0);
+  const [length, setLength] = useState(duration ?? 0);
+  const [scrubbing, setScrubbing] = useState<number>();
+  useEffect(() => () => audioRef.current?.pause(), []);
+
+  const toggle = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (!audio.src) audio.src = src;
+    if (audio.paused) void audio.play().catch(() => setPlaying(false));
+    else audio.pause();
+  };
+  const seek = (seconds: number) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (!audio.src) audio.src = src;
+    audio.currentTime = seconds;
+    setTime(seconds);
+  };
+  const shown = scrubbing ?? time;
+  return (
+    <div className="player">
+      <audio
+        ref={audioRef}
+        preload="none"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onTimeUpdate={(event) => {
+          if (scrubbing === undefined) setTime(event.currentTarget.currentTime);
+        }}
+        onLoadedMetadata={(event) => {
+          if (Number.isFinite(event.currentTarget.duration))
+            setLength(event.currentTarget.duration);
+        }}
+      />
+      <button
+        type="button"
+        className="player-toggle"
+        onClick={toggle}
+        aria-label={playing ? "Pause" : "Play"}
+      >
+        <Icon name={playing ? "pause" : "play"} size={16} />
+      </button>
+      <time className="player-time">{formatDuration(shown) ?? "0:00"}</time>
+      <input
+        type="range"
+        className="player-seek"
+        min={0}
+        max={length || 1}
+        step={0.5}
+        value={Math.min(shown, length || 1)}
+        aria-label="Position in the song"
+        disabled={!length}
+        onChange={(event) => setScrubbing(Number(event.target.value))}
+        onPointerUp={(event) => {
+          const value = Number((event.target as HTMLInputElement).value);
+          setScrubbing(undefined);
+          seek(value);
+        }}
+        onKeyUp={(event) => {
+          const value = Number((event.target as HTMLInputElement).value);
+          setScrubbing(undefined);
+          seek(value);
+        }}
+      />
+      <time className="player-time">{formatDuration(length) ?? "–:––"}</time>
     </div>
   );
 }

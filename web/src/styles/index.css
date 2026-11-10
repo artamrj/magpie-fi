@@ -452,25 +452,57 @@ button.cell:active {
   color: var(--sub);
   font-size: 16px;
 }
-.play-chip {
-  margin-top: 10px;
-  display: inline-flex;
+.hero-main {
+  width: 100%;
+  max-width: 440px;
+}
+.hero-facts {
+  font-size: 13px !important;
+  color: var(--hint) !important;
+  margin-top: 6px !important;
+}
+.player {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
-  padding: 6px 14px 6px 8px;
+  gap: 10px;
+  padding: 8px 12px 8px 8px;
   border-radius: 99px;
   background: var(--fill);
-  font-size: 14px;
-  color: var(--text);
 }
-.play-chip i {
-  width: 28px;
-  height: 28px;
+.player audio {
+  display: none;
+}
+.player-toggle {
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   background: var(--button);
   color: var(--button-text);
   display: grid;
   place-items: center;
+  flex: none;
+}
+.player-time {
+  font-size: 12px;
+  color: var(--sub);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: center;
+}
+.player-seek {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  height: 24px;
+  accent-color: var(--button);
+  cursor: pointer;
+  background: none;
+}
+.player-seek:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ---------- Release options ---------- */
@@ -1156,6 +1188,9 @@ button.cell:active {
   .wide .hero h2 {
     margin-top: 0;
     font-size: 26px;
+  }
+  .wide .hero-main {
+    max-width: 520px;
   }
   .wide .tabbar,
   .wide .back-button {
