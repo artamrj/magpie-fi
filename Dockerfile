@@ -39,7 +39,7 @@ RUN set -eu; \
     unzip -q /tmp/deno.zip -d /tmp/deno; \
     install -m 755 /tmp/deno/deno /out-deno
 
-FROM mirror.gcr.io/library/rust:1.98-slim-trixie AS rust-base
+FROM mirror.gcr.io/library/rust:1.99-slim-trixie AS rust-base
 
 # SongRec's command-line client (Shazam recognition), built once. Only this
 # build needs the ALSA headers.
