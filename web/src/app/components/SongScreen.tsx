@@ -229,7 +229,7 @@ export function SongScreen({
   return (
     <>
       <PageTitle title={title} onBack={onBack} />
-      <Hero track={track} candidate={shown} />
+      <Hero track={track} candidate={chosen} />
 
       {editing ? (
         <ManualEditor

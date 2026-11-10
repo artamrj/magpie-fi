@@ -6,26 +6,47 @@ use reqwest::Client;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+/// Searches Deezer. The filtered query (`artist:"…" track:"…"`) is precise but Deezer's
+/// filtered index misses some tracks that its plain search knows, so an empty answer is
+/// asked again as plain words.
 pub async fn search(
     pool: &SqlitePool,
     client: &Client,
     title: &str,
     artist: Option<&str>,
 ) -> Result<Vec<Candidate>> {
-    let query = match artist.filter(|value| !value.trim().is_empty()) {
-        Some(artist) => format!("artist:{} track:{}", phrase(artist), phrase(title)),
-        None => format!("track:{}", phrase(title)),
-    };
-    let raw = cached(
+    for query in queries(title, artist) {
+        let candidates = parse_results(&fetch_search(pool, client, &query).await?);
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// The filtered query first, then the plain words.
+fn queries(title: &str, artist: Option<&str>) -> Vec<String> {
+    let title = title.trim();
+    match artist.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(artist) => vec![
+            format!("artist:{} track:{}", phrase(artist), phrase(title)),
+            format!("{artist} {title}"),
+        ],
+        None => vec![format!("track:{}", phrase(title)), title.to_owned()],
+    }
+}
+
+async fn fetch_search(pool: &SqlitePool, client: &Client, query: &str) -> Result<Value> {
+    cached(
         pool,
         "deezer",
-        &search_key(&query),
+        &search_key(query),
         Duration::days(7),
         || async {
             let value = request_json(
                 client
                     .get("https://api.deezer.com/search")
-                    .query(&[("q", query.as_str()), ("limit", "10")]),
+                    .query(&[("q", query), ("limit", "10")]),
             )
             .await?;
             if let Some(message) = value["error"]["message"].as_str() {
@@ -34,8 +55,7 @@ pub async fn search(
             Ok(value)
         },
     )
-    .await?;
-    Ok(parse_results(&raw))
+    .await
 }
 
 pub async fn lookup_isrc(
@@ -103,6 +123,21 @@ fn parse_results(raw: &Value) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filtered_search_is_retried_as_plain_words() {
+        assert_eq!(
+            queries("Donyaye Movazi", Some("Tqvis & Ferap")),
+            vec![
+                "artist:\"Tqvis & Ferap\" track:\"Donyaye Movazi\"",
+                "Tqvis & Ferap Donyaye Movazi"
+            ]
+        );
+        assert_eq!(
+            queries("Donyaye Movazi", Some("  ")),
+            vec!["track:\"Donyaye Movazi\"", "Donyaye Movazi"]
+        );
+    }
 
     #[test]
     fn parses_track_without_mislabeling_deezer_ids_as_musicbrainz_ids() {

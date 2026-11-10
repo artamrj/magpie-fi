@@ -192,14 +192,12 @@ export const isPossibleDuplicate = (track: Track) =>
   track.stage === "review" &&
   (track.stage_message ?? "").startsWith("Possible duplicate: you may already have this song as ");
 
-/** The title and artist a row shows: the chosen match, else the file's tags, else the file name. */
+/** The title and artist a row shows: the accepted match, else the file's own tags, else the file name. */
 export function trackTitle(track: Track) {
-  const candidate = selectedCandidate(track) ?? track.candidates[0];
-  return candidate?.title || track.current_title || fileStem(track.filename);
+  return selectedCandidate(track)?.title || track.current_title || fileStem(track.filename);
 }
 export function trackArtist(track: Track) {
-  const candidate = selectedCandidate(track) ?? track.candidates[0];
-  return candidate?.artist || track.current_artist || "";
+  return selectedCandidate(track)?.artist || track.current_artist || "";
 }
 
 /** A chosen match that still needs a cover before the song can be filed. */
