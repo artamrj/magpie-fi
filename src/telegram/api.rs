@@ -7,8 +7,11 @@ use frankenstein::response::{ErrorResponse, MethodResponse};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, time::Duration};
 
-/// Telegram's cloud API lets bots download files up to 20 MB.
-pub const CLOUD_DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
+/// Telegram lets bots download files up to 20 MB
+/// (<https://core.telegram.org/bots/api#getfile>).
+pub const DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
+
+pub const TOO_BIG: &str = "Telegram only lets bots receive files up to 20 MB";
 
 #[derive(Clone)]
 pub struct Bot {
@@ -47,10 +50,6 @@ impl Bot {
             api_url: config.api_url.clone(),
             token: config.token.clone(),
         })
-    }
-
-    pub fn is_cloud(&self) -> bool {
-        self.api_url.contains("api.telegram.org")
     }
 
     /// Calls a Bot API method. Waits and tries again when Telegram asks to
@@ -106,21 +105,21 @@ impl Bot {
         }
     }
 
-    /// Saves a file sent to the bot. With a local Bot API server the file is
-    /// already on disk (its path is shared with magpie) and is copied.
+    /// Saves a file sent to the bot (at most [`DOWNLOAD_LIMIT`]).
     pub async fn download(&self, file_id: &str, target: &Path) -> Result<()> {
-        let file: frankenstein::types::File = self
+        let file: frankenstein::types::File = match self
             .call("getFile", &serde_json::json!({"file_id": file_id}))
-            .await?;
+            .await
+        {
+            Ok(file) => file,
+            Err(error) if error.to_string().contains("file is too big") => {
+                bail!("{TOO_BIG}")
+            }
+            Err(error) => return Err(error),
+        };
         let path = file
             .file_path
             .context("Telegram did not give a download path for this file")?;
-        if Path::new(&path).is_absolute() {
-            tokio::fs::copy(&path, target)
-                .await
-                .with_context(|| format!("could not read {path} from the Bot API server"))?;
-            return Ok(());
-        }
         let url = format!("{}/file/bot{}/{path}", self.api_url, self.token);
         let bytes = self
             .client

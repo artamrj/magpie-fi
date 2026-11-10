@@ -12,7 +12,7 @@ export type Setup = {
   audio_format: string;
   max_parallel_downloads: number;
   navidrome: { configured: boolean; url?: string; reachable?: boolean };
-  telegram: { configured: boolean; owners?: number; guests?: number; large_files?: boolean };
+  telegram: { configured: boolean; owners?: number; guests?: number };
   sources: Record<string, boolean>;
 };
 /** Who is using the page (GET /api/me). */

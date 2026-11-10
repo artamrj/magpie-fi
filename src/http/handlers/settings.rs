@@ -29,7 +29,6 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "configured": true,
             "owners": telegram.owners.len(),
             "guests": guests,
-            "large_files": !telegram.api_url.contains("api.telegram.org"),
         }),
     };
     let library_songs: i64 = sqlx::query_scalar("SELECT count(*) FROM library_items")

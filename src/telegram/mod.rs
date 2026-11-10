@@ -323,16 +323,11 @@ async fn on_upload(
     file: AudioFile,
 ) -> Result<()> {
     let chat = message.chat.id;
-    if context.bot.is_cloud()
-        && file
-            .size
-            .is_some_and(|size| size > api::CLOUD_DOWNLOAD_LIMIT)
-    {
+    if let Some(size) = file.size.filter(|size| *size > api::DOWNLOAD_LIMIT) {
         send(
             context,
             chat,
-            "This file is bigger than 20 MB, the most Telegram lets bots download. Start the \
-             <code>tgapi</code> helper (see README) to accept files up to 2 GB.",
+            &texts::too_big(&file.name, size),
             Some(message.message_id),
         )
         .await;

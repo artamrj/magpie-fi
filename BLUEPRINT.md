@@ -389,7 +389,6 @@ glibc; ffmpeg and Chromaprint come from Debian packages):
 
 | Profile | Image | Turn on when |
 |---|---|---|
-| `tgapi` | `aiogram/telegram-bot-api` | you send files bigger than 20 MB (FLAC) — raises the limit to 2 GB |
 | `pot` | `bgutil-ytdlp-pot-provider` | YouTube starts refusing downloads without a PO token |
 | `slskd` | `slskd/slskd` | you want lossless from Soulseek (⚖️ your legal risk) |
 
@@ -555,7 +554,7 @@ EnableInsightsCollector = false    # your choice; anonymous telemetry, on by def
 
 | Feature | API | Use it for |
 |---|---|---|
-| ⚠️ **Self-hosted Bot API server** (`tdlib/telegram-bot-api`, image `aiogram/telegram-bot-api`) | — | Cloud bots can only **download files ≤ 20 MB** and upload ≤ 50 MB. Local server: unlimited download, 2 GB upload, and `getFile` returns a **local path** — magpie just moves the file into `.magpie/staging/`. Fixes FLAC uploads. Needs `api_id`/`api_hash` from my.telegram.org. |
+| ⚠️ **20 MB file limit** ([`getFile`](https://core.telegram.org/bots/api#getfile)) | — | Bots can only **download files ≤ 20 MB**. magpie does not run its own Bot API server to get around it (one more container and Telegram app keys, for little gain): bigger files get a clear answer — send MP3/M4A, a link, or use the inbox folder. |
 | **Topics in private chats** | 9.3 / 9.4 | The bot creates topics in your DM: *Requests*, *Review*, *New in library*, *Errors*. No more one long mixed chat. |
 | **Reactions** | 7.0 | React 👀 → 👍 / 🤷 on the user's message as a lightweight ack (replaces the sticker trick). |
 | **Mini Apps**: fullscreen, home-screen shortcut, Secondary button, DeviceStorage/SecureStorage, `downloadFile` | 8.0 / 9.0 | The review workbench on your phone (§4.6, Phase 4). |
@@ -635,7 +634,7 @@ magpie-fi/                       ← this folder is still called navidrome-arta 
 ├── BLUEPRINT.md  README.md  SECURITY.md  LICENSE
 ├── Cargo.toml  Cargo.lock       crate "magpie-fi", binary "magpie"
 ├── Dockerfile                   the one image (Debian + ffmpeg, fpcalc, SongRec, rsgain, yt-dlp, Deno)
-├── compose.yaml                 magpie + navidrome  (profile "tgapi": Telegram files up to 2 GB)
+├── compose.yaml                 magpie + navidrome
 ├── .env.example                 every setting, all MAGPIE_*
 ├── config/navidrome.toml  config/ytdlp/
 ├── migrations/                  one database schema
@@ -788,11 +787,12 @@ magpie-fi is now one program in one image; the Python bot is gone.
   these", using the same choose/remove logic as the web page.
 - `/start` `/help` (with the whole rhyme) `/queue` `/health` `/id` `/guests`, hidden `/seven`;
   the rhyme line on finished requests (`MAGPIE_RHYME`).
-- Optional `tgapi` profile (Telegram's own Bot API server) for files up to 2 GB.
+- Files over Telegram's 20 MB bot limit get a clear answer (smaller file, a link, or the inbox
+  folder). No self-hosted Bot API server: one more container and app keys for little gain.
 - `frankenstein` is used for Telegram's types only; requests go through magpie's own HTTP client
   (its built-in client would have pulled in a second reqwest version).
 - Tested against a fake Telegram server in the test suite (strangers, owners, invites, guests,
-  buttons, status messages). Not yet tested with a real bot token, nor the `tgapi` helper.
+  buttons, status messages). Not yet tested with a real bot token.
 - ⛔ Deleted: `bot/` (≈8,000 lines of Python), the bot container and image, Python CI and
   Dependabot entries.
 - Moved to Phase 4: the `/web` login link (the web page has no login yet) and "Open review" /

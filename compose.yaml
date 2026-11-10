@@ -43,7 +43,6 @@ services:
       MAGPIE_YTDLP_COOKIES: /config/cookies.txt
       MAGPIE_TELEGRAM_BOT_TOKEN: "${MAGPIE_TELEGRAM_BOT_TOKEN:-}"
       MAGPIE_TELEGRAM_OWNERS: "${MAGPIE_TELEGRAM_OWNERS:-}"
-      MAGPIE_TELEGRAM_API_URL: "${MAGPIE_TELEGRAM_API_URL:-}"
       MAGPIE_RHYME: "${MAGPIE_RHYME:-}"
       MAGPIE_PUBLIC_URL: "${MAGPIE_PUBLIC_URL:-}"
       MAGPIE_ACOUSTID_KEY: "${MAGPIE_ACOUSTID_KEY:-}"
@@ -62,7 +61,6 @@ services:
       - ${MUSIC_ROOT:-./music}:/music
       - ${DATA_ROOT:-./data}/magpie:/data
       - ./config/ytdlp:/config:ro
-      - tgapi-files:/var/lib/telegram-bot-api:ro
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -78,35 +76,3 @@ services:
       - no-new-privileges:true
     pids_limit: 512
     stop_grace_period: 45s
-
-  # Optional: Telegram's own Bot API server, so people can send files up to
-  # 2 GB instead of 20 MB. Needs TELEGRAM_API_ID / TELEGRAM_API_HASH from
-  # https://my.telegram.org and MAGPIE_TELEGRAM_API_URL=http://tgapi:8081 in .env.
-  # Start it with: docker compose --profile tgapi up -d
-  tgapi:
-    profiles: [tgapi]
-    image: aiogram/telegram-bot-api:latest
-    restart: unless-stopped
-    environment:
-      TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"
-      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
-      TELEGRAM_LOCAL: "1"
-    volumes:
-      - tgapi-files:/var/lib/telegram-bot-api
-
-  # Optional: a Cloudflare Tunnel that gives the web page an HTTPS address for
-  # the Telegram Mini App. In Cloudflare Zero Trust create a tunnel with a public
-  # hostname pointing to http://magpie:7331, put its token in .env as
-  # CLOUDFLARE_TUNNEL_TOKEN and the hostname as MAGPIE_PUBLIC_URL.
-  # Start it with: docker compose --profile tunnel up -d
-  tunnel:
-    profiles: [tunnel]
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
-
-volumes:
-  # Files received by the tgapi helper; magpie reads them from the same path.
-  tgapi-files:

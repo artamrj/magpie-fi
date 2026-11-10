@@ -61,6 +61,18 @@ pub fn help(owner: bool) -> String {
     text
 }
 
+/// Answer to an upload over Telegram's 20 MB limit for bots.
+pub fn too_big(name: &str, bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let megabytes = bytes as f64 / (1024.0 * 1024.0);
+    format!(
+        "⚠️ <b>{}</b> is {megabytes:.0} MB. Telegram only lets bots receive files up to \
+         20 MB, so I can't take this one.\n\nSend a smaller version (MP3 or M4A), a link \
+         to the song, or copy the file into the inbox folder.",
+        escape(name)
+    )
+}
+
 /// What a status message needs besides the counts.
 #[derive(Debug, Default)]
 pub struct StatusView {
@@ -267,6 +279,13 @@ mod tests {
         let waiting = summary("track", 1, 0, 0, 1, 0);
         assert!(!is_final(&waiting));
         assert!(status(&waiting, &view, true).contains("Not sure which song"));
+    }
+
+    #[test]
+    fn big_files_get_a_clear_answer() {
+        let text = too_big("Song <live>.flac", 45 * 1024 * 1024);
+        assert!(text.contains("<b>Song &lt;live&gt;.flac</b> is 45 MB"));
+        assert!(text.contains("up to 20 MB"));
     }
 
     #[test]

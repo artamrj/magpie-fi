@@ -104,10 +104,9 @@ Each request gets one message that updates as songs arrive (“2 of 12 in your l
 isn't sure which song you sent, it asks with up to three choices. Owners can invite guests
 with `/guests` (a one-time link). `/help`, `/queue`, `/health` and `/id` do what they say.
 
-**Files over 20 MB** (FLAC albums): Telegram only lets bots download 20 MB through its cloud
-service. Get an API ID and hash at <https://my.telegram.org>, set `TELEGRAM_API_ID`,
-`TELEGRAM_API_HASH` and `MAGPIE_TELEGRAM_API_URL=http://tgapi:8081` in `.env`, and start the
-helper with `docker compose --profile tgapi up -d`. Files up to 2 GB then work.
+**Files over 20 MB** (most FLAC): Telegram only lets bots receive files up to 20 MB
+([Bot API docs](https://core.telegram.org/bots/api#getfile)). The bot says so when a file is
+too big. Send an MP3/M4A, a link to the song, or copy the file into the inbox folder instead.
 
 ### Phone and Telegram Mini App
 

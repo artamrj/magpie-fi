@@ -25,7 +25,7 @@ pub struct TelegramConfig {
     pub token: String,
     /// Telegram user IDs that may use the bot and invite guests.
     pub owners: Vec<i64>,
-    /// `https://api.telegram.org`, or a self-hosted Bot API server for files over 20 MB.
+    /// Always `https://api.telegram.org`; tests point it at a fake server.
     pub api_url: String,
 }
 
@@ -222,10 +222,7 @@ impl Config {
                 Some(TelegramConfig {
                     token,
                     owners,
-                    api_url: get("MAGPIE_TELEGRAM_API_URL")
-                        .unwrap_or_else(|| "https://api.telegram.org".into())
-                        .trim_end_matches('/')
-                        .to_owned(),
+                    api_url: "https://api.telegram.org".into(),
                 })
             }
         };
@@ -400,12 +397,11 @@ mod tests {
         let config = from(&[
             ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
             ("MAGPIE_TELEGRAM_OWNERS", "123, 456;789"),
-            ("MAGPIE_TELEGRAM_API_URL", "http://tgapi:8081/"),
         ])
         .unwrap();
         let telegram = config.telegram.unwrap();
         assert_eq!(telegram.owners, vec![123, 456, 789]);
-        assert_eq!(telegram.api_url, "http://tgapi:8081");
+        assert_eq!(telegram.api_url, "https://api.telegram.org");
         assert!(
             from(&[
                 ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),

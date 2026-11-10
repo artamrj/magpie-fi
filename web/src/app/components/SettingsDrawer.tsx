@@ -63,11 +63,7 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
             <h3>Telegram</h3>
             <p className="settings-hint">
               {setup.telegram.configured
-                ? `Bot is on · ${setup.telegram.owners} owner(s), ${setup.telegram.guests} guest(s) · ${
-                    setup.telegram.large_files
-                      ? "files up to 2 GB (local Bot API server)"
-                      : "files up to 20 MB"
-                  }`
+                ? `Bot is on · ${setup.telegram.owners} owner(s), ${setup.telegram.guests} guest(s) · files up to 20 MB`
                 : "Off. Set MAGPIE_TELEGRAM_BOT_TOKEN and MAGPIE_TELEGRAM_OWNERS to send links and files from Telegram."}
             </p>
           </section>
