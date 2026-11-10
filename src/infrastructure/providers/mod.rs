@@ -167,6 +167,15 @@ pub struct Candidate {
     pub artwork_message: Option<String>,
     pub recording_id: Option<String>,
     pub release_id: Option<String>,
+    /// MusicBrainz release group: every edition of one album.
+    pub release_group_id: Option<String>,
+    /// MusicBrainz track on the release: Navidrome's stable track identity.
+    pub release_track_id: Option<String>,
+    /// First release of the recording (YYYY, YYYY-MM or YYYY-MM-DD).
+    pub original_date: Option<String>,
+    /// Latin sort names for artists whose display name is Persian.
+    pub artist_sort: Option<String>,
+    pub album_artist_sort: Option<String>,
     pub release_country: Option<String>,
     pub release_date: Option<String>,
     pub release_type: Option<String>,

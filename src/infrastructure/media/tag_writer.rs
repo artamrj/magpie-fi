@@ -84,7 +84,26 @@ pub fn write(
     }
     optional(tag, ItemKey::Composer, &candidate.composer);
     optional(tag, ItemKey::Label, &candidate.label);
+    // Navidrome: DATE is the recording date, RELEASEDATE the release (it groups and sorts
+    // albums by it) and ORIGINALDATE the first release. The full date when a source gave one.
     optional(tag, ItemKey::RecordingDate, &candidate.year);
+    optional(
+        tag,
+        ItemKey::ReleaseDate,
+        &full_date(&candidate.release_date).or_else(|| candidate.year.clone()),
+    );
+    optional(
+        tag,
+        ItemKey::OriginalReleaseDate,
+        &full_date(&candidate.original_date),
+    );
+    // Latin sort names keep Persian-named artists in alphabetical order.
+    optional(tag, ItemKey::TrackArtistSortOrder, &candidate.artist_sort);
+    optional(
+        tag,
+        ItemKey::AlbumArtistSortOrder,
+        &candidate.album_artist_sort,
+    );
     optional(
         tag,
         ItemKey::MusicBrainzRecordingId,
@@ -94,6 +113,16 @@ pub fn write(
         tag,
         ItemKey::MusicBrainzReleaseId,
         &musicbrainz_id(&candidate.release_id),
+    );
+    optional(
+        tag,
+        ItemKey::MusicBrainzReleaseGroupId,
+        &musicbrainz_id(&candidate.release_group_id),
+    );
+    optional(
+        tag,
+        ItemKey::MusicBrainzTrackId,
+        &musicbrainz_id(&candidate.release_track_id),
     );
     let artist_ids = candidate
         .artist_credits
@@ -138,6 +167,53 @@ pub fn write(
         set(tag, lyrics_key(tag.tag_type()), &text);
     }
     file.save_to_path(path, WriteOptions::default())?;
+    if file.file_type() == lofty::file::FileType::Mp4 {
+        merge_duplicate_atoms(path)?;
+    }
+    Ok(())
+}
+
+/// A date as Navidrome reads it: YYYY, YYYY-MM or YYYY-MM-DD; anything else is dropped.
+fn full_date(value: &Option<String>) -> Option<String> {
+    let value = value.as_deref()?.trim();
+    let digits = value.replace('-', "");
+    let shape_ok = matches!(value.len(), 4 | 7 | 10)
+        && digits.chars().all(|character| character.is_ascii_digit())
+        && value.get(4..5).is_none_or(|separator| separator == "-")
+        && value.get(7..8).is_none_or(|separator| separator == "-");
+    (shape_ok && !value.starts_with("0000")).then(|| value.to_owned())
+}
+
+/// Lofty writes one MP4 atom per value of a multi-valued tag (ARTISTS, ALBUMARTISTS, the
+/// MusicBrainz artist IDs). TagLib, which Navidrome reads with, keeps only the first of
+/// duplicated atoms, so the values are folded into one atom with several data entries.
+fn merge_duplicate_atoms(path: &Path) -> Result<()> {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::mp4::{Ilst, Mp4File};
+    let mut file = std::fs::File::open(path)?;
+    let mut mp4 = Mp4File::read_from(&mut file, ParseOptions::new())?;
+    let Some(ilst) = mp4.ilst() else {
+        return Ok(());
+    };
+    let idents = ilst
+        .into_iter()
+        .map(|atom| atom.ident().clone().into_owned())
+        .collect::<Vec<_>>();
+    let has_duplicates = idents
+        .iter()
+        .enumerate()
+        .any(|(index, ident)| idents[..index].contains(ident));
+    if !has_duplicates {
+        return Ok(());
+    }
+    let mut merged = Ilst::new();
+    for atom in ilst.clone() {
+        // `insert` joins an atom with the same identifier into one with several values.
+        merged.insert(atom);
+    }
+    mp4.set_ilst(merged);
+    mp4.save_to_path(path, WriteOptions::default())?;
     Ok(())
 }
 
@@ -301,6 +377,12 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
         .primary_tag()
         .or_else(|| file.first_tag())
         .ok_or_else(|| anyhow::anyhow!("written file contains no metadata tag"))?;
+    // Lofty reads only the first value of an MP4 atom that holds several (TagLib reads
+    // them all), so multi-values of an M4A are checked on the atoms themselves.
+    let ilst = (file.file_type() == lofty::file::FileType::Mp4)
+        .then(|| read_ilst(path))
+        .transpose()?
+        .flatten();
     let credits = crate::domain::credits::normalize_structured(
         &candidate.artist,
         &candidate.title,
@@ -314,6 +396,7 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
     }
     verify_multi_values(
         tag,
+        ilst.as_ref(),
         ItemKey::TrackArtists,
         &crate::domain::credits::individual_names(&credits.artists),
         "track artists",
@@ -326,6 +409,7 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
     if !candidate.album_artist_credits.is_empty() {
         verify_multi_values(
             tag,
+            ilst.as_ref(),
             ItemKey::AlbumArtists,
             &crate::domain::credits::individual_names(&candidate.album_artist_credits),
             "album artists",
@@ -340,6 +424,7 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
     if !artist_ids.is_empty() {
         verify_multi_values(
             tag,
+            ilst.as_ref(),
             ItemKey::MusicBrainzArtistId,
             &dedupe_values(artist_ids),
             "MusicBrainz artist IDs",
@@ -354,6 +439,7 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
     if !album_artist_ids.is_empty() {
         verify_multi_values(
             tag,
+            ilst.as_ref(),
             ItemKey::MusicBrainzReleaseArtistId,
             &dedupe_values(album_artist_ids),
             "MusicBrainz album artist IDs",
@@ -366,12 +452,53 @@ pub fn verify_written_metadata(path: &Path, candidate: &Candidate) -> Result<()>
     Ok(())
 }
 
-fn verify_multi_values(tag: &Tag, key: ItemKey, expected: &[String], label: &str) -> Result<()> {
-    let actual = tag.get_strings(key).map(str::to_owned).collect::<Vec<_>>();
+fn verify_multi_values(
+    tag: &Tag,
+    ilst: Option<&lofty::mp4::Ilst>,
+    key: ItemKey,
+    expected: &[String],
+    label: &str,
+) -> Result<()> {
+    let actual = match ilst {
+        Some(ilst) => mp4_values(ilst, key),
+        None => tag.get_strings(key).map(str::to_owned).collect::<Vec<_>>(),
+    };
     if actual != expected {
         bail!("written {label} differ: expected {expected:?}, found {actual:?}");
     }
     Ok(())
+}
+
+fn read_ilst(path: &Path) -> Result<Option<lofty::mp4::Ilst>> {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    let mut file = std::fs::File::open(path)?;
+    let mp4 = lofty::mp4::Mp4File::read_from(&mut file, ParseOptions::new())?;
+    Ok(mp4.ilst().cloned())
+}
+
+/// Every value of the iTunes free-form atom that `key` is written to.
+fn mp4_values(ilst: &lofty::mp4::Ilst, key: ItemKey) -> Vec<String> {
+    let name = match key {
+        ItemKey::TrackArtists => "ARTISTS",
+        ItemKey::AlbumArtists => "ALBUMARTISTS",
+        ItemKey::MusicBrainzArtistId => "MusicBrainz Artist Id",
+        ItemKey::MusicBrainzReleaseArtistId => "MusicBrainz Album Artist Id",
+        _ => return Vec::new(),
+    };
+    ilst.into_iter()
+        .filter(|atom| {
+            matches!(atom.ident(), lofty::mp4::AtomIdent::Freeform { mean, name: atom_name }
+                if mean == "com.apple.iTunes" && atom_name == name)
+        })
+        .flat_map(|atom| atom.data())
+        .filter_map(|data| match data {
+            lofty::mp4::AtomData::UTF8(text) | lofty::mp4::AtomData::UTF16(text) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn dedupe_values(values: Vec<String>) -> Vec<String> {
@@ -649,6 +776,39 @@ pub fn check_artwork(data: &[u8]) -> Result<ArtworkCheck> {
         },
         single_colour,
     })
+}
+
+/// The longest side of a cover inside a song; catalogs send up to 3000 px.
+pub const EMBEDDED_COVER_SIZE: u32 = 1200;
+
+/// The cover as it goes into the file and next to it: JPEG, at most 1200 px on the long
+/// side. A JPEG that already fits is kept byte for byte, so its verified hash stays valid.
+pub fn prepare_cover(data: &[u8]) -> Result<Vec<u8>> {
+    let format = image::guess_format(data).context("cover image format is unsupported")?;
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(data), format)
+        .into_dimensions()
+        .context("cover image could not be read")?;
+    let fits = width.max(height) <= EMBEDDED_COVER_SIZE;
+    if fits && format == image::ImageFormat::Jpeg {
+        return Ok(data.to_vec());
+    }
+    let decoded = image::load_from_memory_with_format(data, format)
+        .context("cover image could not be decoded")?;
+    let resized = if fits {
+        decoded
+    } else {
+        decoded.resize(
+            EMBEDDED_COVER_SIZE,
+            EMBEDDED_COVER_SIZE,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let mut output = std::io::Cursor::new(Vec::new());
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 88);
+    encoder
+        .encode_image(&resized.to_rgb8())
+        .context("cover image could not be encoded")?;
+    Ok(output.into_inner())
 }
 
 pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<ArtworkInfo> {
@@ -1122,6 +1282,104 @@ mod tests {
             verify_written_metadata(&path, &band)
                 .unwrap_or_else(|error| panic!("{extension} band identity: {error:#}"));
         }
+    }
+
+    #[test]
+    fn dates_are_written_in_navidrome_shape_only() {
+        assert_eq!(
+            full_date(&Some("2024-03-15".into())).as_deref(),
+            Some("2024-03-15")
+        );
+        assert_eq!(
+            full_date(&Some("2024-03".into())).as_deref(),
+            Some("2024-03")
+        );
+        assert_eq!(full_date(&Some("2024".into())).as_deref(), Some("2024"));
+        assert_eq!(full_date(&Some("0000-00-00".into())), None);
+        assert_eq!(full_date(&Some("March 2024".into())), None);
+        assert_eq!(full_date(&None), None);
+    }
+
+    #[test]
+    fn big_covers_are_shrunk_to_jpeg_and_fitting_jpegs_are_kept() {
+        let big = image::RgbImage::from_fn(3000, 3000, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(big)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let prepared = prepare_cover(&png.into_inner()).unwrap();
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&prepared))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!((width, height), (1200, 1200));
+        assert_eq!(
+            image::guess_format(&prepared).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+
+        let small =
+            image::RgbImage::from_fn(600, 600, |x, _| image::Rgb([(x % 256) as u8, 20, 20]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(small)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg = jpeg.into_inner();
+        assert_eq!(prepare_cover(&jpeg).unwrap(), jpeg);
+    }
+
+    #[test]
+    fn m4a_multi_values_live_in_one_atom() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duet.m4a");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.1")
+            .args(["-c:a", "aac", "-b:a", "64k"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let duet = Candidate {
+            title: "Khabe Khoob".into(),
+            artist: "Ebi & Shadmehr Aghili".into(),
+            artist_credits: vec![
+                crate::domain::credits::ArtistCredit::new("Ebi", " & "),
+                crate::domain::credits::ArtistCredit::new("Shadmehr Aghili", ""),
+            ],
+            ..Default::default()
+        };
+        write(&path, &duet, None, None).unwrap();
+        verify_written_metadata(&path, &duet).unwrap();
+        use lofty::config::ParseOptions;
+        use lofty::file::AudioFile;
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mp4 = lofty::mp4::Mp4File::read_from(&mut file, ParseOptions::new()).unwrap();
+        let idents = mp4
+            .ilst()
+            .unwrap()
+            .into_iter()
+            .map(|atom| format!("{:?}", atom.ident()))
+            .collect::<Vec<_>>();
+        let artists_atoms = idents
+            .iter()
+            .filter(|ident| ident.contains("name: \"ARTISTS\""))
+            .count();
+        assert_eq!(artists_atoms, 1, "{idents:?}");
+        assert_eq!(
+            mp4_values(mp4.ilst().unwrap(), ItemKey::TrackArtists),
+            vec!["Ebi".to_owned(), "Shadmehr Aghili".to_owned()]
+        );
     }
 
     #[test]

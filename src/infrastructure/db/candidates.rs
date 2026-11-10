@@ -21,8 +21,10 @@ pub async fn insert(
            year,genre,composer,label,isrc,cover_url,artwork_candidates_json,artwork_status,
            artwork_message,musicbrainz_recording_id,musicbrainz_release_id,release_country,
            release_date,release_type,release_secondary_types,is_compilation,duration_delta,
-           score_breakdown,musicbrainz_artist_id,musicbrainz_album_artist_id,score,raw_json)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+           score_breakdown,musicbrainz_artist_id,musicbrainz_album_artist_id,score,raw_json,
+           musicbrainz_release_group_id,musicbrainz_release_track_id,original_date,artist_sort,
+           album_artist_sort)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(track_id)
     .bind(provider)
@@ -58,6 +60,11 @@ pub async fn insert(
     .bind(&candidate.album_artist_id)
     .bind(candidate.score)
     .bind(&candidate.raw_json)
+    .bind(&candidate.release_group_id)
+    .bind(&candidate.release_track_id)
+    .bind(&candidate.original_date)
+    .bind(&candidate.artist_sort)
+    .bind(&candidate.album_artist_sort)
     .execute(executor)
     .await?
     .last_insert_rowid())
@@ -74,7 +81,8 @@ pub async fn update(executor: impl SqliteExecutor<'_>, candidate: &Candidate) ->
          album_artist_credits_json=?,track_number=?,track_total=?,disc_number=?,disc_total=?,year=?,
          genre=?,composer=?,label=?,isrc=?,cover_url=?,artwork_candidates_json=?,artwork_status=?,
          artwork_message=?,release_country=?,release_date=?,release_type=?,release_secondary_types=?,
-         is_compilation=?,score_breakdown=? WHERE id=?",
+         is_compilation=?,score_breakdown=?,original_date=?,artist_sort=?,album_artist_sort=?
+         WHERE id=?",
     )
     .bind(&candidate.title)
     .bind(&candidate.artist)
@@ -101,6 +109,9 @@ pub async fn update(executor: impl SqliteExecutor<'_>, candidate: &Candidate) ->
     .bind(&candidate.release_secondary_types)
     .bind(candidate.is_compilation)
     .bind(&candidate.score_breakdown)
+    .bind(&candidate.original_date)
+    .bind(&candidate.artist_sort)
+    .bind(&candidate.album_artist_sort)
     .bind(id)
     .execute(executor)
     .await?;

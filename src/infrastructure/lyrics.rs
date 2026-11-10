@@ -118,6 +118,31 @@ async fn save(audio: &Path, track: &LrclibTrack) -> Result<Saved> {
     Ok(Saved::Nothing)
 }
 
+/// LRC text with timestamps, as opposed to plain lines.
+pub fn is_synced(text: &str) -> bool {
+    text.lines().take(20).any(|line| {
+        let line = line.trim_start();
+        line.len() >= 9
+            && line.starts_with('[')
+            && line.as_bytes()[1].is_ascii_digit()
+            && line.as_bytes()[2].is_ascii_digit()
+            && line.as_bytes()[3] == b':'
+    })
+}
+
+/// Writes synced lyrics as `<song>.lrc` next to the song, which Navidrome reads before the
+/// lyrics inside the file. An existing lyrics file of any kind is left alone.
+pub async fn write_lrc(audio: &Path, text: &str) -> Result<Option<PathBuf>> {
+    if !is_synced(text) || sidecar_exists(audio).await {
+        return Ok(None);
+    }
+    let target = audio.with_extension("lrc");
+    let temporary = audio.with_extension("lrc.part");
+    tokio::fs::write(&temporary, format!("{}\n", text.trim_end())).await?;
+    tokio::fs::rename(&temporary, &target).await?;
+    Ok(Some(target))
+}
+
 async fn sidecar_exists(audio: &Path) -> bool {
     for extension in ["lrc", "elrc", "ttml", "txt"] {
         if tokio::fs::try_exists(audio.with_extension(extension))

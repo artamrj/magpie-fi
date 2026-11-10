@@ -87,6 +87,15 @@ async fn destination(
             )
             .find(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("cannot tell the audio format of {}", source.display()))?;
+        // WAV and AIFF become FLAC when filed (see `convert_to_flac`).
+        let extension = if matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "wav" | "aiff" | "aif"
+        ) {
+            "flac".to_owned()
+        } else {
+            extension
+        };
         let destination = library::destination(&library, &aligned, &extension);
         Ok::<_, anyhow::Error>((aligned, destination))
     })
@@ -844,6 +853,10 @@ async fn file_item(
             return Ok(Filing::NotFiled);
         }
     };
+    // The same JPEG goes inside the song and, as cover.jpg, next to it.
+    let artwork = tokio::task::spawn_blocking(move || tag_writer::prepare_cover(&artwork))
+        .await?
+        .context("could not prepare the cover")?;
     let dest = PathBuf::from(&item.destination_path);
     if paths_resolve_to_same_target(&src, &dest).await? {
         bail!("refusing to file a song onto itself: {}", src.display());
@@ -854,19 +867,29 @@ async fn file_item(
             .await
             .with_context(|| format!("could not create the album folder {}", parent.display()))?;
     }
-    tokio::fs::copy(&src, &temporary).await.with_context(|| {
-        format!(
-            "could not copy {} to {}",
-            src.display(),
-            temporary.display()
-        )
-    })?;
+    if is_lossless_uncompressed(&src) {
+        // WAV and AIFF cannot be tagged reliably: they become FLAC, which loses nothing.
+        convert_to_flac(&src, &temporary).await?;
+    } else {
+        tokio::fs::copy(&src, &temporary).await.with_context(|| {
+            format!(
+                "could not copy {} to {}",
+                src.display(),
+                temporary.display()
+            )
+        })?;
+    }
 
     // 2. Tags, cover and lyrics (verified) and atomic publish.
-    let lyrics = if cfg.lyrics && !cfg.sidecars {
+    let fetched_lyrics = if cfg.lyrics {
         fetch_lyrics(s, item).await
     } else {
         None
+    };
+    let lyrics = if cfg.sidecars {
+        None
+    } else {
+        fetched_lyrics.clone()
     };
     let published = match write_tags(s, &temporary, candidate, &artwork, lyrics).await {
         Ok(()) => publish_no_clobber(&temporary, &dest, Some(&src), Some(&artwork)).await,
@@ -926,16 +949,24 @@ async fn file_item(
 
     // 4. Extras. None of them can undo a successful filing. Separate cover and
     // lyrics files only when asked for: normally they are inside the song.
+    // Navidrome looks for cover.jpg before the cover inside the song, and reads a .lrc
+    // before embedded lyrics, so both are written next to the song as well.
     if let Some(album_folder) = final_path.parent() {
-        if cfg.sidecars
-            && let Err(error) = library::write_folder_cover(album_folder, &artwork).await
-        {
+        if let Err(error) = library::write_folder_cover(album_folder, &artwork).await {
             tracing::warn!(%error, folder = %album_folder.display(), "could not write cover file");
         }
         touched_albums.insert(album_folder.to_path_buf());
     }
     if cfg.lyrics && cfg.sidecars {
         save_lyrics(s, item, &final_path).await;
+    } else if let Some(text) = fetched_lyrics.as_deref() {
+        match lyrics::write_lrc(&final_path, text).await {
+            Ok(Some(path)) => tracing::debug!(file = %path.display(), "wrote synced lyrics file"),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, file = %final_path.display(), "could not write the lyrics file")
+            }
+        }
     }
     if reused_existing {
         tracing::info!(
@@ -973,6 +1004,48 @@ async fn file_item(
 
 /// Writes and verifies the tags and cover of the temporary copy, off the
 /// async runtime and within the tag-writer limit.
+fn is_lossless_uncompressed(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "wav" | "aiff" | "aif"
+            )
+        })
+}
+
+/// WAV or AIFF to FLAC: the same samples, about half the size, and a container that holds tags.
+async fn convert_to_flac(source: &Path, target: &Path) -> Result<()> {
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:a:0",
+            "-map_metadata",
+            "0",
+            "-c:a",
+            "flac",
+            "-compression_level",
+            "8",
+            "-f",
+            "flac",
+        ])
+        .arg(target)
+        .output()
+        .await
+        .context("ffmpeg could not be started")?;
+    if !output.status.success() {
+        bail!(
+            "could not convert {} to FLAC: {}",
+            source.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 async fn write_tags(
     s: &AppState,
     target: &Path,

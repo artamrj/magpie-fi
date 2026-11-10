@@ -30,8 +30,21 @@ pub struct TelegramConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioFormat {
+    /// Whatever the source streams, kept as it is: Opus from YouTube, AAC where that is all
+    /// there is. Never re-encoded.
+    Best,
     M4a,
     Opus,
+}
+
+impl AudioFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioFormat::Best => "best",
+            AudioFormat::M4a => "m4a",
+            AudioFormat::Opus => "opus",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +114,7 @@ impl Config {
             sidecars: false,
             telegram: None,
             public_url: None,
-            audio_format: AudioFormat::M4a,
+            audio_format: AudioFormat::Best,
             max_parallel_downloads: 2,
             download_pause_seconds: 3,
             max_download_seconds: 900,
@@ -155,9 +168,10 @@ impl Config {
         config.lyrics = flag("MAGPIE_LYRICS", true)?;
         config.sidecars = flag("MAGPIE_SIDECARS", false)?;
         config.audio_format = match get("MAGPIE_AUDIO_FORMAT").as_deref() {
-            None | Some("m4a") => AudioFormat::M4a,
+            None | Some("best") => AudioFormat::Best,
+            Some("m4a") => AudioFormat::M4a,
             Some("opus") => AudioFormat::Opus,
-            Some(other) => bail!("MAGPIE_AUDIO_FORMAT must be m4a or opus, got '{other}'"),
+            Some(other) => bail!("MAGPIE_AUDIO_FORMAT must be best, m4a or opus, got '{other}'"),
         };
         config.max_parallel_downloads =
             usize::try_from(number("MAGPIE_MAX_PARALLEL_DOWNLOADS", 2)?).unwrap_or(2);

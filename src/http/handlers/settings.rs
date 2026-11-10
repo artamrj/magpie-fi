@@ -45,10 +45,7 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "library_songs": library_songs,
         "rsgain": rsgain,
         "ytdlp": ytdlp,
-        "audio_format": match cfg.audio_format {
-            crate::config::AudioFormat::M4a => "m4a",
-            crate::config::AudioFormat::Opus => "opus",
-        },
+        "audio_format": cfg.audio_format.as_str(),
         "max_parallel_downloads": cfg.max_parallel_downloads,
         "sources": {
             "musicbrainz": true,

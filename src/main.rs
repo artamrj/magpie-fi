@@ -105,10 +105,9 @@ async fn main() -> Result<()> {
                     }
                     if !inbox_state.config.sidecars {
                         match application::tidy::embed_sidecars(&inbox_state).await {
-                            Ok(tidied) if tidied.lyrics + tidied.covers > 0 => tracing::info!(
+                            Ok(tidied) if tidied.lyrics > 0 => tracing::info!(
                                 lyrics = tidied.lyrics,
-                                covers = tidied.covers,
-                                "moved lyrics and covers inside the songs; the separate files are in the trash"
+                                "put lyrics from .lrc files inside their songs"
                             ),
                             Ok(_) => {}
                             Err(error) => {

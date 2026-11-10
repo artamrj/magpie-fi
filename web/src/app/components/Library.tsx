@@ -187,7 +187,7 @@ export function Library({
           title="Downloads and extras"
           subtitle={[
             setup.ytdlp
-              ? `${setup.audio_format.toUpperCase()}, ${setup.max_parallel_downloads} at a time`
+              ? `${setup.audio_format === "best" ? "source codec kept" : setup.audio_format.toUpperCase()}, ${setup.max_parallel_downloads} at a time`
               : "yt-dlp missing: links cannot be downloaded",
             setup.lyrics ? "lyrics on" : "lyrics off",
             setup.rsgain ? "album loudness" : "track loudness only",

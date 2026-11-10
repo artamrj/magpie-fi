@@ -9,7 +9,7 @@ use std::collections::HashMap;
 pub const TRACK_FIELDS: &str = "id,path,output_path,filename,format,bitrate,duration,content_fingerprint,current_title,current_artist,current_album,current_album_artist,current_track_number,selected_candidate_id,status,error,is_missing,stage,stage_message";
 
 /// Every candidate column except `raw_json`, which is only kept for the record.
-pub const CANDIDATE_FIELDS: &str = "id,track_id,provider,title,artist,artist_credits_json,album,album_artist,album_artist_credits_json,track_number,track_total,disc_number,disc_total,year,genre,composer,label,isrc,cover_url,artwork_candidates_json,artwork_status,artwork_message,musicbrainz_recording_id,musicbrainz_release_id,release_country,release_date,release_type,release_secondary_types,is_compilation,duration_delta,score_breakdown,musicbrainz_artist_id,musicbrainz_album_artist_id,score";
+pub const CANDIDATE_FIELDS: &str = "id,track_id,provider,title,artist,artist_credits_json,album,album_artist,album_artist_credits_json,track_number,track_total,disc_number,disc_total,year,genre,composer,label,isrc,cover_url,artwork_candidates_json,artwork_status,artwork_message,musicbrainz_recording_id,musicbrainz_release_id,release_country,release_date,release_type,release_secondary_types,is_compilation,duration_delta,score_breakdown,musicbrainz_artist_id,musicbrainz_album_artist_id,score,musicbrainz_release_group_id,musicbrainz_release_track_id,original_date,artist_sort,album_artist_sort";
 
 #[derive(Clone, Debug, Serialize, FromRow)]
 pub struct Track {
@@ -74,6 +74,11 @@ pub struct CandidateRow {
     pub(crate) musicbrainz_artist_id: Option<String>,
     pub(crate) musicbrainz_album_artist_id: Option<String>,
     pub(crate) score: f64,
+    pub(crate) musicbrainz_release_group_id: Option<String>,
+    pub(crate) musicbrainz_release_track_id: Option<String>,
+    pub(crate) original_date: Option<String>,
+    pub(crate) artist_sort: Option<String>,
+    pub(crate) album_artist_sort: Option<String>,
 }
 
 impl CandidateRow {
@@ -112,6 +117,11 @@ impl CandidateRow {
             artwork_message: self.artwork_message.clone(),
             recording_id: self.musicbrainz_recording_id.clone(),
             release_id: self.musicbrainz_release_id.clone(),
+            release_group_id: self.musicbrainz_release_group_id.clone(),
+            release_track_id: self.musicbrainz_release_track_id.clone(),
+            original_date: self.original_date.clone(),
+            artist_sort: self.artist_sort.clone(),
+            album_artist_sort: self.album_artist_sort.clone(),
             release_country: self.release_country.clone(),
             release_date: self.release_date.clone(),
             release_type: self.release_type.clone(),

@@ -1,11 +1,9 @@
-//! One file per song. Songs filed with separate lyrics and cover files get the
-//! lyrics put inside them, and the extra files go to the trash (kept for
-//! `MAGPIE_TRASH_DAYS`, so nothing is lost). Runs after the library index when
-//! `MAGPIE_SIDECARS` is off; with nothing left to tidy it only reads folders.
+//! Songs filed before lyrics went inside them get the lyrics from the `.lrc` or `.txt` next
+//! to them. The file stays: Navidrome reads it before the lyrics inside the song. Runs after
+//! the library index; with nothing left to do it only reads folders.
 
 use crate::{
     app::AppState,
-    application::library,
     domain::audio,
     infrastructure::{lyrics, media::tag_writer},
 };
@@ -14,21 +12,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Tidied {
-    /// Lyrics files now inside their song.
+    /// Songs that got the lyrics from the file next to them.
     pub lyrics: usize,
-    /// Album cover files removed because every song there has the cover inside.
-    pub covers: usize,
 }
 
-/// The cover files magpie-fi writes per album folder. Other images
-/// (`folder.jpg`, `front.png`) are the owner's and are left alone.
-const COVER_FILES: [&str; 4] = ["cover.jpg", "cover.png", "cover.webp", "cover.gif"];
-
 pub async fn embed_sidecars(state: &AppState) -> Result<Tidied> {
-    let library_root = PathBuf::from(&state.config.output_dir);
-    let trash = state.config.trash_dir.clone();
-    let root = library_root.clone();
-    let (songs, covers) = tokio::task::spawn_blocking(move || find_extra_files(&root)).await?;
+    let root = PathBuf::from(&state.config.output_dir);
+    let songs = tokio::task::spawn_blocking(move || find_lyrics_files(&root)).await?;
 
     let mut tidied = Tidied::default();
     for (song, sidecar) in songs {
@@ -36,32 +26,20 @@ pub async fn embed_sidecars(state: &AppState) -> Result<Tidied> {
         let embedded =
             tokio::task::spawn_blocking(move || embed_one(&song_path, &sidecar_path)).await?;
         match embedded {
-            Ok(()) => {
-                library::move_to_trash(&trash, &library_root, &sidecar).await?;
-                tidied.lyrics += 1;
-            }
+            Ok(true) => tidied.lyrics += 1,
+            Ok(false) => {}
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), song = %song.display(), "could not put the lyrics inside the song");
             }
         }
     }
-    for cover in covers {
-        let Some(folder) = cover.parent().map(Path::to_path_buf) else {
-            continue;
-        };
-        if tokio::task::spawn_blocking(move || every_song_has_a_cover(&folder)).await? {
-            library::move_to_trash(&trash, &library_root, &cover).await?;
-            tidied.covers += 1;
-        }
-    }
     Ok(tidied)
 }
 
-/// Songs with a `.lrc`/`.txt` next to them, and magpie-fi's album cover files.
-/// Hidden folders and files (work in progress, NAS metadata) are skipped.
-fn find_extra_files(library_root: &Path) -> (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>) {
+/// Songs with a `.lrc`/`.txt` next to them. Hidden folders and files (work in progress,
+/// NAS metadata) are skipped.
+fn find_lyrics_files(library_root: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut songs = Vec::new();
-    let mut covers = Vec::new();
     let entries = walkdir::WalkDir::new(library_root)
         .into_iter()
         .filter_entry(|entry| entry.depth() == 0 || !is_hidden(entry.path()))
@@ -69,16 +47,13 @@ fn find_extra_files(library_root: &Path) -> (Vec<(PathBuf, PathBuf)>, Vec<PathBu
         .filter(|entry| entry.file_type().is_file());
     for entry in entries {
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if COVER_FILES.contains(&name.as_str()) {
-            covers.push(path.to_path_buf());
-        } else if is_taggable(path)
+        if is_taggable(path)
             && let Some(sidecar) = lyrics::embeddable_sidecar(path)
         {
             songs.push((path.to_path_buf(), sidecar));
         }
     }
-    (songs, covers)
+    songs
 }
 
 fn is_hidden(path: &Path) -> bool {
@@ -102,15 +77,16 @@ fn is_taggable(path: &Path) -> bool {
 
 /// Puts the lyrics inside a copy of the song, checks them, then swaps the copy
 /// in. A song that already has lyrics inside keeps them; the file is untouched.
-fn embed_one(song: &Path, sidecar: &Path) -> Result<()> {
+/// Returns whether the song changed.
+fn embed_one(song: &Path, sidecar: &Path) -> Result<bool> {
     if tag_writer::read_lyrics(song)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let text = std::fs::read_to_string(sidecar)
         .with_context(|| format!("could not read {}", sidecar.display()))?;
     let text = text.trim_end();
     if text.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let name = song
         .file_name()
@@ -128,22 +104,7 @@ fn embed_one(song: &Path, sidecar: &Path) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    result
-}
-
-fn every_song_has_a_cover(folder: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return false;
-    };
-    let songs = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && !is_hidden(path) && audio::is_supported(path))
-        .collect::<Vec<_>>();
-    !songs.is_empty()
-        && songs.iter().all(|song| {
-            is_taggable(song) && tag_writer::read_artwork(song).ok().flatten().is_some()
-        })
+    result.map(|()| true)
 }
 
 #[cfg(test)]
@@ -152,7 +113,7 @@ mod tests {
     use crate::infrastructure::providers::Candidate;
 
     #[tokio::test]
-    async fn lyrics_and_covers_move_inside_the_songs() {
+    async fn lyrics_files_go_inside_the_songs_and_stay() {
         if std::process::Command::new("ffmpeg")
             .arg("-version")
             .output()
@@ -205,19 +166,14 @@ mod tests {
 
         let tidied = embed_sidecars(&state).await.unwrap();
 
-        assert_eq!(
-            tidied,
-            Tidied {
-                lyrics: 1,
-                covers: 1
-            }
-        );
+        assert_eq!(tidied, Tidied { lyrics: 1 });
         assert_eq!(
             tag_writer::read_lyrics(&song).unwrap().as_deref(),
             Some("[00:01.00] hello")
         );
-        assert!(!album.join("01 - Song.lrc").exists());
-        assert!(!album.join("cover.png").exists());
+        // Navidrome reads these before the song's own tags: they stay.
+        assert!(album.join("01 - Song.lrc").exists());
+        assert!(album.join("cover.png").exists());
         assert!(album.join("folder.jpg").exists());
         // Nothing is left to do the second time.
         assert_eq!(embed_sidecars(&state).await.unwrap(), Tidied::default());

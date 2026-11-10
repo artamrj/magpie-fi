@@ -207,6 +207,13 @@ fn candidate_from_recording(raw: &Value, id: &str) -> Candidate {
         .is_some_and(|value| value.to_ascii_lowercase().contains("compilation"));
     let media_track =
         release.and_then(|release| recording_track(release, id).map(|(_, track)| track));
+    let release_group_id = release_group
+        .and_then(|v| v["id"].as_str())
+        .map(str::to_owned);
+    let original_date = raw["first-release-date"]
+        .as_str()
+        .or_else(|| release_group.and_then(|v| v["first-release-date"].as_str()))
+        .map(str::to_owned);
     Candidate {
         provider: "musicbrainz".into(),
         title: raw["title"].as_str().unwrap_or("Unknown Title").into(),
@@ -251,6 +258,11 @@ fn candidate_from_recording(raw: &Value, id: &str) -> Candidate {
             .map(str::to_owned),
         recording_id: Some(id.into()),
         release_id: release_id.clone(),
+        release_group_id,
+        release_track_id: media_track
+            .and_then(|v| v["id"].as_str())
+            .map(str::to_owned),
+        original_date,
         artist_id: artist_obj.and_then(|v| v["id"].as_str()).map(str::to_owned),
         cover_url: release_id.map(|v| format!("https://coverartarchive.org/release/{v}/front-500")),
         raw_json: raw.to_string(),
@@ -370,6 +382,13 @@ fn candidate_from_search(raw: &Value) -> Candidate {
         is_compilation,
         recording_id: raw["id"].as_str().map(str::to_owned),
         release_id: release_id.clone(),
+        release_group_id: release_group
+            .and_then(|value| value["id"].as_str())
+            .map(str::to_owned),
+        original_date: raw["first-release-date"]
+            .as_str()
+            .or_else(|| release_group.and_then(|value| value["first-release-date"].as_str()))
+            .map(str::to_owned),
         artist_id: artist
             .and_then(|value| value["artist"]["id"].as_str())
             .map(str::to_owned),

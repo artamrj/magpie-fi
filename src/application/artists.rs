@@ -95,12 +95,50 @@ pub async fn resolve_candidates(
             .await?;
         if !candidate.artist_credits.is_empty() {
             candidate.artist = display_artist(&candidate.artist_credits);
+            candidate.artist_sort = sort_name(pool, &candidate.artist_credits).await?;
         }
         if !candidate.album_artist_credits.is_empty() {
             candidate.album_artist = Some(display_artist(&candidate.album_artist_credits));
+            candidate.album_artist_sort = sort_name(pool, &candidate.album_artist_credits).await?;
         }
     }
     Ok(())
+}
+
+/// The credit with every Persian-script name replaced by the artist's Latin spelling, for
+/// `ARTISTSORT`: Navidrome sorts Persian names after all Latin ones otherwise. `None` when
+/// nothing would change or no Latin spelling is known.
+async fn sort_name(pool: &SqlitePool, credits: &[ArtistCredit]) -> Result<Option<String>> {
+    let mut sorted = credits.to_vec();
+    let mut changed = false;
+    for credit in &mut sorted {
+        if !has_arabic_script(&credit.name) {
+            continue;
+        }
+        let Some(id) = credit.artist_id else {
+            continue;
+        };
+        if let Some(latin) = latin_spelling(pool, id).await? {
+            credit.name = latin;
+            changed = true;
+        }
+    }
+    Ok(changed.then(|| display_artist(&sorted)))
+}
+
+/// A Latin spelling remembered for this artist, the most trusted source first.
+async fn latin_spelling(pool: &SqlitePool, artist_id: i64) -> Result<Option<String>> {
+    let spellings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT spelling,source FROM artist_names WHERE artist_id=? AND latin_key IS NOT NULL",
+    )
+    .bind(artist_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(spellings
+        .into_iter()
+        .filter(|(spelling, _)| !has_arabic_script(spelling))
+        .max_by_key(|(_, source)| authority(source))
+        .map(|(spelling, _)| spelling))
 }
 
 /// Identities for plain names (from the tags of library files). Learns new ones.

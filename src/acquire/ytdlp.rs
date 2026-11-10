@@ -195,7 +195,7 @@ pub async fn playlist(config: &Config, url: &str) -> Result<Listing> {
     })
 }
 
-/// Downloads the audio into `folder` as `<stem>.<m4a|opus>`. YouTube's own
+/// Downloads the audio into `folder` as `<stem>.<opus|m4a>`. YouTube's own
 /// stream is kept (no re-encoding to another lossy format). The file is
 /// written under `folder/.part` first and moved into place when complete.
 pub async fn download(
@@ -206,7 +206,13 @@ pub async fn download(
 ) -> Result<PathBuf> {
     let part = folder.join(".part");
     tokio::fs::create_dir_all(&part).await?;
+    // `best` keeps the stream's own codec in its own container (Opus in .opus, AAC in .m4a).
+    // A named format re-encodes only when the chosen stream is not already that codec.
     let (selector, codec) = match config.audio_format {
+        AudioFormat::Best => (
+            "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
+            "best",
+        ),
         AudioFormat::M4a => ("bestaudio[ext=m4a]/bestaudio", "m4a"),
         AudioFormat::Opus => ("bestaudio[acodec=opus]/bestaudio", "opus"),
     };

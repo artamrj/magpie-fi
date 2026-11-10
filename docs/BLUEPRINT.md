@@ -287,18 +287,27 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 
 | What | Notes |
 |---|---|
-| Title, artist, `ARTISTS` (multi-value), album, album artist, `ALBUMARTISTS` | multi-value lets Navidrome link each featured artist |
-| Track and disc number and totals, date, genre, ISRC, label, language, composer | |
-| MusicBrainz recording, release, artist and album-artist IDs | only real MusicBrainz IDs; Navidrome uses them for stable album identity |
+| Title, artist, `ARTISTS` (multi-value), album, album artist, `ALBUMARTISTS` | multi-value lets Navidrome link each featured artist; in M4A all values go into one atom, since TagLib reads only the first of duplicated atoms |
+| `ARTISTSORT` / `ALBUMARTISTSORT` | the Latin spelling when the display name is Persian, so Navidrome sorts it among the Latin names |
+| Track and disc number and totals, genre, ISRC, label, language, composer | |
+| `DATE` (year), `RELEASEDATE` (full date when known), `ORIGINALDATE` (first release) | Navidrome groups and sorts albums by the release date |
+| MusicBrainz recording, release, release-group, release-track, artist and album-artist IDs | only real MusicBrainz IDs; release and release-track IDs give Navidrome stable album and track identity across renames |
 | Release type (`RELEASETYPE` / "MusicBrainz Album Type"), compilation flag | Navidrome can show albums, singles and EPs apart |
-| Embedded front cover | verified, matching the release |
+| Embedded front cover, JPEG at most 1200 px; the same image as `cover.jpg` in the album folder | verified, matching the release; Navidrome looks for `cover.jpg` first |
 | ReplayGain track + album (`rsgain easy` per album folder) | R128 tags for Opus; skipped with a warning if rsgain is missing |
 | Lyrics from LRCLIB, inside the song: LRC text with timestamps (synced) or plain | `LYRICS` (FLAC/Opus), `©lyr` (M4A), `USLT` (MP3); lyrics already inside a file are kept |
-| Only with `MAGPIE_SIDECARS=true`: `cover.jpg` per album folder, `.lrc`/`.txt` next to the song | for players that only read separate files; never overwrites existing ones |
+| Synced lyrics also as `<song>.lrc` next to the song | Navidrome reads the file before the tag, Symfonium the tag before the server; never overwrites an existing lyrics file |
+| With `MAGPIE_SIDECARS=true`: nothing inside the song; `.lrc`/`.txt` next to it | for players that only read separate files |
 | `Playlists/<Owner - Name>.m3u8` | one per playlist link, in the link's order |
 
 Tags are written and verified on a temporary copy **before** the file enters `library/`, so
 Navidrome never sees a half-tagged file and never sees a retag and a move in one scan.
+
+**Formats.** Nothing lossy is ever re-encoded: a song keeps the codec it arrived with. Links
+are downloaded with `MAGPIE_AUDIO_FORMAT=best` (the default): YouTube's Opus stream in `.opus`,
+AAC in `.m4a` where that is all there is. Sent files stay MP3, M4A, FLAC or Opus. WAV and AIFF
+become FLAC when filed (lossless to lossless; they cannot be tagged). Damaged files are the one
+exception: repair re-encodes within the same codec.
 
 ### 5.4 Artists
 
