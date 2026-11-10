@@ -90,23 +90,30 @@ async fn main() -> Result<()> {
                     Ok(count) => tracing::info!(count, "indexed library files"),
                     Err(error) => tracing::warn!(%error, "library indexing failed"),
                 }
-                if !inbox_state.config.sidecars
-                    && inbox_state
-                        .try_claim_workflow(
-                            types::WorkflowPhase::Apply,
-                            "Putting lyrics and covers inside the songs",
-                        )
-                        .await
+                if inbox_state
+                    .try_claim_workflow(types::WorkflowPhase::Apply, "Tidying the library")
+                    .await
                 {
-                    match application::tidy::embed_sidecars(&inbox_state).await {
-                        Ok(tidied) if tidied.lyrics + tidied.covers > 0 => tracing::info!(
-                            lyrics = tidied.lyrics,
-                            covers = tidied.covers,
-                            "moved lyrics and covers inside the songs; the separate files are in the trash"
-                        ),
-                        Ok(_) => {}
+                    match application::artist_changes::split_featured_artists(&inbox_state).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::info!(count, "split featured artists out of artist names")
+                        }
                         Err(error) => {
-                            tracing::warn!(%error, "tidying lyrics and cover files failed")
+                            tracing::warn!(%error, "splitting featured artist names failed")
+                        }
+                    }
+                    if !inbox_state.config.sidecars {
+                        match application::tidy::embed_sidecars(&inbox_state).await {
+                            Ok(tidied) if tidied.lyrics + tidied.covers > 0 => tracing::info!(
+                                lyrics = tidied.lyrics,
+                                covers = tidied.covers,
+                                "moved lyrics and covers inside the songs; the separate files are in the trash"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "tidying lyrics and cover files failed")
+                            }
                         }
                     }
                     inbox_state

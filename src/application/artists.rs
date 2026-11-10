@@ -146,7 +146,7 @@ impl Resolver<'_> {
         seen: &mut HashMap<String, String>,
     ) -> Result<Vec<ArtistCredit>> {
         let mut out: Vec<ArtistCredit> = Vec::with_capacity(credits.len());
-        for credit in credits {
+        for credit in credits.into_iter().flat_map(split_featured) {
             for mut part in self.split(credit).await? {
                 self.resolve(&mut part, source, seen).await?;
                 // The same artist twice in one credit ("Ebi & Ebi") is shown once.
@@ -343,6 +343,24 @@ async fn musicbrainz_identities(
         }
     }
     out
+}
+
+/// "Tommee Profitt feat. Fleurie" in one credit (some sources send it so) is
+/// always two artists: `feat.`, `ft.`, `/` and `;` never belong to a name.
+fn split_featured(credit: ArtistCredit) -> Vec<ArtistCredit> {
+    let parts = crate::domain::credits::normalize_featured(&credit.name, "").artists;
+    if parts.len() < 2 {
+        return vec![credit];
+    }
+    let last_join = credit.join_phrase.clone();
+    let mut parts = parts;
+    if let Some(first) = parts.first_mut() {
+        first.musicbrainz_id = credit.musicbrainz_id;
+    }
+    if let Some(last) = parts.last_mut() {
+        last.join_phrase = last_join;
+    }
+    parts
 }
 
 fn split_on_separators(name: &str) -> Vec<ArtistCredit> {
@@ -550,6 +568,29 @@ mod tests {
         let again = learn(&pool, "itunes", "Simon and Garfunkel").await;
         assert_eq!(again.artist_credits.len(), 1);
         assert_eq!(again.artist, "Simon & Garfunkel");
+    }
+
+    #[tokio::test]
+    async fn a_featured_artist_inside_one_credit_is_split_off() {
+        let (_directory, pool) = pool().await;
+        let mut candidate = song("deezer", "Tommee Profitt");
+        candidate.album_artist = Some("Tommee Profitt feat. Fleurie".into());
+        candidate.album_artist_credits =
+            vec![ArtistCredit::new("Tommee Profitt feat. Fleurie", "")];
+        let mut candidates = vec![candidate];
+        resolve_candidates(&pool, None, &mut candidates, Mode::Learn)
+            .await
+            .unwrap();
+        let names = candidates[0]
+            .album_artist_credits
+            .iter()
+            .map(|credit| credit.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Tommee Profitt", "Fleurie"]);
+        assert_eq!(
+            candidates[0].album_artist.as_deref(),
+            Some("Tommee Profitt feat. Fleurie")
+        );
     }
 
     #[tokio::test]

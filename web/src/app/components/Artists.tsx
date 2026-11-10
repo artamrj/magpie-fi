@@ -7,7 +7,7 @@ import { Icon } from "../Icons";
 import { askConfirm } from "../telegram";
 import { EmptyState } from "./EmptyStates";
 
-const SEPARATORS = /\s+(?:&|x|X|×|و|with|With|vs\.?)\s+|\s*[,،]\s*/;
+const SEPARATORS = /\s+(?:&|x|X|×|و|with|With|vs\.?|feat\.?|ft\.?|featuring)\s+|\s*[,،]\s*/;
 
 const MOVE_WARNING =
   "Their artist tags are rewritten and they move to the right artist folder. Navidrome may see them as new songs, so their play counts and stars can start again.";

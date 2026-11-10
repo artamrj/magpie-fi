@@ -74,9 +74,11 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ArtistSummary>> {
                 spellings.sort();
                 spellings.dedup();
                 let looks_like_several = !single_entity
-                    && [" & ", ", ", " x ", " X ", " و ", "، ", " with ", " vs "]
-                        .iter()
-                        .any(|separator| name.contains(separator));
+                    && [
+                        " & ", ", ", " x ", " X ", " و ", "، ", " with ", " vs ", " feat", " ft. ",
+                    ]
+                    .iter()
+                    .any(|separator| name.contains(separator));
                 ArtistSummary {
                     id,
                     name,
@@ -194,6 +196,47 @@ pub async fn split(state: &Arc<AppState>, id: i64, parts: &[String]) -> Result<C
     transaction.commit().await?;
     replace_ids(&state.pool, id, &part_ids).await?;
     rewrite_songs(state, part_ids[0], &spellings, &part_names).await
+}
+
+/// Artists learned with a featured artist inside their name ("Tommee Profitt
+/// feat. Fleurie", from a source that sent it as one name) are split into
+/// their artists, and their songs move to the main artist's folder. `feat.`
+/// never belongs to a name, so this needs no owner decision. Returns how many.
+pub async fn split_featured_artists(state: &Arc<AppState>) -> Result<usize> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id,name FROM artists
+         WHERE name LIKE '% feat. %' OR name LIKE '% feat %' OR name LIKE '% ft. %'
+            OR name LIKE '% ft %' OR name LIKE '% featuring %'",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let mut done = 0;
+    for (id, name) in rows {
+        let parts = crate::domain::credits::normalize_featured(&name, "")
+            .artists
+            .into_iter()
+            .map(|credit| credit.name)
+            .collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        match split(state, id, &parts).await {
+            Ok(changed) => {
+                tracing::info!(
+                    artist = name,
+                    moved = changed.moved,
+                    "split a featured artist out of an artist name"
+                );
+                done += 1;
+            }
+            Err(error) => tracing::warn!(
+                artist = name,
+                error = format!("{error:#}"),
+                "could not split a featured artist"
+            ),
+        }
+    }
+    Ok(done)
 }
 
 /// "This is one artist" (a band or duo with "&" in its name): never split it.
@@ -646,6 +689,66 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].songs, 2);
         assert!(listed[0].spellings.contains(&"گوگوش".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_featured_artist_folder_is_repaired() {
+        if !installed() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path()).await;
+        // Learned by an older version as one artist, with its own folder.
+        sqlx::query("INSERT INTO artists(id,name,created_at,updated_at) VALUES(50,'Tommee Profitt feat. Fleurie','now','now')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO artist_names(match_key,artist_id,spelling,source) VALUES(?,50,'Tommee Profitt feat. Fleurie','old')")
+            .bind(match_key("Tommee Profitt feat. Fleurie"))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let relative = "Tommee Profitt feat. Fleurie/In the End (2019)/02 - In the End.m4a";
+        let path = PathBuf::from(&state.config.output_dir).join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.2")
+            .args(["-c:a", "aac"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let candidate = Candidate {
+            title: "In the End".into(),
+            artist: "Tommee Profitt feat. Fleurie".into(),
+            album: Some("In the End".into()),
+            album_artist: Some("Tommee Profitt feat. Fleurie".into()),
+            artist_credits: vec![ArtistCredit::new("Tommee Profitt feat. Fleurie", "")],
+            ..Default::default()
+        };
+        tag_writer::write(&path, &candidate, None, None).unwrap();
+        library::remember(
+            &state.pool,
+            &library::LibraryEntry {
+                path: path.to_string_lossy().into_owned(),
+                title: Some("In the End".into()),
+                format: "m4a".into(),
+                source: "inbox".into(),
+                artist_ids: vec![50],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(split_featured_artists(&state).await.unwrap(), 1);
+
+        let moved = PathBuf::from(&state.config.output_dir)
+            .join("Tommee Profitt/In the End (2019)/02 - In the End.m4a");
+        assert!(moved.is_file() && !path.exists());
+        assert_eq!(artists_tag(&moved), ["Tommee Profitt", "Fleurie"]);
+        assert_eq!(split_featured_artists(&state).await.unwrap(), 0);
     }
 
     #[tokio::test]

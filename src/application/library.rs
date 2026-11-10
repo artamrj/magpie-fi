@@ -37,10 +37,17 @@ pub fn destination(library: &Path, candidate: &Candidate, extension: &str) -> Pa
     let album_artist = if compilation {
         VARIOUS_ARTISTS.to_owned()
     } else {
+        // A featured artist never names a folder, whatever a source sent.
+        let without_featured = |name: &str| {
+            credits::normalize_featured(name, "")
+                .artists
+                .first()
+                .map_or_else(|| name.to_owned(), |credit| credit.name.clone())
+        };
         let declared = candidate
             .album_artist_credits
             .first()
-            .map(|credit| credit.name.clone())
+            .map(|credit| without_featured(&credit.name))
             .or_else(|| {
                 candidate
                     .album_artist
@@ -859,6 +866,20 @@ mod tests {
             path(&value, "m4a"),
             "/lib/Ebi/Song (2024) [Single]/01 - Song.m4a"
         );
+    }
+
+    #[test]
+    fn a_featured_album_artist_never_names_the_folder() {
+        let mut value = candidate();
+        value.title = "In the End".into();
+        value.artist = "Tommee Profitt".into();
+        value.album = Some("In the End".into());
+        value.album_artist = Some("Tommee Profitt feat. Fleurie".into());
+        value.album_artist_credits = vec![crate::domain::credits::ArtistCredit::new(
+            "Tommee Profitt feat. Fleurie",
+            "",
+        )];
+        assert!(path(&value, "m4a").starts_with("/lib/Tommee Profitt/"));
     }
 
     #[test]

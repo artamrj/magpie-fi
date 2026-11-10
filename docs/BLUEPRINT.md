@@ -289,6 +289,9 @@ name in `ARTISTS` / `ALBUMARTISTS` and one folder:
   and the whole is not known as one (a band or duo with an MBID, or marked by you).
 - New artists are learned only when a song is filed or the library is indexed, never from search
   results.
+- `feat.`, `ft.`, `featuring`, `/` and `;` always separate artists, even inside one name a source
+  sent (`Tommee Profitt feat. Fleurie`). Artists learned that way by older versions are split
+  automatically after indexing; their songs move to the main artist's folder.
 - The **Artists** page lists them with their spellings: rename, join two, split a duet, or mark
   "one artist". The songs are retagged and moved; Navidrome may then see them as new songs.
 
