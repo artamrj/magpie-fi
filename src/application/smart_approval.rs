@@ -1,3 +1,5 @@
+use crate::domain::versions;
+pub(crate) use crate::domain::versions::version_tags;
 use crate::infrastructure::providers::Candidate;
 use std::collections::{BTreeSet, HashSet};
 
@@ -122,11 +124,23 @@ fn evaluate<'a>(
 ) -> Evaluated<'a> {
     let title_similarity = evidence
         .title
-        .map(|title| title_similarity(title, &candidate.title))
+        .map(|title| {
+            title_similarity(title, &candidate.title).max(versions::version_aware_title_similarity(
+                title,
+                &candidate.title,
+            ))
+        })
         .unwrap_or(0.5);
     let artist_similarity = evidence
         .artist
-        .map(|artist| artist_similarity(artist, &candidate.artist))
+        .map(|artist| {
+            artist_similarity(artist, &candidate.artist).max(versions::credited_artist_similarity(
+                artist,
+                evidence.title.unwrap_or_default(),
+                &candidate.artist,
+                &candidate.title,
+            ))
+        })
         .unwrap_or(0.5);
     let variants = version_tags(&candidate.title);
     let variant_conflict = variants != *expected_variants;
@@ -260,6 +274,8 @@ fn is_supported(candidate: &Evaluated<'_>) -> bool {
         && candidate.artist_available
         && candidate.title_similarity >= 0.90
         && candidate.artist_similarity >= 0.82;
+    // Upload sites (Audiomack, SoundCloud, YouTube) show whatever the uploader
+    // typed, often the same wrong tags as the file: alone they prove nothing.
     let credible_catalog = matches!(
         candidate.candidate.provider.as_str(),
         "itunes"
@@ -267,7 +283,6 @@ fn is_supported(candidate: &Evaluated<'_>) -> bool {
             | "musicbrainz"
             | "spotify"
             | "radiojavan"
-            | "audiomack"
             | "navahang"
             | "shazam"
             | "genius"
@@ -298,7 +313,9 @@ fn same_recording(left: &Evaluated<'_>, right: &Evaluated<'_>) -> bool {
     }
     left.variants == right.variants
         && title_similarity(&left.candidate.title, &right.candidate.title) >= 0.90
-        && artist_similarity(&left.candidate.artist, &right.candidate.artist) >= 0.82
+        && artist_similarity(&left.candidate.artist, &right.candidate.artist).max(
+            versions::artists_similarity(&left.candidate.artist, &right.candidate.artist),
+        ) >= 0.82
 }
 
 fn candidates_agree(left: &Candidate, right: &Candidate) -> bool {
@@ -306,7 +323,9 @@ fn candidates_agree(left: &Candidate, right: &Candidate) -> bool {
     let right_variants = version_tags(&right.title);
     left_variants == right_variants
         && title_similarity(&left.title, &right.title) >= 0.90
-        && artist_similarity(&left.artist, &right.artist) >= 0.82
+        && artist_similarity(&left.artist, &right.artist)
+            .max(versions::artists_similarity(&left.artist, &right.artist))
+            >= 0.82
 }
 
 pub(crate) fn has_audio_recognition(candidate: &Candidate) -> bool {
@@ -378,37 +397,13 @@ fn meaningful_album(album: Option<&str>) -> Option<&str> {
 
 fn provider_trust(provider: &str) -> f64 {
     match provider {
-        "spotify" | "itunes" | "deezer" | "musicbrainz" | "radiojavan" | "audiomack"
-        | "navahang" | "shazam" | "genius" => 5.0,
+        "spotify" | "itunes" | "deezer" | "musicbrainz" | "radiojavan" | "navahang" | "shazam"
+        | "genius" => 5.0,
         "audd" | "acoustid" | "songrec" => 4.0,
-        "discogs" | "soundcloud" => 2.0,
+        "discogs" | "soundcloud" | "audiomack" => 2.0,
         "lastfm" | "youtube" => 1.0,
         _ => 0.0,
     }
-}
-
-pub(crate) fn version_tags(value: &str) -> BTreeSet<&'static str> {
-    let normalized = normalized_text(value);
-    let words = normalized.split_whitespace().collect::<HashSet<_>>();
-    let mut tags = BTreeSet::new();
-    for (tag, aliases) in [
-        ("live", &["live"] as &[&str]),
-        ("remix", &["remix", "mix"] as &[&str]),
-        ("acoustic", &["acoustic", "unplugged"] as &[&str]),
-        ("instrumental", &["instrumental"] as &[&str]),
-        ("karaoke", &["karaoke"] as &[&str]),
-        ("demo", &["demo"] as &[&str]),
-        ("stripped", &["stripped"] as &[&str]),
-        ("sped", &["sped"] as &[&str]),
-        ("slowed", &["slowed"] as &[&str]),
-        ("duet", &["duet"] as &[&str]),
-        ("symphony", &["symphony", "symphonic"] as &[&str]),
-    ] {
-        if aliases.iter().any(|alias| words.contains(alias)) {
-            tags.insert(tag);
-        }
-    }
-    tags
 }
 
 fn title_similarity(left: &str, right: &str) -> f64 {
@@ -488,6 +483,179 @@ mod tests {
             score_breakdown: Some(serde_json::json!({"sources":[provider]}).to_string()),
             ..Default::default()
         }
+    }
+
+    fn performed(
+        id: i64,
+        provider: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        delta: f64,
+    ) -> Candidate {
+        Candidate {
+            artist: artist.into(),
+            duration_delta: Some(delta),
+            cover_url: Some("https://example.test/cover.jpg".into()),
+            year: Some("2020".into()),
+            ..candidate(id, provider, title, album, 85.0)
+        }
+    }
+
+    #[test]
+    fn a_remix_is_found_from_the_names_in_its_title() {
+        // The file says Linkin Park; the remix is credited to the remixers.
+        let evidence = TrackEvidence {
+            filename: "u9.mp3",
+            title: Some("In The End  (Mellen Gi & Tommee Profitt Remix)"),
+            artist: Some("Linkin Park"),
+            album: None,
+        };
+        let candidates = vec![
+            // Upload-site copies with the file's own wrong credit.
+            performed(
+                1,
+                "audiomack",
+                "In The End (Mellen Gi & Tommee Profitt Remix)",
+                "Linkin Park",
+                "",
+                0.0,
+            ),
+            performed(
+                2,
+                "audiomack",
+                "In The End (Mellen Gi Tommee Profitt Remix)",
+                "Linkin Park",
+                "",
+                3.0,
+            ),
+            // The official recordings.
+            performed(
+                3,
+                "itunes",
+                "In the End (Mellen Gi Remix)",
+                "Tommee Profitt, Mellen Gi & Fleurie",
+                "In the End - Single",
+                0.0,
+            ),
+            // The same recording again, with the artists in another order.
+            performed(
+                6,
+                "itunes",
+                "In The End (Mellen Gi Remix)",
+                "Tommee Profitt, Fleurie & Mellen Gi",
+                "The Remixes, Vol. 1 - EP",
+                0.0,
+            ),
+            performed(
+                4,
+                "itunes",
+                "In The End (Mellen Gi Remix/Slowed Down)",
+                "Tommee Profitt, Fleurie & Mellen Gi",
+                "In The End (Anniversary Edition) - EP",
+                38.0,
+            ),
+            performed(
+                5,
+                "itunes",
+                "In the End",
+                "LINKIN PARK",
+                "Hybrid Theory",
+                2.0,
+            ),
+        ];
+        let decision = rank(evidence, &candidates).expect("the official remix is chosen");
+        assert!(matches!(
+            candidates[decision.candidate_index].id,
+            Some(3 | 6)
+        ));
+    }
+
+    #[test]
+    fn an_upload_site_alone_never_decides() {
+        let evidence = TrackEvidence {
+            filename: "song.mp3",
+            title: Some("Some Song"),
+            artist: Some("Some Artist"),
+            album: None,
+        };
+        let candidates = vec![performed(
+            1,
+            "audiomack",
+            "Some Song",
+            "Some Artist",
+            "",
+            0.0,
+        )];
+        assert!(rank(evidence, &candidates).is_none());
+    }
+
+    #[test]
+    fn a_cover_is_matched_to_its_own_performer() {
+        let evidence = TrackEvidence {
+            filename: "The Macarons Project - Fly me to the moon (u6).mp3",
+            title: Some("Fly me to the moon"),
+            artist: Some("The Macarons Project"),
+            album: None,
+        };
+        let candidates = vec![
+            performed(
+                1,
+                "itunes",
+                "Fly Me to the Moon (feat. Count Basie and His Orchestra)",
+                "Frank Sinatra",
+                "Ultimate Sinatra",
+                7.0,
+            ),
+            performed(
+                2,
+                "itunes",
+                "Fly Me to the Moon",
+                "The Macarons Project",
+                "Fly Me to the Moon - Single",
+                0.0,
+            ),
+            performed(
+                3,
+                "deezer",
+                "Fly Me To The Moon",
+                "Bobby Womack",
+                "Fly Me To The Moon",
+                27.0,
+            ),
+        ];
+        let decision = rank(evidence, &candidates).expect("the cover's own release is chosen");
+        assert_eq!(candidates[decision.candidate_index].id, Some(2));
+    }
+
+    #[test]
+    fn credits_in_titles_are_read() {
+        assert_eq!(
+            versions::title_credits("In The End (Mellen Gi & Tommee Profitt Remix)"),
+            ["Mellen Gi", "Tommee Profitt"]
+        );
+        assert_eq!(
+            versions::title_credits("Song (feat. Fleurie) [Extended Mix]"),
+            ["Fleurie"]
+        );
+        assert!(versions::title_credits("Song (Radio Edit)").is_empty());
+        assert_eq!(
+            versions::base_title("In the End (Mellen Gi Remix)"),
+            "In the End"
+        );
+        assert!(
+            versions::version_aware_title_similarity(
+                "In The End (Mellen Gi & Tommee Profitt Remix)",
+                "In the End (Mellen Gi Remix)"
+            ) >= 0.95
+        );
+        // Another remixer is another version.
+        assert!(
+            versions::version_aware_title_similarity(
+                "In The End (Mellen Gi Remix)",
+                "In the End (Steve Aoki Remix)"
+            ) < 0.95
+        );
     }
 
     #[test]

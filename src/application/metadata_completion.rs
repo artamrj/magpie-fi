@@ -497,10 +497,12 @@ pub(crate) fn same_recording(left: &Candidate, right: &Candidate) -> bool {
     {
         return true;
     }
-    crate::application::smart_approval::version_tags(&left.title)
-        == crate::application::smart_approval::version_tags(&right.title)
+    crate::domain::versions::version_tags(&left.title)
+        == crate::domain::versions::version_tags(&right.title)
         && text_similarity(&left.title, &right.title) >= 0.90
-        && text_similarity(&left.artist, &right.artist) >= 0.82
+        && text_similarity(&left.artist, &right.artist).max(
+            crate::domain::versions::artists_similarity(&left.artist, &right.artist),
+        ) >= 0.82
         && match (left.duration_delta, right.duration_delta) {
             (Some(left), Some(right)) => left <= 15.0 && right <= 15.0,
             _ => true,

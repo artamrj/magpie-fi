@@ -33,6 +33,8 @@ pub fn sounds_the_same(left: (&[u32], Option<f64>), right: (&[u32], Option<f64>)
         _ => false,
     };
     close
+        && crate::domain::fingerprint::is_distinctive(left.0)
+        && crate::domain::fingerprint::is_distinctive(right.0)
         && crate::domain::fingerprint::similarity(left.0, right.0)
             >= crate::domain::fingerprint::SAME_RECORDING
 }
@@ -43,9 +45,21 @@ pub struct DuplicateGroup {
     pub members: Vec<usize>,
 }
 
+/// The content key of a fingerprint. `None` for empty fingerprints and for
+/// ones that cannot tell songs apart (silence, a steady tone): two different
+/// silent files have the same fingerprint.
 pub fn fingerprint_key(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty()).then(|| format!("fp:{}", hex::encode(Sha256::digest(value.as_bytes()))))
+    if value.is_empty()
+        || crate::domain::fingerprint::decode(value)
+            .is_some_and(|raw| !crate::domain::fingerprint::is_distinctive(&raw))
+    {
+        return None;
+    }
+    Some(format!(
+        "fp:{}",
+        hex::encode(Sha256::digest(value.as_bytes()))
+    ))
 }
 
 pub fn hash_key(value: &str) -> String {

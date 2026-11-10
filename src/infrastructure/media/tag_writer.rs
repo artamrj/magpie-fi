@@ -243,6 +243,50 @@ pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
     Ok(changed)
 }
 
+/// Writes the title and performer Telegram shows for a sent file into it.
+/// Files forwarded from music channels often have no tags or a channel's name
+/// as artist, while the message carries the right ones (for your own files
+/// they are the same as the tags). Promotional values are ignored. Returns
+/// whether anything was written.
+pub fn apply_telegram_details(
+    path: &Path,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> Result<bool> {
+    let usable = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !crate::domain::audio::is_promotional(value))
+            .map(str::to_owned)
+    };
+    let (title, artist) = (usable(title), usable(artist));
+    if title.is_none() && artist.is_none() {
+        return Ok(false);
+    }
+    let mut file = Probe::open(path)?.guess_file_type()?.read()?;
+    if file.primary_tag().is_none() {
+        file.insert_tag(Tag::new(file.primary_tag_type()));
+    }
+    let tag = file.primary_tag_mut().expect("primary tag present");
+    let mut changed = false;
+    if let Some(title) = title
+        && tag.title().as_deref() != Some(title.as_str())
+    {
+        tag.set_title(title);
+        changed = true;
+    }
+    if let Some(artist) = artist
+        && tag.artist().as_deref() != Some(artist.as_str())
+    {
+        tag.set_artist(artist);
+        changed = true;
+    }
+    if changed {
+        file.save_to_path(path, WriteOptions::default())?;
+    }
+    Ok(changed)
+}
+
 pub fn verify_lyrics(path: &Path, expected: &str) -> Result<()> {
     let written = read_lyrics(path)?.unwrap_or_default();
     if written.trim() != expected.trim() {
@@ -714,6 +758,54 @@ mod tests {
 
         let file = Probe::open(&path).unwrap().read().unwrap();
         assert_eq!(file.primary_tag().unwrap().pictures()[0].data(), artwork);
+    }
+
+    #[test]
+    fn telegram_details_replace_channel_tags() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("u6.mp3");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.2")
+            .args(["-map_metadata", "-1"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            apply_telegram_details(
+                &path,
+                Some("Fly me to the moon"),
+                Some("The Macarons Project")
+            )
+            .unwrap()
+        );
+        let read = |path: &Path| {
+            let file = Probe::open(path).unwrap().read().unwrap();
+            let tag = file.primary_tag().unwrap();
+            (
+                tag.title().map(|value| value.into_owned()),
+                tag.artist().map(|value| value.into_owned()),
+            )
+        };
+        assert_eq!(
+            read(&path),
+            (
+                Some("Fly me to the moon".into()),
+                Some("The Macarons Project".into())
+            )
+        );
+        // Tags that are there already win over Telegram's.
+        // A channel's name from Telegram never replaces a real artist.
+        assert!(!apply_telegram_details(&path, None, Some("@MusicBox")).unwrap());
+        assert_eq!(read(&path).1.as_deref(), Some("The Macarons Project"));
     }
 
     #[test]

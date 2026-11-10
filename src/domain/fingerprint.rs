@@ -150,6 +150,19 @@ fn read_packed(bytes: &[u8], index: usize, width: usize) -> Option<u8> {
 ///   different parts of one song can reach ~0.7
 ///
 /// See [`SAME_RECORDING`] for the threshold and the numbers behind it.
+/// A fingerprint that can tell songs apart. Silence, a steady tone or one
+/// held chord give the same value over and over (0% distinct values, and two
+/// different tones still score 0.91 "similar"); real music changes all the
+/// time (92–97% distinct values measured). Below half distinct, the
+/// fingerprint proves nothing.
+pub fn is_distinctive(raw: &[u32]) -> bool {
+    if raw.len() < MIN_OVERLAP {
+        return false;
+    }
+    let distinct = raw.iter().collect::<std::collections::HashSet<_>>().len();
+    distinct * 2 >= raw.len()
+}
+
 pub fn similarity(a: &[u32], b: &[u32]) -> f64 {
     let mut best = 0.0f64;
     for offset in -MAX_OFFSET..=MAX_OFFSET {
@@ -184,6 +197,20 @@ pub fn same_recording(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_and_steady_tones_prove_nothing() {
+        assert!(!is_distinctive(&vec![0x1234_5678; 900]));
+        assert!(!is_distinctive(&[1, 2, 3]));
+        let music = (0..900_u32)
+            .map(|value| value.wrapping_mul(2_654_435_761))
+            .collect::<Vec<_>>();
+        assert!(is_distinctive(&music));
+        // A song with a long silent intro still counts.
+        let mut intro = vec![0; 300];
+        intro.extend_from_slice(&music[..600]);
+        assert!(is_distinctive(&intro));
+    }
 
     /// `fpcalc -json` (fpcalc 1.6.1) of the first 15 s of a synthetic test
     /// song, saved as FLAC.

@@ -193,7 +193,7 @@ step now. `src/application/apply.rs`:
 
 | Part | File | Job |
 |---|---|---|
-| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube, the Shazam provider. Only public pages and documented APIs. |
+| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube; Shazam `/song/<n>/` links through the iTunes Lookup API (the number is the Apple Music ID; Shazam's pages refuse automated requests), the Shazam page only as a fallback. Only public pages and documented APIs. |
 | Queue | `store.rs` | `requests`, `wanted`, `playlists`. Retries after 30 s, 2 min, 10 min; then failed. A request's `title` falls back to its first song. |
 | Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first, ordinary videos only as a strict fallback. |
 | yt-dlp | `ytdlp.rs` | YouTube Music search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
@@ -288,6 +288,21 @@ A candidate is approved automatically only when:
 
 Everything else stays in Review with a reason.
 
+**Titles and artists** are compared the same way in the per-source score and here
+(`domain::versions`):
+
+- Names credited in a title count as artists of the song: "In The End (Mellen Gi & Tommee
+  Profitt Remix)" tagged *Linkin Park* matches "In the End (Mellen Gi Remix)" by *Tommee Profitt,
+  Mellen Gi & Fleurie* (two shared names = full artist match, one = 0.85).
+- Two remix (live, acoustic…) titles match when the song and the remixer agree.
+- Artist lists are compared as sets of people: "A, B & C" = "A, C & B".
+- **Upload sites** (Audiomack, SoundCloud, YouTube) show what the uploader typed, often the same
+  wrong tags as the file, so they are not an exact catalog match by themselves.
+
+**Tags that advertise** a channel or site (`@Channel`, `t.me/…`, `www.….ir`, `کانال …`) count as
+no tag; a "Artist - Title" file name is then used. Files sent to the Telegram bot get Telegram's
+title and performer written into them and are named `Artist - Title (u6).ext`.
+
 ---
 
 ## 10. Source cascade
@@ -298,7 +313,8 @@ cheap and free ones first:
 1. **AcoustID** (fingerprint, needs `MAGPIE_ACOUSTID_KEY`) → **MusicBrainz** recordings.
 2. **YouTube Data API**, only if the filename contains a video ID (needs a key).
 3. **MusicBrainz** text search.
-4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack**, **Navahang** — free
+4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack** (an upload site),
+   **Navahang** — free
    catalogs, good for Persian and international music.
 5. **Genius**, only when the results still lack details.
 6. **SongRec** (Shazam recognition), only when AcoustID found nothing and no candidate scores

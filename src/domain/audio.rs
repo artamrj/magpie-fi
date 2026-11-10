@@ -190,6 +190,19 @@ fn fill_from_filename(path: &Path, info: &mut AudioInfo) {
         .and_then(|value| value.to_str())
         .unwrap_or("Unknown track")
         .replace('_', " ");
+    // Files sent to the Telegram bot are named "Artist - Title (u6)".
+    let stem = match stem
+        .trim_end()
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (u"))
+    {
+        Some((before, number))
+            if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            before.to_owned()
+        }
+        _ => stem,
+    };
     if let Some((artist, title)) = filename_artist_title(&stem) {
         // A clear "Artist – Title" filename is better search evidence than
         // placeholder tags commonly written by downloaders and converters.
@@ -197,7 +210,7 @@ fn fill_from_filename(path: &Path, info: &mut AudioInfo) {
             info.artist = Some(artist.to_owned());
             info.title = Some(title.to_owned());
         }
-    } else if is_placeholder_tag(info.title.as_deref()) {
+    } else if is_placeholder_tag(info.title.as_deref()) && !is_upload_number(&stem) {
         info.title = Some(stem.trim().to_owned());
     }
 
@@ -207,6 +220,13 @@ fn fill_from_filename(path: &Path, info: &mut AudioInfo) {
     if is_placeholder_tag(info.album_artist.as_deref()) {
         info.album_artist = None;
     }
+}
+
+/// `u6`: how older versions named files sent to the Telegram bot. It is no title.
+fn is_upload_number(stem: &str) -> bool {
+    stem.trim()
+        .strip_prefix('u')
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn filename_artist_title(stem: &str) -> Option<(&str, &str)> {
@@ -225,15 +245,72 @@ fn is_placeholder_tag(value: Option<&str>) -> bool {
         return true;
     };
     let normalized = value.to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "unknown" | "unknown artist" | "unknown album" | "unknown title" | "untitled"
-    ) || normalized
-        .strip_prefix("track ")
-        .is_some_and(|number| !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()))
+    is_promotional(value)
+        || matches!(
+            normalized.as_str(),
+            "unknown" | "unknown artist" | "unknown album" | "unknown title" | "untitled"
+        )
+        || normalized.strip_prefix("track ").is_some_and(|number| {
+            !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+        })
+}
+
+/// A channel or site advertising itself in a tag (`@RadioJavanBot`,
+/// `t.me/music`, `www.example.ir`, `Telegram: MusicChannel`, `کانال …`). Such
+/// an artist or album says nothing about the song.
+pub fn is_promotional(value: &str) -> bool {
+    let lower = value.trim().to_lowercase();
+    lower.starts_with('@')
+        || [
+            "t.me/",
+            "telegram",
+            "http://",
+            "https://",
+            "www.",
+            "instagram",
+            "youtube.com",
+            "کانال",
+            "channel",
+            "join us",
+            "subscribe",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || lower.split_whitespace().any(|word| {
+            word.len() > 4
+                && [".com", ".ir", ".net", ".org", ".me"]
+                    .iter()
+                    .any(|tld| word.ends_with(tld))
+        })
 }
 
 fn clean_search_tags(info: &mut AudioInfo) {
+    // A channel's name in the artist or album tag is no artist or album.
+    for value in [&mut info.artist, &mut info.album, &mut info.album_artist] {
+        if value.as_deref().is_some_and(is_promotional) {
+            *value = None;
+        }
+    }
+    // "Song @Channel" or "Song | t.me/channel": keep the song.
+    if let Some(title) = info.title.as_mut() {
+        let has_promotion = title.split('|').any(|part| is_promotional(part.trim()))
+            || title.split_whitespace().any(|word| word.starts_with('@'));
+        if has_promotion {
+            let kept = title
+                .split('|')
+                .map(str::trim)
+                .filter(|part| !part.is_empty() && !is_promotional(part))
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .split_whitespace()
+                .filter(|word| !word.starts_with('@'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !kept.is_empty() {
+                *title = kept;
+            }
+        }
+    }
     let bilingual = info.album.as_deref().and_then(|album| {
         let (_, english) = album.split_once('|')?;
         let (artist, title) = english.trim().split_once(" - ")?;
@@ -302,6 +379,61 @@ mod tests {
         clean_search_tags(&mut info);
         assert_eq!(info.title.as_deref(), Some("Колыбельная"));
         assert_eq!(info.artist.as_deref(), Some("Jah Khalib"));
+    }
+
+    #[test]
+    fn channel_names_in_tags_are_not_artists() {
+        for junk in [
+            "@MusicBox",
+            "t.me/persian_music",
+            "Telegram: Best Music",
+            "www.example.ir",
+            "کانال موزیک",
+        ] {
+            assert!(is_promotional(junk), "{junk}");
+        }
+        for real in [
+            "The Macarons Project",
+            "Ebi",
+            "Linkin Park",
+            "Mohsen Chavoshi",
+            "Dr. Dre",
+        ] {
+            assert!(!is_promotional(real), "{real}");
+        }
+        let mut info = AudioInfo {
+            title: Some("Fly me to the moon @MusicBox".into()),
+            artist: Some("t.me/musicbox".into()),
+            album: Some("www.musicbox.ir".into()),
+            ..Default::default()
+        };
+        clean_search_tags(&mut info);
+        assert_eq!(info.title.as_deref(), Some("Fly me to the moon"));
+        assert_eq!(info.artist, None);
+        assert_eq!(info.album, None);
+    }
+
+    #[test]
+    fn an_upload_number_is_no_title() {
+        let mut info = AudioInfo::default();
+        fill_from_filename(Path::new("/staging/u6.mp3"), &mut info);
+        assert_eq!(info.title, None);
+        fill_from_filename(Path::new("/inbox/u2 - Song.mp3"), &mut info);
+        assert_eq!(info.title.as_deref(), Some("Song"));
+    }
+
+    #[test]
+    fn telegram_upload_names_give_artist_and_title() {
+        let mut info = AudioInfo {
+            artist: Some("@MusicBox".into()),
+            ..Default::default()
+        };
+        fill_from_filename(
+            Path::new("/staging/The Macarons Project - Fly me to the moon (u6).mp3"),
+            &mut info,
+        );
+        assert_eq!(info.artist.as_deref(), Some("The Macarons Project"));
+        assert_eq!(info.title.as_deref(), Some("Fly me to the moon"));
     }
 
     #[test]

@@ -376,7 +376,19 @@ async fn on_upload(
             .map(str::to_ascii_lowercase)
             .filter(|extension| AUDIO_EXTENSIONS.contains(&extension.as_str()))
             .unwrap_or_else(|| "mp3".into());
-        let target = config.staging_dir.join(format!("u{wanted}.{extension}"));
+        // "Artist - Title (u6).mp3": readable in Review, and a hint for identification.
+        let stem = match file
+            .artist
+            .as_deref()
+            .filter(|artist| !artist.trim().is_empty())
+        {
+            Some(artist) => format!("{artist} - {title}"),
+            None => title.clone(),
+        };
+        let stem = crate::application::library::safe_name(&stem, "audio");
+        let target = config
+            .staging_dir
+            .join(format!("{stem} (u{wanted}).{extension}"));
         let part = config
             .staging_dir
             .join(".part")
@@ -384,6 +396,23 @@ async fn on_upload(
         let result = async {
             tokio::fs::create_dir_all(part.parent().unwrap_or(&config.staging_dir)).await?;
             context.bot.download(&file.id, &part).await?;
+            // Files forwarded from channels often have no tags or a channel's
+            // name as artist; Telegram's title and performer are the better start.
+            let (tagged, hint_title, hint_artist) =
+                (part.clone(), file.title.clone(), file.artist.clone());
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::infrastructure::media::tag_writer::apply_telegram_details(
+                    &tagged,
+                    hint_title.as_deref(),
+                    hint_artist.as_deref(),
+                )
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            {
+                tracing::warn!(%error, "could not write Telegram's title and artist into the file");
+            }
             tokio::fs::rename(&part, &target).await?;
             store::mark_identifying(&context.state.pool, wanted, &target, None).await
         }

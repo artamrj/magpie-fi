@@ -68,16 +68,31 @@ pub fn score_candidate(
                 .map(|value| text_similarity(value, input.artist))
                 .unwrap_or_default(),
         ),
+        // A remix credited in the title ("… (Mellen Gi & Tommee Profitt Remix)")
+        // matches its official release under the remixers' names.
         ScoreMode::Text { .. } => (
             current
                 .title
                 .as_deref()
-                .map(|value| title_similarity(value, input.title))
+                .map(|value| {
+                    title_similarity(value, input.title).max(
+                        super::versions::version_aware_title_similarity(value, input.title),
+                    )
+                })
                 .unwrap_or_default(),
             current
                 .artist
                 .as_deref()
-                .map(|value| artist_similarity(value, input.artist))
+                .map(|value| {
+                    artist_similarity(value, input.artist).max(
+                        super::versions::credited_artist_similarity(
+                            value,
+                            current.title.as_deref().unwrap_or_default(),
+                            input.artist,
+                            input.title,
+                        ),
+                    )
+                })
                 .unwrap_or_default(),
         ),
     };

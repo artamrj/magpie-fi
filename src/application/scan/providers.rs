@@ -1078,7 +1078,8 @@ pub(crate) fn candidate_agrees(
         return true;
     }
     text_close(&left.title, &right.title, 0.82)
-        && text_close(&left.artist, &right.artist, 0.75)
+        && (text_close(&left.artist, &right.artist, 0.75)
+            || crate::domain::versions::artists_similarity(&left.artist, &right.artist) >= 0.99)
         && match (left.album.as_deref(), right.album.as_deref()) {
             (Some(left_album), Some(right_album)) => text_close(left_album, right_album, 0.65),
             _ => true,

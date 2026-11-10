@@ -1114,6 +1114,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // Two different steady tones of one length have near-identical,
+        // unchanging fingerprints; they must never count as one song.
+        let tone = encode(
+            "tone-a.mp3",
+            "sine=frequency=440:duration=30",
+            &["-c:a", "libmp3lame"],
+        );
+        let other_tone = encode(
+            "tone-b.mp3",
+            "sine=frequency=550:duration=30",
+            &["-c:a", "libmp3lame"],
+        );
+        let (tone_print, tone_length) = fingerprint::calculate(&tone).await.unwrap();
+        assert_eq!(input_dedup::fingerprint_key(&tone_print), None);
+        remember(
+            &pool,
+            &LibraryEntry {
+                path: tone.to_string_lossy().into_owned(),
+                duration: Some(tone_length),
+                format: "mp3".into(),
+                source: "inbox".into(),
+                fingerprint: Some(tone_print),
+                ..LibraryEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+        let other = probe(&other_tone).await;
+        assert!(
+            find_same_recording(&pool, &other, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

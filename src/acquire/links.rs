@@ -156,8 +156,16 @@ pub fn classify(raw: &str) -> Option<Link> {
             }
         }
         "youtu.be" => link(Service::YouTube, Scope::Track, parts.first()?, None),
+        // shazam.com/song/1845811123/donyaye-movazi (also /en-us/song/…): the
+        // number is the song's Apple Music ID.
         _ if host.ends_with("shazam.com") => {
-            link(Service::Shazam, Scope::Track, parts.last()?, None)
+            let song = parts
+                .iter()
+                .position(|part| *part == "song" || *part == "track")?;
+            let id = parts
+                .get(song + 1)
+                .filter(|id| id.chars().all(|character| character.is_ascii_digit()))?;
+            link(Service::Shazam, Scope::Track, id, None)
         }
         _ => None,
     }
@@ -526,6 +534,23 @@ async fn shazam(
     pool: &sqlx::SqlitePool,
     link: &Link,
 ) -> Result<Collection> {
+    // Shazam's song pages refuse automated requests; the same song is in
+    // Apple's lookup API under the same number, which is stable and official.
+    if link.url.contains("/song/") {
+        let apple_link = Link {
+            service: Service::Apple,
+            scope: Scope::Track,
+            ..link.clone()
+        };
+        match apple(client, &apple_link).await {
+            Ok(mut collection) if !collection.songs.is_empty() => {
+                collection.songs.truncate(1);
+                return Ok(collection);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, "Apple lookup for a Shazam link failed"),
+        }
+    }
     let candidate = providers::shazam::lookup_url(pool, client, &link.url).await?;
     Ok(Collection {
         songs: vec![Wanted {
@@ -663,7 +688,13 @@ mod tests {
                 "https://www.shazam.com/song/1499378615/blinding-lights",
                 Shazam,
                 Track,
-                "blinding-lights",
+                "1499378615",
+            ),
+            (
+                "https://www.shazam.com/en-us/song/1845811123/donyaye-movazi#referrer=x",
+                Shazam,
+                Track,
+                "1845811123",
             ),
         ];
         for (url, service, scope, id) in cases {
