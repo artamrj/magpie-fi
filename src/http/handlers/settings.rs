@@ -64,8 +64,6 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "shazam": true,
             "integrity_check": ffmpeg,
             "acoustid": !cfg.acoustid_key.is_empty(),
-            "audd": !cfg.audd_token.is_empty(),
-            "spotify": !cfg.spotify_client_id.is_empty() && !cfg.spotify_client_secret.is_empty(),
             "soundcloud": true,
             "soundcloud_search": !cfg.soundcloud_client_id.is_empty() && !cfg.soundcloud_client_secret.is_empty(),
             "youtube": !cfg.youtube_api_key.is_empty(),

@@ -69,9 +69,6 @@ pub struct Config {
     /// Keep a self-updating copy of yt-dlp in `data_dir/bin` (the Docker image does).
     pub ytdlp_self_update: bool,
     pub acoustid_key: String,
-    pub audd_token: String,
-    pub spotify_client_id: String,
-    pub spotify_client_secret: String,
     pub soundcloud_client_id: String,
     pub soundcloud_client_secret: String,
     pub youtube_api_key: String,
@@ -113,9 +110,6 @@ impl Config {
             ytdlp_cookies: None,
             ytdlp_self_update: false,
             acoustid_key: String::new(),
-            audd_token: String::new(),
-            spotify_client_id: String::new(),
-            spotify_client_secret: String::new(),
             soundcloud_client_id: String::new(),
             soundcloud_client_secret: String::new(),
             youtube_api_key: String::new(),
@@ -204,12 +198,19 @@ impl Config {
             }
         };
         text(&mut config.acoustid_key, "MAGPIE_ACOUSTID_KEY");
-        text(&mut config.audd_token, "MAGPIE_AUDD_TOKEN");
-        text(&mut config.spotify_client_id, "MAGPIE_SPOTIFY_CLIENT_ID");
-        text(
-            &mut config.spotify_client_secret,
+        // Paid services are no longer used; their old settings are ignored.
+        for name in [
+            "MAGPIE_AUDD_TOKEN",
+            "MAGPIE_SPOTIFY_CLIENT_ID",
             "MAGPIE_SPOTIFY_CLIENT_SECRET",
-        );
+        ] {
+            if get(name).is_some() {
+                tracing::warn!(
+                    setting = name,
+                    "this paid service is no longer used; remove the setting"
+                );
+            }
+        }
         text(
             &mut config.soundcloud_client_id,
             "MAGPIE_SOUNDCLOUD_CLIENT_ID",

@@ -22,7 +22,6 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub artwork_downloads: Arc<Semaphore>,
     pub tag_writes: Arc<Semaphore>,
-    pub spotify_auth: crate::infrastructure::providers::spotify::SpotifyAuth,
     pub soundcloud_auth: crate::infrastructure::providers::soundcloud::SoundCloudAuth,
     pub workflow: RwLock<Workflow>,
     automation_notify: Notify,
@@ -41,7 +40,6 @@ impl AppState {
                 .expect("HTTP client should build"),
             artwork_downloads: Arc::new(Semaphore::new(crate::config::LOOKUP_WORKERS)),
             tag_writes: Arc::new(Semaphore::new(crate::config::WRITE_WORKERS)),
-            spotify_auth: crate::infrastructure::providers::spotify::SpotifyAuth::default(),
             soundcloud_auth: crate::infrastructure::providers::soundcloud::SoundCloudAuth::default(
             ),
             workflow: RwLock::new(Workflow {

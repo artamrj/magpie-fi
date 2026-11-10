@@ -46,7 +46,6 @@ pub(crate) async fn identify(
     }
     let has_strong_free_candidate = out.iter().any(|candidate| candidate.score >= 90.0);
     let mut recognized_info = None;
-    let mut songrec_matched = false;
     if !acoustid_matched && !has_strong_free_candidate && infra_providers::songrec::available() {
         let songrec_candidates =
             query_songrec(state, limits, path, fingerprint.value, filename).await;
@@ -54,41 +53,10 @@ pub(crate) async fn identify(
             let info = audio_info_from_recognition(recognized, current);
             out.extend(query_recognized_catalogs(state, limits, &info, filename).await);
             recognized_info = Some(info);
-            songrec_matched = true;
         }
         out.extend(songrec_candidates);
     }
-    if !acoustid_matched
-        && !has_strong_free_candidate
-        && !songrec_matched
-        && !cfg.audd_token.trim().is_empty()
-        && !fingerprint.value.is_empty()
-    {
-        let audd_candidates = query_audd(
-            state,
-            limits,
-            &cfg.audd_token,
-            path,
-            fingerprint.value,
-            current,
-            filename,
-        )
-        .await;
-        if let Some(recognized) = audd_candidates.first() {
-            let info = audio_info_from_recognition(recognized, current);
-            out.extend(query_recognized_catalogs(state, limits, &info, filename).await);
-            recognized_info = Some(info);
-        }
-        out.extend(audd_candidates);
-    }
     let catalog_info = recognized_info.as_ref().unwrap_or(current);
-    if !cfg.spotify_client_id.trim().is_empty() && !cfg.spotify_client_secret.trim().is_empty() {
-        let isrcs = out
-            .iter()
-            .filter_map(|candidate| candidate.isrc.clone())
-            .collect::<Vec<_>>();
-        out.extend(query_spotify(state, limits, cfg, catalog_info, filename, &isrcs).await);
-    }
     if !cfg.soundcloud_client_id.trim().is_empty()
         && !cfg.soundcloud_client_secret.trim().is_empty()
     {
@@ -206,8 +174,8 @@ pub(crate) async fn query_recognized_catalogs(
 
 /// Shared scaffolding for metadata-catalog lookups: disabled-provider gate,
 /// optional config-key gate, title gate, timing, error handling, and the
-/// common text-scoring pass. Provider-specific steps (AcoustID, SongRec, AudD,
-/// YouTube, the ISRC-boosted Spotify search, and the alias-enriching iTunes
+/// common text-scoring pass. Provider-specific steps (AcoustID, SongRec,
+/// YouTube, and the alias-enriching iTunes
 /// search) stay explicit in `identify`.
 /// Per-provider knobs for the shared catalog runner.
 struct CatalogSpec {
@@ -328,52 +296,6 @@ pub(crate) async fn query_songrec(
     }
 }
 
-pub(crate) async fn query_audd(
-    state: &Arc<AppState>,
-    limits: &PipelineLimits,
-    token: &str,
-    path: &Path,
-    fingerprint: &str,
-    current: &audio::AudioInfo,
-    filename: &str,
-) -> Vec<infra_providers::Candidate> {
-    if provider_disabled(limits, "audd").await {
-        return Vec::new();
-    }
-    let started = Instant::now();
-    match infra_providers::audd::recognize(
-        &state.pool,
-        &state.client,
-        token,
-        path,
-        fingerprint,
-        current.duration,
-    )
-    .await
-    {
-        Ok(mut candidates) => {
-            for candidate in &mut candidates {
-                normalize_credits(candidate);
-                candidate.duration_delta = candidate
-                    .duration_delta
-                    .map(|candidate_duration| (current.duration - candidate_duration).abs());
-                if let Some(raw) = candidate.score_breakdown.as_deref()
-                    && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
-                {
-                    value["duration_delta"] = serde_json::json!(candidate.duration_delta);
-                    candidate.score_breakdown = Some(value.to_string());
-                }
-            }
-            log_provider_count(filename, "audd", candidates.len(), started);
-            candidates
-        }
-        Err(error) => {
-            handle_provider_error(limits, filename, "audd", error).await;
-            Vec::new()
-        }
-    }
-}
-
 pub(crate) async fn query_youtube(
     state: &Arc<AppState>,
     limits: &PipelineLimits,
@@ -402,65 +324,6 @@ pub(crate) async fn query_youtube(
         }
         Err(error) => {
             handle_provider_error(limits, filename, "youtube", error).await;
-            Vec::new()
-        }
-    }
-}
-
-pub(crate) async fn query_spotify(
-    state: &Arc<AppState>,
-    limits: &PipelineLimits,
-    cfg: &crate::config::Config,
-    current: &audio::AudioInfo,
-    filename: &str,
-    isrcs: &[String],
-) -> Vec<infra_providers::Candidate> {
-    if provider_disabled(limits, "spotify").await {
-        return Vec::new();
-    }
-    let Some(title) = current
-        .title
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-    else {
-        return Vec::new();
-    };
-    let started = Instant::now();
-    match infra_providers::spotify::search(
-        &state.client,
-        &state.spotify_auth,
-        &cfg.spotify_client_id,
-        &cfg.spotify_client_secret,
-        title,
-        current.artist.as_deref(),
-        isrcs,
-    )
-    .await
-    {
-        Ok(mut candidates) => {
-            for candidate in &mut candidates {
-                let identifier_match = candidate.isrc.as_deref().is_some_and(|candidate_isrc| {
-                    isrcs
-                        .iter()
-                        .any(|isrc| isrc.eq_ignore_ascii_case(candidate_isrc))
-                });
-                let _ = score_text_candidate(candidate, current, "spotify_catalog_search");
-                if identifier_match {
-                    candidate.score = candidate.score.max(96.0);
-                    if let Some(raw) = candidate.score_breakdown.as_deref()
-                        && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw)
-                    {
-                        value["identifier_match"] = serde_json::json!("isrc");
-                        value["final_score"] = serde_json::json!(candidate.score);
-                        candidate.score_breakdown = Some(value.to_string());
-                    }
-                }
-            }
-            log_provider_count(filename, "spotify", candidates.len(), started);
-            candidates
-        }
-        Err(error) => {
-            handle_provider_error(limits, filename, "spotify", error).await;
             Vec::new()
         }
     }
@@ -1004,7 +867,6 @@ pub(crate) fn artwork_provider_priority(provider: &str) -> u8 {
         "soundcloud" => 6,
         "deezer" => 5,
         "discogs" => 4,
-        "audd" => 3,
         "lastfm" => 2,
         "youtube" => 1,
         _ => 0,

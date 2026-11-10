@@ -831,11 +831,8 @@ pub async fn resolve_source(
     let (_, found) = lookup_source(&s, url, &parsed).await.ok_or_else(|| {
         ApiError::validation("Source lookup failed: this site is not a supported music source")
     })?;
-    let mut candidate =
+    let candidate =
         found.map_err(|error| ApiError::validation(format!("Source lookup failed: {error:#}")))?;
-    if candidate.provider == "shazam" {
-        enrich_shazam_with_spotify(&s, &mut candidate).await;
-    }
     Ok(Json(candidate))
 }
 
@@ -853,11 +850,10 @@ async fn lookup_source(
         .unwrap_or(&host);
     let (pool, client) = (&s.pool, &s.client);
     Some(match site {
-        "spotify.com" => ("Spotify", lookup_spotify_source(s, url).await),
-        "shazam.com" => (
-            "Shazam",
-            providers::shazam::lookup_url(pool, client, url).await,
-        ),
+        "spotify.com" | "spotify.link" | "spoti.fi" => {
+            ("Spotify", lookup_link_source(s, url, "spotify").await)
+        }
+        "shazam.com" => ("Shazam", lookup_link_source(s, url, "shazam").await),
         "soundcloud.com" => (
             "SoundCloud",
             providers::soundcloud::lookup_url(client, url).await,
@@ -885,84 +881,49 @@ async fn lookup_source(
     })
 }
 
-async fn lookup_spotify_source(s: &AppState, url: &str) -> Result<Candidate> {
-    let cfg = &s.config;
-    providers::spotify::lookup_url(
-        &s.client,
-        &s.spotify_auth,
-        &cfg.spotify_client_id,
-        &cfg.spotify_client_secret,
-        url,
-    )
-    .await
-}
-
-async fn enrich_shazam_with_spotify(s: &AppState, candidate: &mut Candidate) {
-    let cfg = &s.config;
-    if cfg.spotify_client_id.trim().is_empty() || cfg.spotify_client_secret.trim().is_empty() {
-        return;
-    }
-    let isrcs = candidate.isrc.clone().into_iter().collect::<Vec<_>>();
-    let Ok(results) = providers::spotify::search(
-        &s.client,
-        &s.spotify_auth,
-        &cfg.spotify_client_id,
-        &cfg.spotify_client_secret,
-        &candidate.title,
-        Some(&candidate.artist),
-        &isrcs,
-    )
-    .await
-    else {
-        return;
-    };
-    let spotify = results.iter().find(|result| {
-        candidate
-            .isrc
+/// A Spotify or Shazam song link, read the free way the bot reads links:
+/// Spotify's public embed page, and Apple's lookup for Shazam (the Shazam
+/// number is the Apple Music ID).
+async fn lookup_link_source(s: &AppState, url: &str, provider: &str) -> Result<Candidate> {
+    use crate::acquire::links;
+    let expanded = links::expand_short_link(&s.client, url).await?;
+    let link = links::classify(&expanded)
+        .filter(|link| link.scope == links::Scope::Track)
+        .ok_or_else(|| anyhow::anyhow!("this is not a song link"))?;
+    let song = links::read(&s.client, &s.pool, &s.config, &link)
+        .await?
+        .songs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("the link has no song"))?;
+    let label = crate::domain::provider_name(provider);
+    Ok(Candidate {
+        provider: provider.into(),
+        title: song.title,
+        artist: song.artist.unwrap_or_default(),
+        album: song.album,
+        track_number: song.track_number,
+        year: song
+            .release_date
             .as_deref()
-            .zip(result.isrc.as_deref())
-            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
-    });
-    let Some(spotify) = spotify.or_else(|| results.first()) else {
-        return;
-    };
-    fill_missing_source_fields(candidate, spotify);
-    candidate.score_breakdown = Some(
-        serde_json::json!({
-            "source": "shazam_user_source_url",
-            "sources": ["Shazam", "Spotify"],
-            "user_verified_source": true,
-            "spotify_catalog_enriched": true,
-            "final_score": candidate.score
-        })
-        .to_string(),
-    );
-}
-
-fn fill_missing_source_fields(candidate: &mut Candidate, source: &Candidate) {
-    macro_rules! fill {
-        ($field:ident) => {
-            if candidate.$field.is_none() {
-                candidate.$field = source.$field.clone();
-            }
-        };
-    }
-    fill!(album);
-    fill!(album_artist);
-    fill!(track_number);
-    fill!(track_total);
-    fill!(disc_number);
-    fill!(disc_total);
-    fill!(year);
-    fill!(genre);
-    fill!(composer);
-    fill!(label);
-    fill!(isrc);
-    fill!(cover_url);
-    fill!(release_date);
-    fill!(release_type);
-    fill!(duration_delta);
-    candidate.is_compilation |= source.is_compilation;
+            .and_then(|date| date.get(..4))
+            .map(str::to_owned),
+        release_date: song.release_date,
+        isrc: song.isrc,
+        cover_url: song.cover_url,
+        duration_delta: song.duration,
+        score: 97.0,
+        score_breakdown: Some(
+            serde_json::json!({
+                "source": format!("{provider}_user_source_url"),
+                "sources": [label],
+                "user_verified_source": true,
+                "final_score": 97.0
+            })
+            .to_string(),
+        ),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

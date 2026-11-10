@@ -651,7 +651,7 @@ fn provider_priority(provider: &str) -> u8 {
     match provider {
         "musicbrainz" | "itunes" | "spotify" | "radiojavan" | "audiomack" | "navahang"
         | "shazam" | "genius" => 6,
-        "deezer" | "audd" | "songrec" => 5,
+        "deezer" | "songrec" => 5,
         "discogs" => 4,
         "lastfm" | "soundcloud" => 3,
         _ => 2,

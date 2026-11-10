@@ -295,7 +295,6 @@ export function providerName(source: string) {
   const names: Record<string, string> = {
     acoustid: "AcoustID",
     audiomack: "Audiomack",
-    audd: "AudD",
     deezer: "Deezer",
     discogs: "Discogs",
     itunes: "Apple Music",

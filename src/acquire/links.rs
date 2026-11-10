@@ -65,6 +65,9 @@ pub struct Wanted {
     pub isrc: Option<String>,
     pub source_url: Option<String>,
     pub youtube_id: Option<String>,
+    /// The cover the service shows for the song, when the link has one.
+    pub cover_url: Option<String>,
+    pub release_date: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -230,6 +233,16 @@ async fn spotify(client: &reqwest::Client, link: &Link) -> Result<Collection> {
     parse_spotify_embed(&html, link)
 }
 
+/// The biggest picture in a list of `{url, maxHeight}` images.
+fn largest_image(images: &Value) -> Option<String> {
+    images
+        .as_array()?
+        .iter()
+        .max_by_key(|image| image["maxHeight"].as_i64().unwrap_or(0))
+        .and_then(|image| image["url"].as_str())
+        .map(str::to_owned)
+}
+
 fn parse_spotify_embed(html: &str, link: &Link) -> Result<Collection> {
     let data = script_json(html, "__NEXT_DATA__").context("Spotify page has no song data")?;
     let entity = &data["props"]["pageProps"]["state"]["data"]["entity"];
@@ -248,6 +261,11 @@ fn parse_spotify_embed(html: &str, link: &Link) -> Result<Collection> {
                 artist: (!artists.is_empty()).then(|| artists.join(", ")),
                 duration: milliseconds(&entity["duration"]),
                 source_url: Some(format!("https://open.spotify.com/track/{}", link.id)),
+                cover_url: largest_image(&entity["visualIdentity"]["image"]),
+                release_date: entity["releaseDate"]["isoString"]
+                    .as_str()
+                    .and_then(|date| date.get(..10))
+                    .map(str::to_owned),
                 ..Wanted::default()
             }],
             ..Collection::default()
@@ -327,6 +345,11 @@ fn parse_itunes_lookup(value: &Value, scope: Scope) -> Collection {
             track_number: item["trackNumber"].as_i64(),
             duration: milliseconds(&item["trackTimeMillis"]),
             source_url: text(item, "trackViewUrl"),
+            // Apple's artwork URL scales to any size; 1200 px is what we embed.
+            cover_url: text(item, "artworkUrl100")
+                .map(|url| url.replace("100x100bb", "1200x1200bb")),
+            release_date: text(item, "releaseDate")
+                .and_then(|date| date.get(..10).map(str::to_owned)),
             ..Wanted::default()
         })
         .collect();
@@ -491,7 +514,8 @@ fn deezer_track(track: &Value, album: Option<String>) -> Wanted {
         duration: track["duration"].as_f64().filter(|value| *value > 0.0),
         isrc: text(track, "isrc"),
         source_url: text(track, "link"),
-        youtube_id: None,
+        cover_url: track["album"]["cover_xl"].as_str().map(str::to_owned),
+        ..Wanted::default()
     }
 }
 

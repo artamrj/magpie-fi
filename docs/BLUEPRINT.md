@@ -181,10 +181,10 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   repaired), a Chromaprint fingerprint, or SHA-256 when fingerprinting fails.
 - **Evidence from a link.** A download carries the link's title, artist, album and ISRC as tags,
   so it is usually identified without questions — but still checked against length and sound.
-- **15 sources, cheap first.** AcoustID (by fingerprint) and MusicBrainz; YouTube (video ID in
-  the filename); Apple Music, Deezer and the Persian catalogs Radio Javan, Audiomack and Navahang;
-  Genius; SongRec (Shazam) and AudD for audio recognition when nothing else matched; Spotify,
-  SoundCloud, Discogs and Last.fm. Sources that need a key are off without it. Cover Art Archive
+- **Only free sources, cheap first.** AcoustID (by fingerprint) and MusicBrainz; YouTube (video
+  ID in the filename); Apple Music, Deezer and the Persian catalogs Radio Javan, Audiomack and
+  Navahang; Genius; SongRec (Shazam) for audio recognition when nothing else matched; SoundCloud,
+  Discogs and Last.fm. Sources that need a (free) key are off without it. Cover Art Archive
   supplies covers, Wikidata artist genres, LRCLIB lyrics.
 - **Smart approval.** Every candidate gets a weighted score (title, artist, length, album,
   completeness, agreement between sources, audio recognition, version tags). Automatic only when
@@ -366,7 +366,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 | 15 | Web page in the binary? | **No, served from disk** next to it (`MAGPIE_WEB_DIR`); same single origin. |
 | 16 | ReplayGain | **Only rsgain, per album folder after each batch.** The per-file ffmpeg pass was removed: rsgain already measures track and album gain. |
 | 17 | Fewer sources | **Two were removed** (Nov 2026): an extra metadata catalog and the Wikidata song search. Wikidata stays for artist genres. |
-| 18 | Key-only sources (AudD, Spotify, SoundCloud, …) | Kept, **off unless a key is set.** |
+| 18 | Paid sources | **None.** AudD and the Spotify Web API (owner needs Premium since 2026) were removed; Spotify links are read from the public page. Free-key sources (AcoustID, Last.fm, Discogs, YouTube, SoundCloud) stay, off unless a key is set. |
 | 19 | A song fails while filing | **It goes to Issues** instead of being retried every cycle; the others continue. |
 | 20 | Persian music | Tags and folders in the original script, NFC-normalised. |
 | 21 | Dependency updates | **Dependabot**, monthly. yt-dlp updates itself daily. |

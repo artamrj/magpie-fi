@@ -12,7 +12,6 @@ pub fn provider_name(provider: &str) -> &str {
     match provider {
         "" | "musicbrainz" => "MusicBrainz",
         "acoustid" => "AcoustID",
-        "audd" => "AudD",
         "audiomack" => "Audiomack",
         "deezer" => "Deezer",
         "discogs" => "Discogs",

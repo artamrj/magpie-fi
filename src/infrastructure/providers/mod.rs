@@ -1,5 +1,4 @@
 pub mod acoustid;
-pub mod audd;
 pub mod audiomack;
 pub mod cover_art_archive;
 pub mod deezer;
@@ -13,7 +12,6 @@ pub mod radiojavan;
 pub mod shazam;
 pub mod songrec;
 pub mod soundcloud;
-pub mod spotify;
 pub mod wikidata;
 pub mod youtube;
 
@@ -72,7 +70,7 @@ pub async fn browser_page(client: &Client, url: &str) -> Result<String> {
         .await?)
 }
 
-/// An OAuth client-credentials token (Spotify, SoundCloud), reused until
+/// An OAuth client-credentials token (SoundCloud), reused until
 /// shortly before it expires.
 #[derive(Default)]
 pub struct ClientCredentials {

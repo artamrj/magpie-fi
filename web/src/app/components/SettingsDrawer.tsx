@@ -114,7 +114,6 @@ function ProviderStatus({ sources }: { sources: Record<string, boolean> }) {
           "navahang",
           "audiomack",
           "genius",
-          "spotify",
           "acoustid",
           "shazam",
           "songrec",

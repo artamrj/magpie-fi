@@ -319,9 +319,8 @@ cheap and free ones first:
 5. **Genius**, only when the results still lack details.
 6. **SongRec** (Shazam recognition), only when AcoustID found nothing and no candidate scores
    ≥ 90; at most two at a time. Its artist/title is fed back through the catalogs of step 3–5.
-7. **AudD**, only if SongRec also failed (needs a token); same feedback.
-8. **Spotify** (ISRC cross-check), **SoundCloud**, **Discogs**, **Last.fm** — each only with its
-   key or token.
+7. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
+   service is used.
 
 Free without a key: MusicBrainz, Apple Music, Deezer, Radio Javan, Audiomack, Navahang, Genius,
 SongRec. Other sources: **Cover Art Archive** (covers by MusicBrainz release), **Wikidata**
@@ -403,8 +402,8 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 | MusicBrainz | 1 request/s |
 | Downloads | `MAGPIE_MAX_PARALLEL_DOWNLOADS` (default 2) + `MAGPIE_DOWNLOAD_PAUSE_SECONDS` |
 
-- **External tools**: the integrity check, fingerprint, repair, rsgain, SongRec and the AudD
-  sample run through `infrastructure::process`: whether a tool is installed is checked once per
+- **External tools**: the integrity check, fingerprint, repair, rsgain and SongRec run
+  through `infrastructure::process`: whether a tool is installed is checked once per
   run, and every call has a timeout after which the process is killed (e.g. 3 min for a
   fingerprint, 30 min for rsgain on one album). yt-dlp calls have their own timeouts
   (`MAGPIE_MAX_DOWNLOAD_SECONDS` for a download, default 15 min).
@@ -417,7 +416,7 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 
 | Cache | Key | Lifetime |
 |---|---|---|
-| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID and AudD 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily. |
+| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily. |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | path + size + mtime | until the file changes; together capped at **100 MiB**, oldest first (at start, daily and hourly when idle) |
 | `artwork_overrides` | path | until you choose another cover |
 

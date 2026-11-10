@@ -399,7 +399,7 @@ fn provider_trust(provider: &str) -> f64 {
     match provider {
         "spotify" | "itunes" | "deezer" | "musicbrainz" | "radiojavan" | "navahang" | "shazam"
         | "genius" => 5.0,
-        "audd" | "acoustid" | "songrec" => 4.0,
+        "acoustid" | "songrec" => 4.0,
         "discogs" | "soundcloud" | "audiomack" => 2.0,
         "lastfm" | "youtube" => 1.0,
         _ => 0.0,
@@ -696,14 +696,14 @@ mod tests {
     fn lower_score_plain_recording_beats_high_score_duet() {
         let mut duet = candidate(
             1,
-            "audd",
+            "songrec",
             "Perfect Duet (Ed Sheeran & Beyoncé)",
             "Perfect Duet",
             99.0,
         );
         duet.duration_delta = None;
         duet.score_breakdown =
-            Some(serde_json::json!({"audio_recognition":true,"sources":["AudD"]}).to_string());
+            Some(serde_json::json!({"audio_recognition":true,"sources":["SongRec"]}).to_string());
         let plain = candidate(2, "deezer", "Perfect", "÷ (Deluxe)", 94.6);
 
         let decision = select(
@@ -851,11 +851,11 @@ mod tests {
 
     #[test]
     fn audio_recognition_can_identify_a_track_without_existing_tags() {
-        let mut recognized = candidate(1, "audd", "Teardrop", "Mezzanine", 96.0);
+        let mut recognized = candidate(1, "songrec", "Teardrop", "Mezzanine", 96.0);
         recognized.artist = "Massive Attack".into();
         recognized.duration_delta = None;
         recognized.score_breakdown =
-            Some(serde_json::json!({"audio_recognition":true,"sources":["AudD"]}).to_string());
+            Some(serde_json::json!({"audio_recognition":true,"sources":["SongRec"]}).to_string());
 
         let decision = select(
             TrackEvidence {

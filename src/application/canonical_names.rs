@@ -113,7 +113,7 @@ fn provider_authority(provider: &str) -> i64 {
         "musicbrainz" => 100,
         "spotify" => 95,
         "itunes" | "deezer" => 90,
-        "shazam" | "audd" | "genius" => 80,
+        "shazam" | "genius" => 80,
         "manual" => 70,
         _ => 60,
     }
