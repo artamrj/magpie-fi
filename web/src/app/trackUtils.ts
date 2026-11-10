@@ -1,18 +1,6 @@
-import type { ArtworkStatus, Candidate, Track } from "../api/types";
-import type { IconName } from "./Icons";
+import type { Candidate, Track } from "../api/types";
 
 export const busyPhases = new Set(["scan", "fetch", "apply"]);
-export type QueueFilter = "all" | "review" | "problems" | "ready";
-export type QueueOrder = "queue" | "title" | "artist" | "status";
-export type Theme = "dark" | "light";
-
-export const queueOrderLabels: Record<QueueOrder, string> = {
-  queue: "Queue",
-  title: "Title",
-  artist: "Artist",
-  status: "Status",
-};
-export const queueOrderSequence: QueueOrder[] = ["queue", "title", "artist", "status"];
 
 export function candidateConfidence(score: number) {
   if (score >= 85) return { label: "Strong match", tone: "strong" };
@@ -58,29 +46,6 @@ export function candidateSignals(track: Track, candidate: Candidate) {
   ];
 }
 
-export function candidateVerdict(score: number, signals: Array<{ tone: string }>) {
-  const warnings = signals.filter((signal) => signal.tone === "warning").length;
-  if (score >= 85 && warnings === 0)
-    return {
-      tone: "good",
-      title: "Good choice",
-      detail: "The identity and audio evidence agree with your file.",
-    };
-  if (score >= 70 && warnings <= 1)
-    return {
-      tone: "caution",
-      title: "Likely match",
-      detail: "Most evidence agrees; check the highlighted difference before choosing.",
-    };
-  return {
-    tone: "risk",
-    title: "Needs caution",
-    detail: warnings
-      ? `${warnings} important ${warnings === 1 ? "difference" : "differences"} detected. Choose only if you recognize this release.`
-      : "The available evidence is too weak to recommend this automatically.",
-  };
-}
-
 function comparisonSignal(
   label: string,
   original?: string,
@@ -116,13 +81,6 @@ function normalizeText(value: string) {
     .trim();
 }
 
-export const artworkStatusLabels: Record<ArtworkStatus, string> = {
-  verified: "Verified cover",
-  searching: "Checking cover",
-  retryable_error: "Cover source unavailable",
-  cover_required: "Cover required",
-};
-
 export function formatDuration(seconds?: number) {
   if (!seconds || !Number.isFinite(seconds)) return undefined;
   const minutes = Math.floor(seconds / 60);
@@ -154,83 +112,11 @@ export function selectedCandidate(track: Track) {
   return track.candidates.find((candidate) => candidate.id === track.selected_candidate_id);
 }
 
-const filterTests: Record<QueueFilter, (track: Track) => boolean> = {
-  all: () => true,
-  review: isReview,
-  problems: isProblem,
-  ready: isReady,
-};
-export function matchesFilter(track: Track, filter: QueueFilter) {
-  return filterTests[filter](track);
-}
-
-export function statusFor(track: Track): { label: string; tone: string; icon: IconName } {
-  const error = (label: string) => ({ label, tone: "error", icon: "alert" as const });
-  if (track.status === "corrupt") return error("Damaged");
-  if (track.stage === "skipped") return { label: "Skipped", tone: "muted", icon: "skip" };
-  if (track.is_missing) return error("File missing");
-  if (track.stage === "failed" || track.status === "failed" || track.status === "provider_error")
-    return error("Failed");
-  if (track.stage === "review")
-    return {
-      label:
-        selectedCandidate(track) || track.candidates.length > 1
-          ? "Needs review"
-          : track.candidates.length
-            ? "Uncertain"
-            : "Not identified",
-      tone: "review",
-      icon: "info",
-    };
-  if (isReady(track)) return { label: "Ready", tone: "success", icon: "check" };
-  return { label: "Processing", tone: "processing", icon: "waveform" };
-}
-
-export function problemTitle(track: Track) {
-  if (track.status === "corrupt") return "Damaged audio file";
-  if (track.is_missing) return "Source file is missing";
-  return "Could not process this track";
-}
-
-export function friendlyTrackError(track: Track) {
-  if (!track.error) return "";
-  if (track.status === "corrupt")
-    return "The audio stream could not be decoded safely. This file will not be written.";
-  if (track.is_missing) return "The source file is no longer available at its original location.";
-  return "magpie-fi could not finish this track. Open technical details if you need the diagnostic message.";
-}
-
 function queuePriority(track: Track) {
   if (isReview(track)) return 0;
   if (isProblem(track)) return 1;
   if (isReady(track)) return 2;
   return 3;
-}
-
-export function compareTracks(first: Track, second: Track, order: QueueOrder) {
-  if (order === "status")
-    return (
-      queuePriority(first) - queuePriority(second) ||
-      compareText(trackTitle(first), trackTitle(second))
-    );
-  if (order === "artist")
-    return (
-      compareText(trackArtist(first), trackArtist(second)) ||
-      compareText(trackTitle(first), trackTitle(second))
-    );
-  return compareText(trackTitle(first), trackTitle(second));
-}
-
-function trackTitle(track: Track) {
-  const candidate = selectedCandidate(track) ?? track.candidates[0];
-  return candidate?.title || track.current_title || fileStem(track.filename);
-}
-function trackArtist(track: Track) {
-  const candidate = selectedCandidate(track) ?? track.candidates[0];
-  return candidate?.artist || track.current_artist || "Unknown artist";
-}
-function compareText(first: string, second: string) {
-  return first.localeCompare(second, undefined, { numeric: true, sensitivity: "base" });
 }
 
 export function preferredTrack(tracks: Track[]) {
@@ -240,14 +126,6 @@ export function preferredTrack(tracks: Track[]) {
   )[0];
 }
 
-export function filterTitle(filter: QueueFilter) {
-  return {
-    all: "Music queue",
-    review: "Needs review",
-    problems: "Issues",
-    ready: "Ready to write",
-  }[filter];
-}
 export function folderName(path: string) {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? "";
@@ -273,12 +151,6 @@ export function friendlyError(value: string) {
   if (/permission|denied/i.test(value))
     return `${value} Check that magpie-fi can read the inbox and write to the library folder.`;
   return value;
-}
-
-export function googleMetadataUrl(candidate: Candidate) {
-  const artist = String(candidate.artist || "").replaceAll('"', "");
-  const title = String(candidate.title || "").replaceAll('"', "");
-  return `https://www.google.com/search?q=${encodeURIComponent(`"${artist}" "${title}" song album or single album name original release year`)}`;
 }
 
 export function candidateSources(candidate: Candidate) {
@@ -315,35 +187,109 @@ export function providerName(source: string) {
   return names[source] || source;
 }
 
-export function metadataAudit(candidate: Candidate) {
-  const stored = evidenceOf(candidate).metadata_completion;
-  if (typeof stored?.score === "number" && Array.isArray(stored.missing_fields))
-    return {
-      score: stored.score,
-      coreComplete: stored.core_complete === true,
-      missing: stored.missing_fields as string[],
-    };
-  const fields: Array<[string, boolean, number]> = [
-    ["title", Boolean(candidate.title?.trim()), 18],
-    ["artist", Boolean(candidate.artist?.trim()), 18],
-    ["album", Boolean(candidate.album?.trim()), 16],
-    ["cover", Boolean(candidate.cover_url?.trim()), 16],
-    ["year", Boolean(candidate.year?.trim() || candidate.release_date?.trim()), 10],
-    ["genre", Boolean(candidate.genre?.trim()), 8],
-    ["track", Boolean(candidate.track_number), 6],
-    ["album artist", Boolean(candidate.album_artist?.trim()), 4],
-    ["ISRC", Boolean(candidate.isrc?.trim()), 4],
-  ];
-  return {
-    score: fields
-      .filter(([, present]) => present)
-      .reduce((total, [, , weight]) => total + weight, 0),
-    coreComplete: fields.slice(0, 4).every(([, present]) => present),
-    missing: fields.filter(([, present]) => !present).map(([name]) => name),
-  };
-}
-
 /** Filing stopped because the library probably has this song already. */
 export const isPossibleDuplicate = (track: Track) =>
   track.stage === "review" &&
   (track.stage_message ?? "").startsWith("Possible duplicate: you may already have this song as ");
+
+/** The title and artist a row shows: the chosen match, else the file's tags, else the file name. */
+export function trackTitle(track: Track) {
+  const candidate = selectedCandidate(track) ?? track.candidates[0];
+  return candidate?.title || track.current_title || fileStem(track.filename);
+}
+export function trackArtist(track: Track) {
+  const candidate = selectedCandidate(track) ?? track.candidates[0];
+  return candidate?.artist || track.current_artist || "";
+}
+
+/** A chosen match that still needs a cover before the song can be filed. */
+export function needsCover(track: Track) {
+  const candidate = selectedCandidate(track);
+  return Boolean(candidate && candidate.artwork_status !== "verified");
+}
+
+/** The one-line reason a song waits in Review. */
+export function reviewReason(track: Track) {
+  if (isPossibleDuplicate(track)) return "Maybe already in your library";
+  if (hasRetryableArtwork(track)) return "Cover download failed";
+  if (needsCover(track)) return "Needs a cover";
+  const count = track.candidates.length;
+  if (count > 1) return `${count} releases match`;
+  if (count === 1) return "One match, not sure";
+  return "Nothing recognized it";
+}
+
+/** The one-line reason a song is in Issues. */
+export function problemReason(track: Track) {
+  if (track.status === "corrupt") return "Damaged file";
+  if (track.is_missing) return "File is missing";
+  if (track.stage === "skipped") return "Duplicate upload, skipped";
+  if (track.status === "provider_error") return "A source was unavailable";
+  return "Could not be processed";
+}
+
+/** A review song whose first match is strong enough to accept without a look. */
+export function isConfident(track: Track) {
+  return (
+    isReview(track) &&
+    !isProblem(track) &&
+    !hasRetryableArtwork(track) &&
+    !isPossibleDuplicate(track) &&
+    track.candidates.length > 0 &&
+    track.candidates[0].score >= 85 &&
+    (track.candidates.length === 1 || track.candidates[0].score - track.candidates[1].score >= 8)
+  );
+}
+
+export type Chip = { text: string; tone: "good" | "warn" | "plain" };
+
+/** What sets a release apart from the file, as short chips. Only differences are shown. */
+export function candidateChips(track: Track, candidate: Candidate, rank: number): Chip[] {
+  const chips: Chip[] = [];
+  const signals = candidateSignals(track, candidate);
+  if (rank === 1 && candidate.score >= 85) chips.push({ text: "Best match", tone: "good" });
+  else if (candidate.score < 55) chips.push({ text: "Weak match", tone: "warn" });
+  const [title, artist, album, duration] = signals;
+  if (title.tone === "warning")
+    chips.push({ text: titleDifference(track.current_title, candidate.title), tone: "warn" });
+  if (artist.tone === "warning") chips.push({ text: "Different artist", tone: "warn" });
+  if (album.tone === "warning" && track.current_album)
+    chips.push({ text: "Different album", tone: "warn" });
+  if (duration.tone === "warning") chips.push({ text: "Length differs", tone: "warn" });
+  if (candidate.artwork_status === "cover_required")
+    chips.push({ text: "No cover found", tone: "warn" });
+  chips.push({ text: candidateSources(candidate), tone: "plain" });
+  return chips;
+}
+
+function titleDifference(original?: string, proposed?: string) {
+  if (!proposed) return "No title";
+  const extra = proposed.match(/\((.+?)\)|\[(.+?)\]|- (.+)$/);
+  if (
+    extra &&
+    original &&
+    proposed.toLocaleLowerCase().startsWith(original.toLocaleLowerCase().trim())
+  )
+    return `Title adds “${extra[1] ?? extra[2] ?? extra[3]}”`;
+  return "Different title";
+}
+
+/** The tag fields a match changes, for "what changes in your file". */
+export function changedFields(track: Track, candidate: Candidate) {
+  const rows: Array<{ label: string; from?: string; to?: string }> = [
+    { label: "Title", from: track.current_title, to: candidate.title },
+    { label: "Artist", from: track.current_artist, to: candidate.artist },
+    { label: "Album", from: track.current_album, to: candidate.album },
+    { label: "Album artist", from: track.current_album_artist, to: candidate.album_artist },
+    {
+      label: "Track",
+      from: track.current_track_number?.toString(),
+      to: candidate.track_number
+        ? `${candidate.track_number}${candidate.track_total ? ` of ${candidate.track_total}` : ""}`
+        : undefined,
+    },
+    { label: "Year", to: candidate.year || candidate.release_date?.slice(0, 4) },
+    { label: "Genre", to: candidate.genre },
+  ];
+  return rows.filter((row) => row.to && row.to !== row.from);
+}

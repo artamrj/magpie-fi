@@ -15,14 +15,13 @@ export function EmptyState({
 }) {
   return (
     <div className="empty-state">
-      <span>
-        <Icon name={icon} size={28} />
+      <span className="empty-icon">
+        <Icon name={icon} size={30} />
       </span>
       <h2>{title}</h2>
       <p>{description}</p>
       {action && (
-        <button className="compact-button" onClick={onAction}>
-          <Icon name="refresh" size={15} />
+        <button type="button" className="text-button" onClick={onAction}>
           {action}
         </button>
       )}
@@ -30,17 +29,18 @@ export function EmptyState({
   );
 }
 
-export function QueueSkeleton() {
+export function ListSkeleton({ rows = 5 }: { rows?: number }) {
   return (
-    <div className="skeleton-list" aria-label="Loading tracks">
-      {[1, 2, 3, 4, 5].map((item) => (
-        <div key={item}>
-          <i />
-          <span>
-            <b />
-            <small />
+    <div className="list skeleton-list" aria-label="Loading">
+      {Array.from({ length: rows }, (_, index) => (
+        <div className="cell has-lead" key={index}>
+          <span className="cell-lead">
+            <i className="skeleton artwork artwork-small" />
           </span>
-          <em />
+          <span className="cell-main">
+            <i className="skeleton line" />
+            <i className="skeleton line short" />
+          </span>
         </div>
       ))}
     </div>

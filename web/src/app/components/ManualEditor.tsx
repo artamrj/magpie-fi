@@ -2,14 +2,35 @@ import { useState } from "react";
 import { api, post } from "../../api/client";
 import type { ArtistCredit, Candidate, Track } from "../../api/types";
 import { Icon } from "../Icons";
+import { Section, Spinner } from "./ui";
 
+const labels: Record<string, string> = {
+  title: "Title",
+  artist: "Artist",
+  album: "Album",
+  album_artist: "Album artist",
+  track_number: "Track number",
+  year: "Year",
+  release_date: "Release date",
+  genre: "Genre",
+  composer: "Composer",
+  label: "Label",
+  isrc: "ISRC",
+  cover_url: "Cover link",
+};
+
+/** Edits the tags by hand or from a song link. Saved by the screen's "Save tags" button. */
 export function ManualEditor({
   track,
   candidate,
+  onBusy,
+  onError,
   onSaved,
 }: {
   track: Track;
   candidate?: Candidate;
+  onBusy: (saving: boolean) => void;
+  onError: (message: string) => void;
   onSaved: () => Promise<void>;
 }) {
   const [form, setForm] = useState<Record<string, string | number>>({
@@ -37,12 +58,12 @@ export function ManualEditor({
       ? candidate.album_artist_credits
       : [{ name: candidate?.album_artist || track.current_album_artist || "", join_phrase: "" }],
   );
-  const [feedback, setFeedback] = useState<{ error?: boolean; text: string }>();
   const [resolving, setResolving] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [imported, setImported] = useState("");
+
   const resolveSource = async () => {
     setResolving(true);
-    setFeedback(undefined);
+    setImported("");
     try {
       const found = await post<Candidate>("/source/resolve", { url: sourceUrl });
       setForm((current) => ({
@@ -62,16 +83,21 @@ export function ManualEditor({
       }));
       if (found.artist_credits?.length) setArtistCredits(found.artist_credits);
       if (found.album_artist_credits?.length) setAlbumArtistCredits(found.album_artist_credits);
-      setFeedback({ text: `Loaded metadata and artwork for ${found.artist || "this track"}.` });
+      setImported(`Filled in from ${found.artist || "the link"}. Check the fields, then save.`);
     } catch (reason) {
-      setFeedback({ error: true, text: (reason as Error).message });
+      onError((reason as Error).message);
     } finally {
       setResolving(false);
     }
   };
-  const save = async () => {
-    setSaving(true);
-    setFeedback(undefined);
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!String(form.title).trim() || !String(form.artist).trim()) {
+      onError("A title and an artist are needed.");
+      return;
+    }
+    onBusy(true);
     try {
       await api(`/tracks/${track.id}/manual`, {
         method: "PUT",
@@ -88,93 +114,76 @@ export function ManualEditor({
       });
       await onSaved();
     } catch (reason) {
-      setFeedback({ error: true, text: (reason as Error).message });
+      onError((reason as Error).message);
     } finally {
-      setSaving(false);
+      onBusy(false);
     }
   };
-  const labels: Record<string, string> = {
-    title: "Title",
-    artist: "Artist",
-    album: "Album",
-    album_artist: "Album artist",
-    track_number: "Track number",
-    year: "Release year",
-    release_date: "Release date",
-    genre: "Genre",
-    composer: "Composer",
-    label: "Label",
-    isrc: "ISRC",
-    cover_url: "Cover artwork URL",
-  };
+
   return (
-    <section className="manual-editor" aria-labelledby="manual-title">
-      <div className="section-heading">
-        <div>
-          <p className="eyebrow">Manual correction</p>
-          <h3 id="manual-title">Edit proposed metadata</h3>
-        </div>
-      </div>
-      <div className="source-resolver">
-        <label>
-          <span>Use a track link</span>
+    <form id="manual-editor" onSubmit={(event) => void save(event)}>
+      <Section
+        title="Fill in from a link"
+        footer={
+          imported ||
+          "Spotify, Shazam, SoundCloud, Audiomack, Navahang, Genius, Radio Javan or YouTube."
+        }
+      >
+        <label className="field" style={{ borderRadius: 0 }}>
+          <Icon name="link" className="field-icon" />
           <input
+            id="source-link"
             value={sourceUrl}
             onChange={(event) => setSourceUrl(event.target.value)}
-            placeholder="Shazam, Spotify, SoundCloud, Audiomack, Navahang, Genius, Radio Javan, or YouTube URL"
+            placeholder="https://…"
+            inputMode="url"
+            autoComplete="off"
           />
+          <button
+            type="button"
+            className="small-button"
+            disabled={!sourceUrl.trim() || resolving}
+            onClick={() => void resolveSource()}
+          >
+            {resolving ? <Spinner size={16} /> : "Import"}
+          </button>
         </label>
-        <button
-          className="compact-button"
-          disabled={!sourceUrl.trim() || resolving}
-          onClick={() => void resolveSource()}
-        >
-          {resolving ? "Loading…" : "Import"}
-        </button>
-      </div>
-      {feedback && (
-        <p
-          className={`inline-feedback ${feedback.error ? "error" : "success"}`}
-          role={feedback.error ? "alert" : "status"}
-        >
-          {feedback.text}
-        </p>
-      )}
-      <div className="editor-grid">
+      </Section>
+
+      <Section title="Tags">
         {Object.entries(form).map(([name, value]) => (
-          <label className={name === "cover_url" ? "wide" : ""} key={name}>
+          <label className="field-row" key={name}>
             <span>{labels[name]}</span>
             <input
+              id={`tag-${name}`}
+              dir="auto"
               value={value}
+              inputMode={name === "track_number" || name === "year" ? "numeric" : undefined}
               onChange={(event) => setForm({ ...form, [name]: event.target.value })}
             />
           </label>
         ))}
-      </div>
-      <div className="editor-grid">
-        <ArtistCreditsEditor
-          label="Individual track artists"
-          credits={artistCredits}
-          onChange={setArtistCredits}
-        />
-        <ArtistCreditsEditor
-          label="Individual album artists"
+      </Section>
+
+      <Section
+        title="Artists on this song"
+        footer="One chip per artist. Duets and features get their own chip so each artist gets credit."
+      >
+        <CreditsEditor label="Track artists" credits={artistCredits} onChange={setArtistCredits} />
+        <CreditsEditor
+          label="Album artists"
           credits={albumArtistCredits}
           onChange={setAlbumArtistCredits}
         />
-      </div>
-      <button
-        className="primary-action editor-save"
-        disabled={saving || !String(form.title).trim() || !String(form.artist).trim()}
-        onClick={() => void save()}
-      >
-        {saving ? <span className="spinner" /> : <Icon name="check" />}Use this metadata
+      </Section>
+      <button type="submit" className="sr-only">
+        Save tags
       </button>
-    </section>
+    </form>
   );
 }
 
-function ArtistCreditsEditor({
+function CreditsEditor({
   label,
   credits,
   onChange,
@@ -199,13 +208,14 @@ function ArtistCreditsEditor({
     onChange([...next, { name: "", join_phrase: "" }]);
   };
   return (
-    <fieldset className="credit-editor wide">
-      <legend>{label}</legend>
+    <div className="field-row" style={{ alignItems: "start" }}>
+      <span style={{ paddingTop: 8 }}>{label}</span>
       <div className="credit-chips">
         {credits.map((credit, index) => (
-          <span className="credit-chip" key={`${index}-${credit.musicbrainz_id || "manual"}`}>
+          <span className="credit" key={`${index}-${credit.musicbrainz_id || "manual"}`}>
             <input
               aria-label={`${label} ${index + 1}`}
+              dir="auto"
               value={credit.name}
               onChange={(event) => update(index, event.target.value)}
             />
@@ -214,14 +224,15 @@ function ArtistCreditsEditor({
               aria-label={`Remove ${credit.name}`}
               onClick={() => remove(index)}
             >
-              ×
+              <Icon name="x" size={14} />
             </button>
           </span>
         ))}
-        <button type="button" className="compact-button" onClick={add}>
-          Add artist
+        <button type="button" className="small-button" onClick={add}>
+          <Icon name="plus" size={16} />
+          Add
         </button>
       </div>
-    </fieldset>
+    </div>
   );
 }

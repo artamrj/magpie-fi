@@ -99,7 +99,7 @@ src/
 │   └── lyrics.rs · provider_cache.rs · fingerprint_cache.rs · process.rs · resilient_http.rs
 ├── http/          API routes, login, security headers
 └── telegram/      bot client, commands and buttons, status messages, texts
-web/               React page (Vite): Get music, Review, Issues, Ready, inspector, settings
+web/               React page (Vite), built as a Telegram Mini App: Add, Review, Library
 migrations/        the SQLite schema
 ```
 
@@ -149,9 +149,21 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 
 - One axum server serves the API and the built web page from disk (`/usr/share/magpie-fi` in the
   image), so everything comes from one origin, as Telegram's Mini App rules require.
-- The web page has **Get music** (paste a link, follow it to the library), **All tracks**,
-  **Review**, **Issues**, **Ready**, an inspector with audio and cover previews, a manual
-  editor, recently added songs and a read-only settings panel.
+- The web page is designed as a Telegram Mini App and looks the same in a browser: one column
+  of Telegram-style grouped lists, colours from Telegram's theme variables (`--tg-theme-*`, with
+  Telegram's iOS day and night colours as fallbacks), and three tabs:
+  - **Add**: paste a link (or send one to the bot); every request with its progress; recently
+    added songs.
+  - **Review**: songs grouped by what has to happen to them (needs your pick, issues, ready to
+    file), with "Accept N confident matches" and "Check and repair" as the first rows. One song
+    opens as its own screen that asks one question: which release (a radio list with only the
+    differences as chips, details on demand), pick a cover, file anyway, repair, or remove. The
+    manual tag editor is a mode of that screen. The screen's action is Telegram's native Main
+    Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
+  - **Library**: counts, artists (rename, join, split a duet, from a bottom sheet) and status
+    (bot, sources, folders, log out).
+  A browser window wider than 1024 px shows a sidebar, the list and the song side by side
+  (Enter uses the match, → goes to the next song). Telegram's panel is never that wide.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
   bot's menu button or "📱 Open review" (`?view=review`).
 - The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
