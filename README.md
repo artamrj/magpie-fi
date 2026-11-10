@@ -52,7 +52,7 @@ Every minute magpie checks the inbox and its own downloads. For each new song it
    Persian catalogs, …),
 4. if it is sure, writes the tags, a verified cover, ReplayGain and synced lyrics, and files it as
    `Album Artist/Album (Year)/01 - Title.ext`,
-5. moves the original to `MUSIC_ROOT/.magpie/trash/` (kept 30 days) and asks Navidrome to scan.
+5. moves the original to `MUSIC_ROOT/.magpie/trash/` (kept 30 days) Navidrome's file watcher shows the song within seconds.
 
 Songs it is not sure about wait in **Review** on magpie's web page, where you pick the right
 match, paste a song link, or type the details.
@@ -84,9 +84,8 @@ use `docker compose pull` instead (see Releases).
 
 Then:
 
-1. **Navidrome:** open `http://<server>:4533` and create the admin user. Put the same login in
-   `.env` as `MAGPIE_NAVIDROME_USER` / `MAGPIE_NAVIDROME_PASSWORD` and run `docker compose up -d`
-   again, so new songs appear right after they are filed.
+1. **Navidrome:** open `http://<server>:4533` and create your user. magpie needs no Navidrome
+   login: Navidrome watches the library folder and shows new songs within seconds.
 2. **Add music:** copy files or whole folders into `MUSIC_ROOT/inbox`.
 3. **Review:** open `http://127.0.0.1:7331` on the server. From another computer, run
    `ssh -L 7331:127.0.0.1:7331 <server>` first.

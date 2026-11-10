@@ -2,7 +2,6 @@ use super::*;
 
 /// Read-only view of the configuration. Settings come from `MAGPIE_*`
 /// environment variables; the web page shows them but cannot change them.
-
 pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let cfg = s.config.read().await;
     let fpcalc = std::process::Command::new("fpcalc")
@@ -11,14 +10,6 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         .is_ok();
     let ffmpeg = crate::infrastructure::media::replaygain::available();
     let songrec = crate::infrastructure::providers::songrec::available();
-    let navidrome = match cfg.navidrome.as_ref() {
-        None => serde_json::json!({"configured": false}),
-        Some(navidrome) => serde_json::json!({
-            "configured": true,
-            "url": navidrome.url,
-            "reachable": crate::infrastructure::navidrome::ping(&s.client, navidrome).await.is_ok(),
-        }),
-    };
     let guests: i64 = sqlx::query_scalar("SELECT count(*) FROM telegram_guests")
         .fetch_one(&s.pool)
         .await
@@ -42,7 +33,6 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "trash_days": cfg.trash_days,
         "inbox_check_seconds": cfg.inbox_check_seconds,
         "lyrics": cfg.lyrics,
-        "navidrome": navidrome,
         "telegram": telegram,
         "library_songs": library_songs,
         "rsgain": crate::infrastructure::media::rsgain::available(),

@@ -8,7 +8,7 @@ pub mod store;
 pub mod worker;
 pub mod ytdlp;
 
-use crate::{app::AppState, application::library, infrastructure::navidrome};
+use crate::{app::AppState, application::library};
 use std::{path::Path, sync::Arc};
 
 /// Called by the filing step for every original it finishes with. When the
@@ -26,51 +26,27 @@ pub async fn downloaded_file_done(
     }
     let status = if already_owned { "in_library" } else { "filed" };
     match store::finished_download(&state.pool, original, library_path, status).await {
-        Ok(requests) if !requests.is_empty() => refresh_playlists(state, &requests, false).await,
+        Ok(requests) if !requests.is_empty() => refresh_playlists(state, &requests).await,
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not record a filed download"),
     }
 }
 
-/// Rewrites the playlist files of these requests. `scan` asks Navidrome to
-/// pick up the change (the filing step already scans after filing songs).
-pub async fn refresh_playlists(state: &Arc<AppState>, requests: &[i64], scan: bool) {
+/// Rewrites the playlist files of these requests. Navidrome's file watcher
+/// picks up the change.
+pub async fn refresh_playlists(state: &Arc<AppState>, requests: &[i64]) {
     let config = state.config.read().await.clone();
     let library_root = Path::new(&config.output_dir);
-    let mut changed = false;
     for request in requests {
         match store::playlist_for_request(&state.pool, *request).await {
             Ok(Some((name, songs))) => match library::write_playlist(library_root, &name, &songs)
                 .await
             {
-                Ok(true) => changed = true,
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => tracing::warn!(%error, playlist = %name, "could not write playlist"),
             },
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "could not read playlist songs"),
         }
-    }
-    if changed && scan {
-        state
-            .playlist_scan_pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// One Navidrome scan for all playlist changes since the last one (called by
-/// the worker when the download queue goes quiet).
-pub async fn scan_for_playlists(state: &Arc<AppState>) {
-    if !state
-        .playlist_scan_pending
-        .swap(false, std::sync::atomic::Ordering::Relaxed)
-    {
-        return;
-    }
-    let config = state.config.read().await.clone();
-    if let Some(navidrome_config) = config.navidrome.as_ref()
-        && let Err(error) = navidrome::start_scan(&state.client, navidrome_config).await
-    {
-        tracing::warn!(%error, "Navidrome scan request failed");
     }
 }

@@ -725,7 +725,8 @@ Turned ununknown into the magpie program and gave it a real library.
 - **Trash:** originals and replaced files go to `MUSIC_ROOT/.magpie/trash/<date>/`, emptied after
   `MAGPIE_TRASH_DAYS`.
 - **Extras:** `cover.jpg` per album, synced lyrics from LRCLIB (`.lrc`/`.txt`), track + album
-  ReplayGain (rsgain), `RELEASETYPE` tag, Navidrome scan after each batch.
+  ReplayGain (rsgain), `RELEASETYPE` tag. Navidrome's file watcher picks up new songs and
+  playlists; magpie needs no Navidrome login.
 - **Fix:** singles keep their own title as album name (ununknown renamed them all to "Single",
   which would merge every single of an artist into one Navidrome album).
 - **One image:** `ghcr.io/artamrj/magpie-fi`, Debian trixie + ffmpeg, fpcalc, SongRec, rsgain.

@@ -28,9 +28,6 @@ services:
       # Paths inside the container; the host paths are set by the volumes below.
       MAGPIE_MUSIC_ROOT: /music
       MAGPIE_DATA_DIR: /data
-      MAGPIE_NAVIDROME_URL: "${MAGPIE_NAVIDROME_URL:-http://navidrome:4533}"
-      MAGPIE_NAVIDROME_USER: "${MAGPIE_NAVIDROME_USER:-}"
-      MAGPIE_NAVIDROME_PASSWORD: "${MAGPIE_NAVIDROME_PASSWORD:-}"
       MAGPIE_INBOX_CHECK_SECONDS: "${MAGPIE_INBOX_CHECK_SECONDS:-}"
       MAGPIE_INBOX_SETTLE_SECONDS: "${MAGPIE_INBOX_SETTLE_SECONDS:-}"
       MAGPIE_TRASH_DAYS: "${MAGPIE_TRASH_DAYS:-}"

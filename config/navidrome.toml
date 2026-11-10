@@ -4,8 +4,11 @@
 MusicFolder = "/music"
 DataFolder = "/data"
 
-# The core files songs into the library; the watcher sees them within seconds.
-# The schedule is a safety net for NAS shares where the watcher may not fire.
+# magpie never talks to Navidrome: it files songs and playlists into the
+# library, and Navidrome's file watcher picks them up within seconds.
+# The hourly scan is a safety net for network shares (SMB/NFS), where the
+# watcher may not see changes.
+Scanner.WatcherEnabled = true
 Scanner.WatcherWait = "5s"
 Scanner.Schedule = "@every 1h"
 # Keep play counts and stars of files that moved. Clean up with `navidrome missing`.

@@ -63,7 +63,6 @@ pub async fn run(state: Arc<AppState>) {
                 }
                 Ok(None) => {
                     drop(slot);
-                    super::scan_for_playlists(&state).await;
                     break;
                 }
                 Err(error) => {
@@ -98,7 +97,7 @@ async fn process(state: &Arc<AppState>, row: WantedRow) {
             if let Err(error) = store::mark_in_library(&state.pool, row.id, &path).await {
                 tracing::warn!(%error, "could not record a library song");
             }
-            super::refresh_playlists(state, &[row.request_id], true).await;
+            super::refresh_playlists(state, &[row.request_id]).await;
         }
         Ok(Outcome::Downloaded { path, youtube_id }) => {
             tracing::info!(song = %label, file = %path.display(), "downloaded; identifying next");

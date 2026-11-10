@@ -1166,7 +1166,6 @@ dependencies = [
  "hmac",
  "image",
  "lofty",
- "md-5",
  "percent-encoding",
  "reqwest",
  "serde",

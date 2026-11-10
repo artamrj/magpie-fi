@@ -99,8 +99,6 @@ pub struct AppState {
     pub workflow: RwLock<Workflow>,
     automation_notify: Notify,
     acquire_notify: Notify,
-    /// A playlist file changed without a filing step that scans Navidrome.
-    pub playlist_scan_pending: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -126,7 +124,6 @@ impl AppState {
             }),
             automation_notify: Notify::new(),
             acquire_notify: Notify::new(),
-            playlist_scan_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

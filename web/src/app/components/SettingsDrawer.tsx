@@ -6,7 +6,6 @@ import { providerName } from "../trackUtils";
 
 /** Read-only status. Settings live in the server's .env file (MAGPIE_*). */
 export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () => void }) {
-  const navidrome = setup.navidrome;
   const me = useQuery({ queryKey: ["me"], queryFn: () => api<Me>("/me"), staleTime: Infinity });
   const logOut = async () => {
     await api("/logout", { method: "POST", body: "{}" }).catch(() => undefined);
@@ -52,11 +51,7 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
           <section>
             <h3>Navidrome</h3>
             <p className="settings-hint">
-              {!navidrome.configured
-                ? "Not connected. Navidrome still finds new songs with its own scanner."
-                : navidrome.reachable
-                  ? `Connected to ${navidrome.url}. A scan starts after new songs are filed.`
-                  : `Cannot reach ${navidrome.url}. Check the URL, user and password.`}
+              Navidrome watches the library folder and shows new songs within seconds.
             </p>
           </section>
           <section>

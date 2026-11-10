@@ -520,25 +520,11 @@ async fn health_text(context: &Context) -> String {
     let writable = tokio::fs::metadata(&config.output_dir)
         .await
         .is_ok_and(|metadata| !metadata.permissions().readonly());
-    let navidrome = match config.navidrome.as_ref() {
-        None => "not connected".to_owned(),
-        Some(navidrome) => {
-            if crate::infrastructure::navidrome::ping(&context.state.client, navidrome)
-                .await
-                .is_ok()
-            {
-                "✅ reachable".into()
-            } else {
-                "⚠️ not reachable".into()
-            }
-        }
-    };
     let check = |ok: bool| if ok { "✅" } else { "⚠️" };
     format!(
         "<b>Health</b>\n\
          Library: {} {songs} songs\n\
-         yt-dlp: {}\n\
-         Navidrome: {navidrome}",
+         yt-dlp: {}",
         check(writable),
         check(crate::acquire::ytdlp::available(&config)),
     )

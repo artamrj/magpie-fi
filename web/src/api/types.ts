@@ -11,7 +11,6 @@ export type Setup = {
   ytdlp: boolean;
   audio_format: string;
   max_parallel_downloads: number;
-  navidrome: { configured: boolean; url?: string; reachable?: boolean };
   telegram: { configured: boolean; owners?: number; guests?: number };
   sources: Record<string, boolean>;
 };

@@ -210,7 +210,7 @@ The **apply service** (`src/application/apply.rs`) files every Ready track:
    - Inbox duplicates are finished the same way (`finish_duplicate`); the `tracks`
      row is deleted.
 3. **After the batch** — `rsgain easy` re-measures every album folder that got new
-   songs (album gain), then one Navidrome `startScan` (when a login is configured).
+   songs (album gain). Navidrome's file watcher picks up the new files; magpie never calls Navidrome.
 
 ---
 
@@ -516,7 +516,7 @@ are evicted first (checked at startup and hourly while idle).
 | Configuration | `src/config.rs` |
 | SQLite schema | `migrations/*.sql` |
 | Library layout, trash, index, folder cover | `src/application/library.rs` |
-| Lyrics, Navidrome, album gain | `src/infrastructure/lyrics.rs`, `navidrome.rs`, `media/rsgain.rs` |
+| Lyrics, album gain | `src/infrastructure/lyrics.rs`, `media/rsgain.rs` |
 | Configuration | `src/config.rs` |
 | Web page | `web/src/app/App.tsx` |
 
@@ -537,5 +537,5 @@ Review → choose / auto-select / manual / source-link / artwork / retry-issues
 File → per song: already in library? (skip or lossless upgrade) → ReplayGain
      → verified cover → copy to temp → write+verify tags → atomic no-clobber publish
      → original to trash → index → cover.jpg → lyrics
-     → after the batch: album gain (rsgain) → Navidrome scan
+     → after the batch: album gain (rsgain) → Navidrome's watcher sees the files
 ```

@@ -9,7 +9,6 @@ use crate::{
         db::tracks::{CandidateRow, TRACK_FIELDS, Track, candidates_by_track, selected_for_tracks},
         fingerprint_cache, lyrics,
         media::{fingerprint, replaygain, rsgain, tag_writer},
-        navidrome,
         providers::Candidate,
     },
     types::{TrackId, WorkflowPhase},
@@ -949,7 +948,7 @@ pub async fn apply(s: Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
             .execute(&s.pool)
             .await?;
     }
-    finish_batch(&s, &cfg, touched_albums, filed).await;
+    finish_batch(&touched_albums).await;
     Ok(filed)
 }
 
@@ -1024,40 +1023,13 @@ async fn save_lyrics(s: &Arc<AppState>, item: &PreviewItem, audio: &std::path::P
     }
 }
 
-/// After a batch: album ReplayGain for every album folder that got new songs,
-/// then one Navidrome scan so the songs appear right away.
-async fn finish_batch(
-    s: &Arc<AppState>,
-    cfg: &Config,
-    touched_albums: std::collections::BTreeSet<PathBuf>,
-    filed: usize,
-) {
+/// After a batch: album ReplayGain for every album folder that got new songs.
+/// Navidrome's file watcher picks up the new files by itself.
+async fn finish_batch(touched_albums: &std::collections::BTreeSet<PathBuf>) {
     if !touched_albums.is_empty() && rsgain::available() {
-        for folder in &touched_albums {
+        for folder in touched_albums {
             if let Err(error) = rsgain::tag_album_folder(folder).await {
                 tracing::warn!(%error, "album ReplayGain failed");
-            }
-        }
-    }
-    if filed == 0 {
-        return;
-    }
-    if let Some(navidrome_config) = cfg.navidrome.as_ref() {
-        match navidrome::start_scan(&s.client, navidrome_config).await {
-            Ok(()) => {
-                s.log_entry(ActivityLogEntry::new(
-                    "ok",
-                    "navidrome",
-                    format!("Asked Navidrome to scan for {filed} new songs"),
-                ))
-                .await;
-            }
-            Err(error) => {
-                s.log_entry(
-                    ActivityLogEntry::new("warn", "navidrome", "Navidrome scan request failed")
-                        .error(error.as_ref()),
-                )
-                .await;
             }
         }
     }

@@ -14,13 +14,6 @@ pub const USER_AGENT: &str = concat!(
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NavidromeConfig {
-    pub url: String,
-    pub user: String,
-    pub password: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TelegramConfig {
     pub token: String,
     /// Telegram user IDs that may use the bot and invite guests.
@@ -53,7 +46,6 @@ pub struct Config {
     pub inbox_settle_seconds: u64,
     pub trash_days: u64,
     pub lyrics: bool,
-    pub navidrome: Option<NavidromeConfig>,
     pub telegram: Option<TelegramConfig>,
     /// The magpie rhyme at the end of finished Telegram requests.
     pub rhyme: bool,
@@ -107,7 +99,6 @@ impl Config {
             inbox_settle_seconds: 30,
             trash_days: 30,
             lyrics: true,
-            navidrome: None,
             telegram: None,
             rhyme: true,
             public_url: None,
@@ -188,26 +179,6 @@ impl Config {
         }
         config.ytdlp_cookies = get("MAGPIE_YTDLP_COOKIES").map(PathBuf::from);
         config.ytdlp_self_update = flag("MAGPIE_YTDLP_SELF_UPDATE", false)?;
-
-        // Without a login there is no Navidrome connection (the URL alone is fine:
-        // Docker Compose always sets it). A login without a URL, or half a login,
-        // is a mistake worth stopping for.
-        config.navidrome = match (
-            get("MAGPIE_NAVIDROME_URL"),
-            get("MAGPIE_NAVIDROME_USER"),
-            get("MAGPIE_NAVIDROME_PASSWORD"),
-        ) {
-            (_, None, None) => None,
-            (Some(url), Some(user), Some(password)) => Some(NavidromeConfig {
-                url: url.trim_end_matches('/').to_owned(),
-                user,
-                password,
-            }),
-            _ => bail!(
-                "to connect Navidrome set MAGPIE_NAVIDROME_URL, MAGPIE_NAVIDROME_USER \
-                 and MAGPIE_NAVIDROME_PASSWORD together"
-            ),
-        };
 
         config.telegram = match get("MAGPIE_TELEGRAM_BOT_TOKEN") {
             None => None,
@@ -336,33 +307,6 @@ mod tests {
             PathBuf::from("/srv/music/.magpie/staging")
         );
         assert_eq!(config.db_path, "/data/magpie.sqlite");
-    }
-
-    #[test]
-    fn navidrome_connects_only_with_a_full_login() {
-        let url_only = from(&[("MAGPIE_NAVIDROME_URL", "http://nd:4533")]).unwrap();
-        assert!(url_only.navidrome.is_none());
-        assert!(
-            from(&[
-                ("MAGPIE_NAVIDROME_URL", "http://nd:4533"),
-                ("MAGPIE_NAVIDROME_USER", "admin"),
-            ])
-            .is_err()
-        );
-        assert!(
-            from(&[
-                ("MAGPIE_NAVIDROME_USER", "admin"),
-                ("MAGPIE_NAVIDROME_PASSWORD", "secret"),
-            ])
-            .is_err()
-        );
-        let config = from(&[
-            ("MAGPIE_NAVIDROME_URL", "http://nd:4533/"),
-            ("MAGPIE_NAVIDROME_USER", "admin"),
-            ("MAGPIE_NAVIDROME_PASSWORD", "secret"),
-        ])
-        .unwrap();
-        assert_eq!(config.navidrome.unwrap().url, "http://nd:4533");
     }
 
     #[test]
