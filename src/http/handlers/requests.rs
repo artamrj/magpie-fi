@@ -54,3 +54,23 @@ pub async fn retry_request(
     s.notify_acquire();
     Ok(Json(serde_json::json!({"queued": queued})))
 }
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct RecentSong {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    added_at: String,
+}
+
+/// `GET /api/library/recent` — the songs filed most recently.
+pub async fn recent_library(State(s): State<Arc<AppState>>) -> ApiResult<Json<Vec<RecentSong>>> {
+    Ok(Json(
+        sqlx::query_as(
+            "SELECT title,artist,album,added_at FROM library_items WHERE source='inbox'
+             ORDER BY added_at DESC LIMIT 30",
+        )
+        .fetch_all(&s.pool)
+        .await?,
+    ))
+}

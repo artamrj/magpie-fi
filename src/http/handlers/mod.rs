@@ -24,7 +24,7 @@ mod tracks;
 mod workspace;
 
 pub use apply::start_apply;
-pub use requests::{create_request, list_requests, request_songs, retry_request};
+pub use requests::{create_request, list_requests, recent_library, request_songs, retry_request};
 pub use scan::{check_inbox, retry_issues, run_automatic_cycle, stop_scan};
 pub use settings::setup;
 pub use tracks::{

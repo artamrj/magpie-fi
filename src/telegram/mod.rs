@@ -81,10 +81,24 @@ pub async fn run(state: Arc<AppState>) {
                 {"command": "queue", "description": "What is on the way"},
                 {"command": "health", "description": "Is everything working"},
                 {"command": "guests", "description": "Invite people (owners)"},
+                {"command": "web", "description": "Log in to the web page (owners)"},
                 {"command": "id", "description": "Your Telegram ID"},
             ]}),
         )
         .await;
+    // Owners get a "magpie" button next to the message box that opens the web page.
+    if let Some(url) = mini_app_url(&state.config.read().await.public_url, "") {
+        for owner in &config.owners {
+            let _: Option<bool> = bot
+                .try_call(
+                    "setChatMenuButton",
+                    &json!({"chat_id": owner, "menu_button": {
+                        "type": "web_app", "text": "magpie", "web_app": {"url": url}
+                    }}),
+                )
+                .await;
+        }
+    }
     let context = Arc::new(Context {
         state,
         bot,
@@ -445,6 +459,28 @@ async fn on_command(
         "queue" => send(context, chat, &queue_text(context).await?, None).await,
         "health" => send(context, chat, &health_text(context).await, None).await,
         "seven" => send(context, chat, &seven_text(context).await?, None).await,
+        "web" if role == Role::Owner => {
+            let public_url = context.state.config.read().await.public_url.clone();
+            let base = public_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:7331".into());
+            let link =
+                crate::http::auth::create_login_link(&context.state.pool, user_id, &base).await?;
+            let text = format!(
+                "Your login link for the web page. It works once, for 10 minutes, and keeps \
+                 that browser logged in for 30 days:\n{}{}",
+                texts::escape(&link),
+                if public_url.is_none() {
+                    "\n\nOpen it on the server itself (MAGPIE_PUBLIC_URL is not set)."
+                } else {
+                    ""
+                }
+            );
+            let keyboard = public_url
+                .is_some()
+                .then(|| json!({"inline_keyboard": [[{"text": "🌐 Open magpie", "url": link}]]}));
+            send_with(context, chat, &text, None, keyboard).await
+        }
         "guests" if role == Role::Owner => {
             let (text, keyboard) = guests_view(context).await?;
             send_with(context, chat, &text, None, Some(keyboard)).await
@@ -809,6 +845,18 @@ async fn details_text(context: &Context, request: i64) -> Result<String> {
         text.push_str(&format!("…and {} more", problems.len() - 30));
     }
     Ok(text)
+}
+
+/// The web page as a Telegram Mini App. Telegram only opens HTTPS addresses.
+pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
+    let url = public_url
+        .as_deref()
+        .filter(|url| url.starts_with("https://"))?;
+    Some(if view.is_empty() {
+        format!("{url}/")
+    } else {
+        format!("{url}/?view={view}")
+    })
 }
 
 fn invite_token() -> String {

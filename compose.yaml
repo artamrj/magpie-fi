@@ -15,10 +15,11 @@ services:
     build: .
     image: ghcr.io/artamrj/magpie-fi:${MAGPIE_TAG:-latest}
     restart: unless-stopped
-    # Web page (review, status). Keep it on loopback: it has no login yet.
-    # From another computer: ssh -L 7331:127.0.0.1:7331 <server>
+    # Web page (Get music, Review, status), published on loopback only. To open it
+    # from your phone or inside Telegram, give it an HTTPS address (README:
+    # "Phone and Telegram Mini App"); with Telegram set up it then needs a login.
     ports:
-      - "127.0.0.1:${MAGPIE_PORT:-7331}:7331"
+      - "${MAGPIE_PORT:-7331}:7331"
     # Settings come from .env (see .env.example). Empty means "off" or default.
     environment:
       PUID: "${PUID:-1000}"
@@ -44,6 +45,7 @@ services:
       MAGPIE_TELEGRAM_OWNERS: "${MAGPIE_TELEGRAM_OWNERS:-}"
       MAGPIE_TELEGRAM_API_URL: "${MAGPIE_TELEGRAM_API_URL:-}"
       MAGPIE_RHYME: "${MAGPIE_RHYME:-}"
+      MAGPIE_PUBLIC_URL: "${MAGPIE_PUBLIC_URL:-}"
       MAGPIE_ACOUSTID_KEY: "${MAGPIE_ACOUSTID_KEY:-}"
       MAGPIE_AUDD_TOKEN: "${MAGPIE_AUDD_TOKEN:-}"
       MAGPIE_SPOTIFY_CLIENT_ID: "${MAGPIE_SPOTIFY_CLIENT_ID:-}"
@@ -77,28 +79,6 @@ services:
     pids_limit: 512
     stop_grace_period: 45s
 
-  navidrome:
-    image: ghcr.io/navidrome/navidrome:${NAVIDROME_TAG:-0.64.2}
-    restart: unless-stopped
-    # Navidrome runs directly as the host user. If your NAS rejects `user:`,
-    # remove this line; Navidrome then runs as its image default (uid 1000).
-    user: "${PUID:-1000}:${PGID:-1000}"
-    ports:
-      - "${NAVIDROME_PORT:-4533}:4533"
-    environment:
-      ND_CONFIGFILE: /config/navidrome.toml
-    volumes:
-      - ${MUSIC_ROOT:-./music}/library:/music:ro
-      - ${DATA_ROOT:-./data}/navidrome:/data
-      - ${DATA_ROOT:-./data}/navidrome-backup:/backup
-      - ./config/navidrome.toml:/config/navidrome.toml:ro
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:4533/ping"]
-      interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
-
   # Optional: Telegram's own Bot API server, so people can send files up to
   # 2 GB instead of 20 MB. Needs TELEGRAM_API_ID / TELEGRAM_API_HASH from
   # https://my.telegram.org and MAGPIE_TELEGRAM_API_URL=http://tgapi:8081 in .env.
@@ -113,6 +93,19 @@ services:
       TELEGRAM_LOCAL: "1"
     volumes:
       - tgapi-files:/var/lib/telegram-bot-api
+
+  # Optional: a Cloudflare Tunnel that gives the web page an HTTPS address for
+  # the Telegram Mini App. In Cloudflare Zero Trust create a tunnel with a public
+  # hostname pointing to http://magpie:7331, put its token in .env as
+  # CLOUDFLARE_TUNNEL_TOKEN and the hostname as MAGPIE_PUBLIC_URL.
+  # Start it with: docker compose --profile tunnel up -d
+  tunnel:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
 
 volumes:
   # Files received by the tgapi helper; magpie reads them from the same path.

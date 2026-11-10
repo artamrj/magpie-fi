@@ -131,7 +131,12 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
         }
     });
-    let api = http::router().layer(middleware::from_fn(http::protect_local_api));
+    let api = http::router()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            http::auth::require_login,
+        ))
+        .layer(middleware::from_fn(http::protect_local_api));
     let app = Router::new().nest("/api", api);
     let app = if let Some(directory) = &frontend {
         app.fallback_service(

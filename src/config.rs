@@ -57,6 +57,8 @@ pub struct Config {
     pub telegram: Option<TelegramConfig>,
     /// The magpie rhyme at the end of finished Telegram requests.
     pub rhyme: bool,
+    /// The web page's public HTTPS address (needed for the Telegram Mini App).
+    pub public_url: Option<String>,
     /// `m4a` or `opus`: YouTube's own audio stream, never re-encoded to another lossy format.
     pub audio_format: AudioFormat,
     pub max_parallel_downloads: usize,
@@ -108,6 +110,7 @@ impl Config {
             navidrome: None,
             telegram: None,
             rhyme: true,
+            public_url: None,
             audio_format: AudioFormat::M4a,
             max_parallel_downloads: 2,
             download_pause_seconds: 3,
@@ -227,6 +230,13 @@ impl Config {
             }
         };
         config.rhyme = flag("MAGPIE_RHYME", true)?;
+        config.public_url =
+            get("MAGPIE_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_owned());
+        if let Some(url) = config.public_url.as_deref()
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            bail!("MAGPIE_PUBLIC_URL must start with https:// (or http:// on your own network)");
+        }
 
         let text = |field: &mut String, name: &str| {
             if let Some(value) = get(name) {
@@ -256,6 +266,12 @@ impl Config {
             &mut config.musicbrainz_user_agent,
             "MAGPIE_MUSICBRAINZ_USER_AGENT",
         );
+        if config.public_url.is_some() && config.telegram.is_none() {
+            bail!(
+                "MAGPIE_PUBLIC_URL needs Telegram: without MAGPIE_TELEGRAM_BOT_TOKEN the web page \
+                 has no login and must not be reachable from the internet"
+            );
+        }
         config.normalize();
         Ok(config)
     }
@@ -397,6 +413,19 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_public_address_requires_the_telegram_login() {
+        assert!(from(&[("MAGPIE_PUBLIC_URL", "https://magpie.example")]).is_err());
+        let config = from(&[
+            ("MAGPIE_PUBLIC_URL", "https://magpie.example/"),
+            ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
+            ("MAGPIE_TELEGRAM_OWNERS", "1"),
+        ])
+        .unwrap();
+        assert_eq!(config.public_url.as_deref(), Some("https://magpie.example"));
+        assert!(from(&[("MAGPIE_PUBLIC_URL", "magpie.example")]).is_err());
     }
 
     #[test]

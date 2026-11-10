@@ -11,6 +11,10 @@ use std::sync::Arc;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
+        .route("/me", get(crate::http::auth::me))
+        .route("/login", get(crate::http::auth::login))
+        .route("/logout", post(crate::http::auth::logout))
+        .route("/library/recent", get(handlers::recent_library))
         .route("/setup", get(handlers::setup))
         .route("/status", get(handlers::workspace))
         .route("/inbox/check", post(handlers::check_inbox))

@@ -48,6 +48,7 @@ pub fn help(owner: bool) -> String {
     );
     if owner {
         text.push_str("/guests · invite people or remove them\n");
+        text.push_str("/web · log in to the web page\n");
     }
     text.push_str("\n<i>");
     for (index, line) in RHYME.iter().enumerate() {

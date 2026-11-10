@@ -243,7 +243,19 @@ fn evaluate<'a>(
     }
 }
 
+/// A candidate whose length differs more than this from the file is never
+/// chosen automatically. Catalogs searched with the same tags agreeing with
+/// each other says nothing about the audio itself (a wrongly tagged file).
+const MAX_AUTOMATIC_DURATION_GAP_SECONDS: f64 = 15.0;
+
 fn is_supported(candidate: &Evaluated<'_>) -> bool {
+    if candidate
+        .candidate
+        .duration_delta
+        .is_some_and(|delta| delta > MAX_AUTOMATIC_DURATION_GAP_SECONDS)
+    {
+        return false;
+    }
     let exact_text = candidate.title_available
         && candidate.artist_available
         && candidate.title_similarity >= 0.90
@@ -476,6 +488,40 @@ mod tests {
             score_breakdown: Some(serde_json::json!({"sources":[provider]}).to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn agreeing_catalogs_cannot_outvote_the_audio_length() {
+        // A two-minute file tagged as a famous song: every catalog finds that
+        // song by its tags, but the song is 80 seconds longer than the file.
+        let evidence = TrackEvidence {
+            filename: "test-tone.m4a",
+            title: Some("Perfect"),
+            artist: Some("Ed Sheeran"),
+            album: None,
+        };
+        let mut wrong = Vec::new();
+        for (id, provider) in [(1, "itunes"), (2, "deezer"), (3, "musicbrainz")] {
+            let mut song = candidate(id, provider, "Perfect", "÷", 95.0);
+            song.duration_delta = Some(80.0);
+            song.score_breakdown = Some(
+                serde_json::json!({"sources": ["itunes", "deezer", "musicbrainz"]}).to_string(),
+            );
+            wrong.push(song);
+        }
+        assert!(select(evidence, &wrong).is_none());
+
+        // The same agreement with a matching length is still filed automatically.
+        for song in &mut wrong {
+            song.duration_delta = Some(1.0);
+        }
+        let evidence = TrackEvidence {
+            filename: "test-tone.m4a",
+            title: Some("Perfect"),
+            artist: Some("Ed Sheeran"),
+            album: None,
+        };
+        assert!(select(evidence, &wrong).is_some());
     }
 
     #[test]

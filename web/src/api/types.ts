@@ -15,6 +15,20 @@ export type Setup = {
   telegram: { configured: boolean; owners?: number; guests?: number; large_files?: boolean };
   sources: Record<string, boolean>;
 };
+/** Who is using the page (GET /api/me). */
+export type Me = {
+  user_id: number;
+  name?: string;
+  role: "owner" | "guest";
+  via: "telegram" | "session" | "local";
+};
+/** A song filed recently (GET /api/library/recent). */
+export type RecentSong = {
+  title?: string;
+  artist?: string;
+  album?: string;
+  added_at: string;
+};
 /** A link someone asked for (GET /api/requests). */
 export type MusicRequest = {
   id: number;

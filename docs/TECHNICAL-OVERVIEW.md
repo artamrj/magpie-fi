@@ -239,6 +239,20 @@ deleted after filing instead of going to the trash.
 | Status | `status.rs` | Every 3 s: redraws each open request's status message when its text changed, closes it when nothing is on the way or waiting for review, and asks about Telegram songs that wait in review (candidate buttons call the same choose/remove handlers as the web page). |
 | Texts | `texts.rs` | Every message the bot sends, the progress bar and the rhyme. |
 
+## 4d. Web page login (`src/http/auth.rs`)
+
+- Without Telegram the page needs no login (it is published on loopback only, and
+  `MAGPIE_PUBLIC_URL` is refused).
+- With Telegram, `require_login` guards every `/api` route except `health`, `login` and `me`:
+  - **Mini App:** `Authorization: tma <initData>`; the HMAC-SHA256 signature is checked with a key
+    derived from the bot token, and the data may be at most 24 h old. `/api/me` also sets a session
+    cookie, so `<img>` and `<audio>` requests (which cannot send the header) work.
+  - **Browser:** `/web` in the bot creates a one-time link (`login_links`, 10 minutes) →
+    `/api/login` starts a 30-day session (`sessions`, `HttpOnly` cookie, `SameSite=None; Secure`
+    over HTTPS). Tokens are stored as SHA-256 hashes.
+  - Only owners get through; guests get 403 and use the bot.
+- The page's CSP allows Telegram's Mini App script and framing by `web.telegram.org`, nothing else.
+
 ## 5a. Library index
 
 `library_items` (`src/application/library.rs`) keeps one row per audio file in the
@@ -470,6 +484,10 @@ are evicted first (checked at startup and hourly while idle).
 | `POST /api/source/resolve` | Resolve a Shazam/Spotify/YouTube/… link to metadata |
 | `GET  /api/candidates/{id}/artwork/preview`, etc. | Artwork previews |
 | `POST /api/write` | File all Ready tracks into the library now |
+| `GET  /api/me` | Who is using the page (or 401: log in) |
+| `GET  /api/login?token=` | Use a one-time login link (from `/web`), start a session |
+| `POST /api/logout` | End this browser's session |
+| `GET  /api/library/recent` | The songs filed most recently |
 | `POST /api/requests` | Read a link and queue its songs |
 | `GET  /api/requests` | The latest requests with progress counts |
 | `GET  /api/requests/{id}` | Every song of one request with its status |

@@ -149,6 +149,13 @@ async fn ask_reviews(context: &Context) -> Result<()> {
             "text": "🗑 None of these",
             "callback_data": format!("drop:{}", question.track_id),
         })]);
+        if let Some(url) =
+            super::mini_app_url(&context.state.config.read().await.public_url, "review")
+        {
+            rows.push(vec![
+                json!({"text": "📱 Open review", "web_app": {"url": url}}),
+            ]);
+        }
         let song = match &question.artist {
             Some(artist) => format!("{artist} – {}", question.title),
             None => question.title.clone(),

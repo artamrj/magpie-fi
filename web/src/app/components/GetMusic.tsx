@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api/client";
-import type { MusicRequest, WantedSong } from "@/api/types";
+import type { MusicRequest, RecentSong, WantedSong } from "@/api/types";
 import { Icon } from "../Icons";
 
 const statusLabels: Record<string, string> = {
@@ -83,6 +83,8 @@ export function GetMusic({ onError }: { onError: (message: string) => void }) {
           </button>
         </div>
       </form>
+
+      <RecentlyAdded />
 
       {list.length === 0 ? (
         <div className="empty-state">
@@ -211,5 +213,34 @@ function RequestSongs({ request, onRetry }: { request: MusicRequest; onRetry: ()
         </a>
       )}
     </div>
+  );
+}
+
+/** The last songs that went into the library, newest first. */
+function RecentlyAdded() {
+  const recent = useQuery({
+    queryKey: ["library", "recent"],
+    queryFn: () => api<RecentSong[]>("/library/recent"),
+    refetchInterval: 15000,
+  });
+  const songs = recent.data ?? [];
+  if (songs.length === 0) return null;
+  return (
+    <details className="recently-added">
+      <summary>
+        Recently added <span>{songs.length}</span>
+      </summary>
+      <ol>
+        {songs.map((song, index) => (
+          <li key={`${song.added_at}-${index}`} className="song-status filed">
+            <span>
+              <b>{song.title ?? "Unknown title"}</b>
+              <small>{[song.artist, song.album].filter(Boolean).join(" · ")}</small>
+            </span>
+            <em>{new Date(song.added_at).toLocaleDateString()}</em>
+          </li>
+        ))}
+      </ol>
+    </details>
   );
 }

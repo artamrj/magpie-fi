@@ -3092,3 +3092,36 @@ input:focus {
     max-width: 45vw;
   }
 }
+
+/* Login gate */
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+
+/* Recently added */
+.recently-added {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+}
+.recently-added summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+.recently-added summary span {
+  margin-left: 6px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.recently-added ol {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}

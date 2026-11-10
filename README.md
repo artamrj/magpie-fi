@@ -109,6 +109,27 @@ service. Get an API ID and hash at <https://my.telegram.org>, set `TELEGRAM_API_
 `TELEGRAM_API_HASH` and `MAGPIE_TELEGRAM_API_URL=http://tgapi:8081` in `.env`, and start the
 helper with `docker compose --profile tgapi up -d`. Files up to 2 GB then work.
 
+### Phone and Telegram Mini App
+
+With an HTTPS address, the web page opens **inside Telegram** (the "magpie" button next to the
+message box, and "📱 Open review" on the bot's questions), so you can review songs, fix covers and
+follow downloads on your phone. Telegram is the login: owners only, no passwords.
+
+1. Give the web page an HTTPS address, either way:
+   - **Tailscale Funnel** (simplest, if the server runs Tailscale):
+     `tailscale funnel --bg 7331` on the server. Your address is
+     `https://<server>.<tailnet>.ts.net`.
+   - **Cloudflare Tunnel** (your own domain): in Cloudflare Zero Trust create a tunnel with a
+     public hostname pointing to `http://magpie:7331`, put its token in `.env` as
+     `CLOUDFLARE_TUNNEL_TOKEN`, and run `docker compose --profile tunnel up -d`.
+2. Set `MAGPIE_PUBLIC_URL` in `.env` to that address and run `docker compose up -d`.
+3. In the bot, tap **magpie** next to the message box (owners), or send `/web` for a login link
+   for a computer's browser (it works once and keeps that browser logged in for 30 days).
+
+Once Telegram is set up, the web page always needs a login, also on the server itself (send
+`/web`). magpie refuses to start with a public address but no Telegram, because the page
+would then be open to everyone.
+
 ### Music you already have
 
 - **Keep it where it is:** put it in `MUSIC_ROOT/library`. magpie indexes it on start, so new
@@ -147,8 +168,6 @@ page's status panel shows the current values. To change one, edit `.env` and run
 These go away in later phases (see [BLUEPRINT.md §8](BLUEPRINT.md#8-roadmap)):
 
 - Spotify playlists: only the songs Spotify's public page shows are read (about the first 100).
-- The web page has no login yet, so it is only reachable on the server itself (or through an
-  SSH tunnel). Phase 4 opens it inside Telegram, with Telegram as the login.
 - "Stop" in Telegram drops the songs that have not started; a download already running finishes.
 
 ## Development

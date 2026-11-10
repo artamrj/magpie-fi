@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/api/client";
 import type { Candidate, Track } from "@/api/types";
+import { askConfirm } from "../telegram";
 import { Icon, type IconName } from "../Icons";
 import {
   artworkStatusLabel,
@@ -92,9 +93,9 @@ export function TrackInspector({
   };
   const removeMusicFile = async () => {
     if (
-      !confirm(
-        `Permanently remove "${track.filename}" from the music folder? This cannot be undone.`,
-      )
+      !(await askConfirm(
+        `Remove "${track.filename}"? It won't be added to your library. Your own files go to the trash (kept for a while); downloads are deleted.`,
+      ))
     )
       return;
     setRemoving(true);
@@ -325,7 +326,7 @@ export function TrackInspector({
         <section className="inspector-section candidate-section">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">Ununknown suggestions</p>
+              <p className="eyebrow">magpie suggestions</p>
               <h3>Choose the recording that matches this file</h3>
             </div>
             <span>{track.candidates.length} options</span>
@@ -363,7 +364,7 @@ export function TrackInspector({
           <section className="inspector-section selected-proposal">
             <div className="section-heading">
               <div>
-                <p className="eyebrow">Ununknown suggestion</p>
+                <p className="eyebrow">magpie suggestion</p>
                 <h3>Review exactly what will change</h3>
               </div>
               <button className="text-button" onClick={() => setEditing(!editing)}>

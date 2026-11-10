@@ -9,6 +9,7 @@ import { TrackRow } from "./components/TrackRow";
 import { TrackInspector, InspectorEmpty } from "./components/TrackInspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
 import { GetMusic } from "./components/GetMusic";
+import { askConfirm, startView, telegram } from "./telegram";
 import { ProcessingDock } from "./components/ProcessingDock";
 import { EmptyState, QueueSkeleton } from "./components/EmptyStates";
 import type { QueueFilter, QueueOrder, Theme } from "./trackUtils";
@@ -56,8 +57,13 @@ export function App() {
   const tracks = useMemo(() => tracksQuery.data ?? [], [tracksQuery.data]);
   const setup = setupQuery.data ?? emptySetup;
   const [selectedId, setSelectedId] = useState<number>();
-  const [filter, setFilter] = useState<QueueFilter>("all");
-  const [view, setView] = useState<"get" | "queue">("queue");
+  // Links from the bot open straight on Review (?view=review) or Get music (?view=get).
+  const [filter, setFilter] = useState<QueueFilter>(() =>
+    startView() === "review" ? "review" : "all",
+  );
+  const [view, setView] = useState<"get" | "queue">(() =>
+    startView() === "get" ? "get" : "queue",
+  );
   const [queueOrder, setQueueOrder] = useState<QueueOrder>("queue");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -67,6 +73,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mobileInspector, setMobileInspector] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => {
+    if (telegram) return telegram.colorScheme;
     const saved = localStorage.getItem("magpie-theme");
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
@@ -93,6 +100,11 @@ export function App() {
       queryClient.invalidateQueries({ queryKey: queryKeys.tracks }),
     ]);
   }, [queryClient]);
+
+  useEffect(() => {
+    // Follow Telegram's light/dark switch while the Mini App is open.
+    telegram?.onEvent("themeChanged", () => setTheme(telegram!.colorScheme));
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -200,9 +212,9 @@ export function App() {
     const damaged = tracks.filter((track) => isProblem(track) && track.status === "corrupt").length;
     if (
       damaged &&
-      !confirm(
-        `magpie will try to salvage ${damaged} damaged ${damaged === 1 ? "file" : "files"} by skipping unreadable frames and re-encoding the valid audio. Each damaged original will be kept beside the repaired file as an .magpie-damaged backup. Continue?`,
-      )
+      !(await askConfirm(
+        `magpie will try to salvage ${damaged} damaged ${damaged === 1 ? "file" : "files"} by skipping unreadable frames and re-encoding the valid audio. Each damaged original is kept next to the repaired file as a .magpie-damaged backup. Continue?`,
+      ))
     )
       return;
     setRetryingIssues(true);

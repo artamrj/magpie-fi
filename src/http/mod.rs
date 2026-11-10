@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod error;
 pub mod handlers;
 pub mod router;
@@ -91,7 +92,8 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' data: https:; media-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            // Telegram's Mini App script, and Telegram Web (which shows Mini Apps in a frame).
+            "default-src 'self'; img-src 'self' data: https:; media-src 'self'; style-src 'self'; script-src 'self' https://telegram.org; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://web.telegram.org",
         ),
     );
     headers.insert(

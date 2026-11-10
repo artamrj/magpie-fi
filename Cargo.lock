@@ -1161,6 +1161,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "frankenstein",
+ "getrandom 0.4.3",
  "hex",
  "hmac",
  "image",

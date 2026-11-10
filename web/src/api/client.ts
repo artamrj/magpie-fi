@@ -1,3 +1,5 @@
+import { telegram } from "@/app/telegram";
+
 const API_TIMEOUT_MS = 30_000;
 
 export class ApiError extends Error {
@@ -15,7 +17,11 @@ export const api = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const timer = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   try {
     const response = await fetch(`/api${path}`, {
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Inside Telegram, Telegram's signed user data is the login.
+        ...(telegram ? { Authorization: `tma ${telegram.initData}` } : {}),
+      },
       signal: controller.signal,
       ...init,
     });

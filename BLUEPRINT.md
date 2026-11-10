@@ -798,10 +798,25 @@ magpie-fi is now one program in one image; the Python bot is gone.
 - Moved to Phase 4: the `/web` login link (the web page has no login yet) and "Open review" /
   "▶ Play" buttons (they need an address reachable from your phone). DM topics were left out.
 
-### Phase 4 — The workbench in your pocket
-- The web page opens inside Telegram as a **Mini App** (`@tma.js/sdk`, Telegram theme colours,
-  Main/Secondary buttons, fullscreen), on one HTTPS address via Tailscale Funnel or Cloudflare Tunnel.
-- Review, manual edit, cover fix, "recently added", queue — all on your phone.
+### Phase 4 — The workbench in your pocket ✅ built (2026-11-10)
+- **Login** (`src/http/auth.rs`): with Telegram configured every API call needs either Telegram's
+  signed Mini App data (checked with the bot token) or a 30-day session from a one-time `/web`
+  link. Owners only; guests use the bot. Without Telegram nothing changes (local-only, no login),
+  and a public address without Telegram is refused at startup.
+- **Mini App:** the same React page opens inside Telegram (`telegram-web-app.js`): full height,
+  Telegram's light/dark theme, straight to Review or Get music (`?view=`). The "magpie" menu
+  button for owners and "📱 Open review" on review questions open it.
+- **HTTPS address:** `MAGPIE_PUBLIC_URL`, via Tailscale Funnel (one command) or the new optional
+  Cloudflare Tunnel profile (`tunnel`).
+- "Recently added" list and "Log out" on the web page.
+- Fixed on the way: a wrongly tagged file (a 2-minute tone tagged "The Weeknd – Blinding Lights")
+  was filed automatically because several catalogs agreed on the tags. An automatic decision now
+  never contradicts the audio length (more than 15 s off → Review). Inside Telegram, confirmations
+  use Telegram's own dialog.
+- Tested in Docker at phone size as a Mini App (Telegram-signed data, Telegram's script): login,
+  theme, deep link to Review, cover and audio previews, and clearing the review list.
+- Moved to Phase 5: "▶ Play" buttons and guest share links (Navidrome shares need Navidrome's own
+  public address).
 - ✅ Done when you can clear the whole review list from your phone.
 
 ### Phase 5 — Better than a subscription

@@ -1,10 +1,17 @@
-import type { Setup } from "@/api/types";
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/api/client";
+import type { Me, Setup } from "@/api/types";
 import { Icon } from "../Icons";
 import { providerName } from "../trackUtils";
 
 /** Read-only status. Settings live in the server's .env file (MAGPIE_*). */
 export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () => void }) {
   const navidrome = setup.navidrome;
+  const me = useQuery({ queryKey: ["me"], queryFn: () => api<Me>("/me"), staleTime: Infinity });
+  const logOut = async () => {
+    await api("/logout", { method: "POST", body: "{}" }).catch(() => undefined);
+    window.location.reload();
+  };
   return (
     <div className="drawer-layer" role="presentation">
       <button className="drawer-backdrop" onClick={onClose} aria-label="Close status" />
@@ -84,6 +91,11 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
             To change settings, edit the <code>MAGPIE_…</code> values in the server&apos;s{" "}
             <code>.env</code> file and restart magpie.
           </p>
+          {me.data?.via === "session" && (
+            <button className="compact-button" onClick={() => void logOut()}>
+              Log out of this browser
+            </button>
+          )}
         </div>
       </aside>
     </div>
