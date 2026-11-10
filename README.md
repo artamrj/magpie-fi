@@ -1,8 +1,9 @@
 # 🐦 magpie-fi
 
-Your own music service. Drop music into a folder (or send it to a Telegram bot). magpie
-identifies every song, fixes its tags, cover, lyrics and loudness, files it into a clean
-library, and [Navidrome](https://www.navidrome.org) plays it on every device. No subscription.
+Your own music service. Paste a Spotify, Apple Music, Deezer or YouTube link, or drop music
+into a folder. magpie gets the songs, identifies them, fixes their tags, cover, lyrics and
+loudness, files them into a clean library, and [Navidrome](https://www.navidrome.org) plays
+them on every device. No subscription.
 
 The full plan is in [BLUEPRINT.md](BLUEPRINT.md). magpie-fi grew out of two earlier projects
 whose history is kept in this repository: [ununknown](https://github.com/artamrj/ununknown)
@@ -12,14 +13,36 @@ the Telegram bot in [`bot/`](bot/) until it is rewritten into magpie (Phase 3).
 ## How it works
 
 ```text
-your drops ─┐
-            ├─► MUSIC_ROOT/inbox ─► magpie ─► MUSIC_ROOT/library ─► Navidrome ─► your apps
-Telegram ───┘   (bot, optional)       │
-                                      ├─ sure?      → filed automatically
-                                      └─ not sure?  → waits for you in Review (web page)
+a link ──► magpie downloads ──┐
+your drops ─► MUSIC_ROOT/inbox ┼─► magpie ─► MUSIC_ROOT/library ─► Navidrome ─► your apps
+Telegram bot (optional) ───────┘     │
+                                     ├─ sure?      → filed automatically
+                                     └─ not sure?  → waits for you in Review (web page)
 ```
 
-Every minute magpie checks the inbox. For each new song it:
+### Getting music from a link
+
+Open **Get music** in the web page and paste a link:
+
+| Service | Song | Album | Playlist |
+|---|---|---|---|
+| Spotify | ✅ | ✅ | ✅ (as many songs as Spotify's public page shows, about 100) |
+| Apple Music | ✅ | ✅ | ✅ |
+| Deezer | ✅ | ✅ | ✅ |
+| YouTube / YouTube Music | ✅ | — | ✅ |
+| Shazam | ✅ | — | — |
+
+For every song magpie first checks whether you already have it (then nothing is downloaded).
+Otherwise it finds the official song on YouTube Music (live, cover, remix and sped-up versions are
+avoided unless you asked for one), downloads YouTube's own audio stream without re-encoding,
+and hands it to the same identification and filing as everything else. A playlist link also
+becomes a Navidrome playlist in the same order; sending it again updates that playlist and only
+downloads songs you don't have yet. The audio always comes from YouTube; Spotify, Apple Music
+and Deezer links are only read for the song list.
+
+### Filing
+
+Every minute magpie checks the inbox and its own downloads. For each new song it:
 
 1. checks that the audio is not damaged and computes its audio fingerprint,
 2. checks the library: if you already have this recording, the new copy goes to the trash
@@ -115,9 +138,10 @@ page's status panel shows the current values. To change one, edit `.env` and run
 
 These go away in later phases (see [BLUEPRINT.md §8](BLUEPRINT.md#8-roadmap)):
 
-- The Telegram bot says "Completed" when its download finishes. The song reaches Navidrome a
-  minute or two later, or waits in Review if magpie is unsure.
-- Playlist links still download every song, but no Navidrome playlist is created yet (Phase 2).
+- The Telegram bot is still the old Python bridge: it says "Completed" when its download
+  finishes, and its playlists don't become Navidrome playlists. Paste links into the web page
+  instead, or wait for Phase 3.
+- Spotify playlists: only the songs Spotify's public page shows are read (about the first 100).
 - Telegram limits bots to files of 20 MB, so large FLAC uploads fail (Phase 3).
 
 ## Development

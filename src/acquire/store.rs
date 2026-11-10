@@ -1,0 +1,545 @@
+//! Requests, wanted songs and playlists in the database.
+
+use super::links::{Collection, Scope};
+use anyhow::Result;
+use chrono::Utc;
+use serde::Serialize;
+use sqlx::SqlitePool;
+use std::path::Path;
+
+/// Waits before the 2nd, 3rd and last attempt (from sync-me-maybe).
+const RETRY_DELAYS_SECONDS: [i64; 3] = [30, 120, 600];
+pub const MAX_ATTEMPTS: i64 = 3;
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct WantedRow {
+    pub id: i64,
+    pub request_id: i64,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub track_number: Option<i64>,
+    pub duration: Option<f64>,
+    pub isrc: Option<String>,
+    pub source_url: Option<String>,
+    pub youtube_id: Option<String>,
+    pub attempts: i64,
+}
+
+const WANTED_FIELDS: &str =
+    "id,request_id,title,artist,album,track_number,duration,isrc,source_url,youtube_id,attempts";
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+pub async fn create_request(
+    pool: &SqlitePool,
+    url: &str,
+    scope: Scope,
+    origin: &str,
+    requested_by: Option<&str>,
+) -> Result<i64> {
+    let now = now();
+    Ok(sqlx::query(
+        "INSERT INTO requests(url,kind,origin,requested_by,status,created_at,updated_at)
+         VALUES(?,?,?,?,'reading',?,?)",
+    )
+    .bind(url)
+    .bind(scope.as_str())
+    .bind(origin)
+    .bind(requested_by)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .last_insert_rowid())
+}
+
+/// Stores the songs a link stands for. A playlist link also gets (or takes
+/// over) its playlist record, so the same playlist always maps to one file.
+pub async fn save_collection(
+    pool: &SqlitePool,
+    request_id: i64,
+    url: &str,
+    scope: Scope,
+    collection: &Collection,
+) -> Result<()> {
+    let now = now();
+    let mut transaction = pool.begin().await?;
+    sqlx::query("UPDATE requests SET title=?,owner=?,status='ready',updated_at=? WHERE id=?")
+        .bind(&collection.title)
+        .bind(&collection.owner)
+        .bind(&now)
+        .bind(request_id)
+        .execute(&mut *transaction)
+        .await?;
+    for (position, song) in collection.songs.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO wanted(request_id,position,title,artist,album,track_number,duration,isrc,
+               source_url,youtube_id,status,updated_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?,'pending',?)",
+        )
+        .bind(request_id)
+        .bind(position as i64 + 1)
+        .bind(&song.title)
+        .bind(&song.artist)
+        .bind(&song.album)
+        .bind(song.track_number)
+        .bind(song.duration)
+        .bind(&song.isrc)
+        .bind(&song.source_url)
+        .bind(&song.youtube_id)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    if scope == Scope::Playlist {
+        let name = playlist_name(collection);
+        sqlx::query(
+            "INSERT INTO playlists(source_url,name,request_id,updated_at) VALUES(?,?,?,?)
+             ON CONFLICT(source_url) DO UPDATE SET request_id=excluded.request_id,
+               updated_at=excluded.updated_at",
+        )
+        .bind(url)
+        .bind(name)
+        .bind(request_id)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// "Owner - Title", or just the title when the owner is a service name.
+fn playlist_name(collection: &Collection) -> String {
+    let title = collection
+        .title
+        .clone()
+        .unwrap_or_else(|| "Playlist".to_owned());
+    match collection.owner.as_deref().map(str::trim) {
+        Some(owner)
+            if !owner.is_empty()
+                && ![
+                    "spotify",
+                    "apple music",
+                    "deezer",
+                    "youtube",
+                    "youtube music",
+                ]
+                .contains(&owner.to_ascii_lowercase().as_str()) =>
+        {
+            format!("{owner} - {title}")
+        }
+        _ => title,
+    }
+}
+
+pub async fn request_failed(pool: &SqlitePool, request_id: i64, error: &str) -> Result<()> {
+    sqlx::query("UPDATE requests SET status='failed',error=?,updated_at=? WHERE id=?")
+        .bind(error)
+        .bind(now())
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Claims the next song that is due, marking it as downloading.
+pub async fn claim_next(pool: &SqlitePool) -> Result<Option<WantedRow>> {
+    let now = now();
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "UPDATE wanted SET status='downloading',updated_at=?
+         WHERE id=(SELECT id FROM wanted WHERE status='pending'
+                   AND (not_before IS NULL OR not_before<=?) ORDER BY id LIMIT 1)
+         RETURNING {WANTED_FIELDS}"
+    )))
+    .bind(&now)
+    .bind(&now)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Songs interrupted by a restart start again.
+pub async fn reset_interrupted(pool: &SqlitePool) -> Result<u64> {
+    Ok(
+        sqlx::query("UPDATE wanted SET status='pending' WHERE status='downloading'")
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// When the next delayed retry is due, if any.
+pub async fn next_due(pool: &SqlitePool) -> Result<Option<chrono::DateTime<Utc>>> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT min(not_before) FROM wanted WHERE status='pending' AND not_before IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&Utc)))
+}
+
+pub async fn mark_in_library(pool: &SqlitePool, id: i64, library_path: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE wanted SET status='in_library',library_path=?,error=NULL,updated_at=? WHERE id=?",
+    )
+    .bind(library_path)
+    .bind(now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_identifying(
+    pool: &SqlitePool,
+    id: i64,
+    staging_path: &Path,
+    youtube_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE wanted SET status='identifying',staging_path=?,youtube_id=?,error=NULL,updated_at=?
+         WHERE id=?",
+    )
+    .bind(staging_path.to_string_lossy().as_ref())
+    .bind(youtube_id)
+    .bind(now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A failed attempt: try again later, or give up after the last attempt.
+/// `retry` is false for problems that waiting cannot fix.
+pub async fn mark_attempt_failed(
+    pool: &SqlitePool,
+    row: &WantedRow,
+    error: &str,
+    retry: bool,
+) -> Result<bool> {
+    let attempts = row.attempts + 1;
+    let will_retry = retry && attempts < MAX_ATTEMPTS;
+    let not_before = will_retry.then(|| {
+        let delay = RETRY_DELAYS_SECONDS[usize::try_from(attempts - 1).unwrap_or(0).min(2)];
+        (Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+    });
+    sqlx::query(
+        "UPDATE wanted SET status=?,attempts=?,not_before=?,error=?,updated_at=? WHERE id=?",
+    )
+    .bind(if will_retry { "pending" } else { "failed" })
+    .bind(attempts)
+    .bind(not_before)
+    .bind(error)
+    .bind(now())
+    .bind(row.id)
+    .execute(pool)
+    .await?;
+    Ok(will_retry)
+}
+
+/// The download from `staging_path` is now in the library at `library_path`
+/// (filed, or recognised as a song you already had). Returns the requests
+/// whose playlists need rewriting.
+pub async fn finished_download(
+    pool: &SqlitePool,
+    staging_path: &Path,
+    library_path: &Path,
+    status: &str,
+) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE wanted SET status=?,library_path=?,error=NULL,updated_at=?
+         WHERE staging_path=? AND status='identifying' RETURNING request_id",
+    )
+    .bind(status)
+    .bind(library_path.to_string_lossy().as_ref())
+    .bind(now())
+    .bind(staging_path.to_string_lossy().as_ref())
+    .fetch_all(pool)
+    .await?)
+}
+
+/// A library file that came from this YouTube video or this source link before.
+pub async fn known_source(
+    pool: &SqlitePool,
+    youtube_id: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<Option<String>> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT library_path FROM wanted
+         WHERE status IN ('filed','in_library') AND library_path IS NOT NULL
+           AND ((? IS NOT NULL AND youtube_id=?) OR (? IS NOT NULL AND source_url=?))
+         ORDER BY id DESC",
+    )
+    .bind(youtube_id)
+    .bind(youtube_id)
+    .bind(source_url)
+    .bind(source_url)
+    .fetch_all(pool)
+    .await?;
+    for path in paths {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Failed songs of a request go back into the queue.
+pub async fn retry_failed(pool: &SqlitePool, request_id: i64) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE wanted SET status='pending',attempts=0,not_before=NULL,error=NULL,updated_at=?
+         WHERE request_id=? AND status='failed'",
+    )
+    .bind(now())
+    .bind(request_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// The playlist file of a request, with its songs in order.
+pub async fn playlist_for_request(
+    pool: &SqlitePool,
+    request_id: i64,
+) -> Result<Option<(String, Vec<String>)>> {
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM playlists WHERE request_id=?")
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT library_path FROM wanted WHERE request_id=? AND library_path IS NOT NULL
+         ORDER BY position",
+    )
+    .bind(request_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some((name, paths)))
+}
+
+// ── What the web page shows ─────────────────────────────────────────────────
+
+#[derive(Debug, Default, Serialize, sqlx::FromRow)]
+pub struct RequestSummary {
+    pub id: i64,
+    pub url: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub owner: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub total: i64,
+    /// Filed now or already in the library.
+    pub done: i64,
+    pub working: i64,
+    pub review: i64,
+    pub failed: i64,
+}
+
+pub async fn list_requests(pool: &SqlitePool, limit: i64) -> Result<Vec<RequestSummary>> {
+    Ok(sqlx::query_as(
+        "SELECT r.id,r.url,r.kind,r.title,r.owner,r.status,r.error,r.created_at,
+           count(w.id) AS total,
+           coalesce(sum(w.status IN ('filed','in_library')),0) AS done,
+           coalesce(sum(w.status IN ('pending','downloading')
+             OR (w.status='identifying' AND coalesce(t.stage,'') NOT IN ('review','failed'))),0) AS working,
+           coalesce(sum(w.status='identifying' AND t.stage IN ('review','failed')),0) AS review,
+           coalesce(sum(w.status='failed'),0) AS failed
+         FROM requests r
+         LEFT JOIN wanted w ON w.request_id=r.id
+         LEFT JOIN tracks t ON t.path=w.staging_path AND w.status='identifying'
+         GROUP BY r.id ORDER BY r.id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct WantedView {
+    pub position: i64,
+    pub title: String,
+    pub artist: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub library_path: Option<String>,
+    pub attempts: i64,
+}
+
+pub async fn request_songs(pool: &SqlitePool, request_id: i64) -> Result<Vec<WantedView>> {
+    Ok(sqlx::query_as(
+        "SELECT w.position,w.title,w.artist,
+           CASE WHEN w.status='identifying' AND t.stage='review' THEN 'review'
+                WHEN w.status='identifying' AND t.stage='failed' THEN 'review'
+                ELSE w.status END AS status,
+           coalesce(w.error, CASE WHEN w.status='identifying' THEN t.stage_message END) AS error,
+           w.library_path,w.attempts
+         FROM wanted w LEFT JOIN tracks t ON t.path=w.staging_path
+         WHERE w.request_id=? ORDER BY w.position",
+    )
+    .bind(request_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acquire::links::Wanted;
+
+    async fn pool() -> (tempfile::TempDir, SqlitePool) {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = crate::infrastructure::db::connect(
+            directory.path().join("requests.sqlite").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        (directory, pool)
+    }
+
+    fn collection(songs: &[&str]) -> Collection {
+        Collection {
+            title: Some("Road Trip".into()),
+            owner: Some("Arta".into()),
+            songs: songs
+                .iter()
+                .map(|title| Wanted {
+                    title: (*title).into(),
+                    artist: Some("Artist".into()),
+                    ..Wanted::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn songs_are_claimed_once_and_retried_with_backoff() {
+        let (_directory, pool) = pool().await;
+        let request = create_request(&pool, "https://x/playlist/1", Scope::Playlist, "web", None)
+            .await
+            .unwrap();
+        save_collection(
+            &pool,
+            request,
+            "https://x/playlist/1",
+            Scope::Playlist,
+            &collection(&["A", "B"]),
+        )
+        .await
+        .unwrap();
+
+        let first = claim_next(&pool).await.unwrap().unwrap();
+        let second = claim_next(&pool).await.unwrap().unwrap();
+        assert_eq!((first.title.as_str(), second.title.as_str()), ("A", "B"));
+        assert!(claim_next(&pool).await.unwrap().is_none());
+
+        // A failure waits before the next attempt.
+        assert!(
+            mark_attempt_failed(&pool, &first, "network", true)
+                .await
+                .unwrap()
+        );
+        assert!(claim_next(&pool).await.unwrap().is_none());
+        assert!(next_due(&pool).await.unwrap().is_some());
+        // A problem that waiting cannot fix fails at once.
+        assert!(
+            !mark_attempt_failed(&pool, &second, "no match", false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(retry_failed(&pool, request).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn filed_downloads_build_the_playlist_in_order() {
+        let (directory, pool) = pool().await;
+        let request = create_request(&pool, "https://x/playlist/1", Scope::Playlist, "web", None)
+            .await
+            .unwrap();
+        save_collection(
+            &pool,
+            request,
+            "https://x/playlist/1",
+            Scope::Playlist,
+            &collection(&["A", "B"]),
+        )
+        .await
+        .unwrap();
+        let a = claim_next(&pool).await.unwrap().unwrap();
+        let b = claim_next(&pool).await.unwrap().unwrap();
+        let staging = directory.path().join("w1.m4a");
+        mark_identifying(&pool, a.id, &staging, "yt-a")
+            .await
+            .unwrap();
+        let library_b = directory.path().join("B.m4a");
+        tokio::fs::write(&library_b, b"b").await.unwrap();
+        mark_in_library(&pool, b.id, library_b.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let library_a = directory.path().join("A.m4a");
+        tokio::fs::write(&library_a, b"a").await.unwrap();
+        let requests = finished_download(&pool, &staging, &library_a, "filed")
+            .await
+            .unwrap();
+        assert_eq!(requests, vec![request]);
+
+        let (name, paths) = playlist_for_request(&pool, request).await.unwrap().unwrap();
+        assert_eq!(name, "Arta - Road Trip");
+        assert_eq!(
+            paths,
+            vec![library_a.to_str().unwrap(), library_b.to_str().unwrap()]
+        );
+        // The same video is recognised next time.
+        assert_eq!(
+            known_source(&pool, Some("yt-a"), None)
+                .await
+                .unwrap()
+                .as_deref(),
+            library_a.to_str()
+        );
+
+        let summary = &list_requests(&pool, 10).await.unwrap()[0];
+        assert_eq!((summary.total, summary.done), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn the_same_playlist_sent_again_takes_over_its_file() {
+        let (_directory, pool) = pool().await;
+        for _ in 0..2 {
+            let request =
+                create_request(&pool, "https://x/playlist/1", Scope::Playlist, "web", None)
+                    .await
+                    .unwrap();
+            save_collection(
+                &pool,
+                request,
+                "https://x/playlist/1",
+                Scope::Playlist,
+                &collection(&["A"]),
+            )
+            .await
+            .unwrap();
+        }
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT request_id FROM playlists")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![2]);
+    }
+
+    #[test]
+    fn service_owners_are_left_out_of_playlist_names() {
+        let mut value = collection(&[]);
+        value.owner = Some("Spotify".into());
+        assert_eq!(playlist_name(&value), "Road Trip");
+    }
+}

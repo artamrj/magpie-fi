@@ -20,6 +20,12 @@ pub struct NavidromeConfig {
     pub password: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioFormat {
+    M4a,
+    Opus,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub db_path: String,
@@ -29,12 +35,26 @@ pub struct Config {
     pub output_dir: String,
     /// `MUSIC_ROOT/.magpie/trash`: originals and replaced files, kept for `trash_days`.
     pub trash_dir: PathBuf,
+    /// `MUSIC_ROOT/.magpie/staging`: downloads waiting to be identified and filed.
+    pub staging_dir: PathBuf,
+    /// The data folder (database, the self-updated yt-dlp).
+    pub data_dir: PathBuf,
     pub inbox_check_seconds: u64,
     /// Files changed more recently than this are still being copied and wait.
     pub inbox_settle_seconds: u64,
     pub trash_days: u64,
     pub lyrics: bool,
     pub navidrome: Option<NavidromeConfig>,
+    /// `m4a` or `opus`: YouTube's own audio stream, never re-encoded to another lossy format.
+    pub audio_format: AudioFormat,
+    pub max_parallel_downloads: usize,
+    pub download_pause_seconds: u64,
+    pub max_download_seconds: u64,
+    pub max_collection_tracks: usize,
+    pub ytdlp_bin: String,
+    pub ytdlp_cookies: Option<PathBuf>,
+    /// Keep a self-updating copy of yt-dlp in `data_dir/bin` (the Docker image does).
+    pub ytdlp_self_update: bool,
     pub acoustid_key: String,
     pub audd_token: String,
     pub spotify_client_id: String,
@@ -67,11 +87,21 @@ impl Config {
             input_dir: path(music_root.join("inbox")),
             output_dir: path(music_root.join("library")),
             trash_dir: music_root.join(".magpie").join("trash"),
+            staging_dir: music_root.join(".magpie").join("staging"),
+            data_dir: data_dir.to_path_buf(),
             inbox_check_seconds: 60,
             inbox_settle_seconds: 30,
             trash_days: 30,
             lyrics: true,
             navidrome: None,
+            audio_format: AudioFormat::M4a,
+            max_parallel_downloads: 2,
+            download_pause_seconds: 3,
+            max_download_seconds: 900,
+            max_collection_tracks: 1000,
+            ytdlp_bin: "yt-dlp".into(),
+            ytdlp_cookies: None,
+            ytdlp_self_update: false,
             acoustid_key: String::new(),
             audd_token: String::new(),
             spotify_client_id: String::new(),
@@ -125,6 +155,22 @@ impl Config {
         config.inbox_settle_seconds = number("MAGPIE_INBOX_SETTLE_SECONDS", 30)?;
         config.trash_days = number("MAGPIE_TRASH_DAYS", 30)?;
         config.lyrics = flag("MAGPIE_LYRICS", true)?;
+        config.audio_format = match get("MAGPIE_AUDIO_FORMAT").as_deref() {
+            None | Some("m4a") => AudioFormat::M4a,
+            Some("opus") => AudioFormat::Opus,
+            Some(other) => bail!("MAGPIE_AUDIO_FORMAT must be m4a or opus, got '{other}'"),
+        };
+        config.max_parallel_downloads =
+            usize::try_from(number("MAGPIE_MAX_PARALLEL_DOWNLOADS", 2)?).unwrap_or(2);
+        config.download_pause_seconds = number("MAGPIE_DOWNLOAD_PAUSE_SECONDS", 3)?;
+        config.max_download_seconds = number("MAGPIE_MAX_DOWNLOAD_SECONDS", 900)?;
+        config.max_collection_tracks =
+            usize::try_from(number("MAGPIE_MAX_COLLECTION_TRACKS", 1000)?).unwrap_or(1000);
+        if let Some(bin) = get("MAGPIE_YTDLP_BIN") {
+            config.ytdlp_bin = bin;
+        }
+        config.ytdlp_cookies = get("MAGPIE_YTDLP_COOKIES").map(PathBuf::from);
+        config.ytdlp_self_update = flag("MAGPIE_YTDLP_SELF_UPDATE", false)?;
 
         // Without a login there is no Navidrome connection (the URL alone is fine:
         // Docker Compose always sets it). A login without a URL, or half a login,
@@ -186,6 +232,9 @@ impl Config {
         self.inbox_check_seconds = self.inbox_check_seconds.clamp(10, 24 * 60 * 60);
         self.inbox_settle_seconds = self.inbox_settle_seconds.min(60 * 60);
         self.trash_days = self.trash_days.clamp(1, 3650);
+        self.max_parallel_downloads = self.max_parallel_downloads.clamp(1, 8);
+        self.max_download_seconds = self.max_download_seconds.clamp(30, 6 * 60 * 60);
+        self.max_collection_tracks = self.max_collection_tracks.clamp(1, 10_000);
     }
 }
 
@@ -220,6 +269,10 @@ mod tests {
         assert_eq!(config.input_dir, "/srv/music/inbox");
         assert_eq!(config.output_dir, "/srv/music/library");
         assert_eq!(config.trash_dir, PathBuf::from("/srv/music/.magpie/trash"));
+        assert_eq!(
+            config.staging_dir,
+            PathBuf::from("/srv/music/.magpie/staging")
+        );
         assert_eq!(config.db_path, "/data/magpie.sqlite");
     }
 
@@ -256,6 +309,23 @@ mod tests {
         assert!(error.to_string().contains("MAGPIE_INBOX_CHECK_SECONDS"));
         let error = from(&[("MAGPIE_LYRICS", "maybe")]).unwrap_err();
         assert!(error.to_string().contains("MAGPIE_LYRICS"));
+    }
+
+    #[test]
+    fn download_settings_are_read_and_validated() {
+        let config = from(&[
+            ("MAGPIE_AUDIO_FORMAT", "opus"),
+            ("MAGPIE_MAX_PARALLEL_DOWNLOADS", "20"),
+            ("MAGPIE_YTDLP_COOKIES", "/config/cookies.txt"),
+        ])
+        .unwrap();
+        assert_eq!(config.audio_format, AudioFormat::Opus);
+        assert_eq!(config.max_parallel_downloads, 8);
+        assert_eq!(
+            config.ytdlp_cookies,
+            Some(PathBuf::from("/config/cookies.txt"))
+        );
+        assert!(from(&[("MAGPIE_AUDIO_FORMAT", "mp3")]).is_err());
     }
 
     #[test]

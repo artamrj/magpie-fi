@@ -51,6 +51,12 @@ pub fn router() -> Router<Arc<AppState>> {
             get(handlers::candidate_artwork_preview),
         )
         .route("/write", post(handlers::start_apply))
+        .route(
+            "/requests",
+            get(handlers::list_requests).post(handlers::create_request),
+        )
+        .route("/requests/{id}", get(handlers::request_songs))
+        .route("/requests/{id}/retry", post(handlers::retry_request))
         .fallback(api_not_found)
 }
 

@@ -626,37 +626,35 @@ python-telegram-bot 22.8 stops at Bot API 10.0 and aiogram 3.31 at 10.3.
 
 ## 7. Repository layout of this folder
 
-One Rust crate at the root. The old `core/` and `bot/` folders disappear: ununknown's code moves
-to the root with `git mv` (its history stays: `git log --follow`), and the bot's ideas are
-rewritten into Rust modules. The bot's history remains in git as the record of where they came from.
+One Rust crate at the root (`core/` was moved there with its history; `bot/` stays only until
+Phase 3). The folders inherited from ununknown keep their names; new parts get their own
+top-level module.
 
 ```text
 magpie-fi/                       ← this folder is still called navidrome-arta on disk
-├── BLUEPRINT.md  README.md  CHANGELOG.md
+├── BLUEPRINT.md  README.md  SECURITY.md  LICENSE
 ├── Cargo.toml  Cargo.lock       crate "magpie-fi", binary "magpie"
-├── Dockerfile                   the one image
-├── compose.yaml                 magpie + navidrome  (profiles: tgapi, pot, slskd)
+├── Dockerfile                   the one image (Debian + ffmpeg, fpcalc, SongRec, rsgain, yt-dlp, Deno)
+├── compose.yaml                 magpie + navidrome  (profile "bot": the temporary Telegram bridge)
 ├── .env.example                 every setting, all MAGPIE_*
-├── config/navidrome.toml
+├── config/navidrome.toml  config/ytdlp/
 ├── migrations/                  one database schema
 ├── src/
-│   ├── main.rs  config.rs  error.rs
-│   ├── db/                      connection, single writer, queries
-│   ├── jobs/                    requests, items, jobs, workers, limits, retries, event bus
-│   ├── telegram/                client, router, commands, uploads, status messages,
-│   │                            buttons, guests, review prompts, /web login, the rhyme
-│   ├── acquire/                 link reading, providers/ (spotify, apple, shazam, youtube,
-│   │                            deezer), playlist expansion, source matcher, download
-│   ├── identify/                integrity, fingerprint, dedup, providers/ (the 20 sources),
-│   │                            scoring, completion, artwork
-│   ├── library/                 index, layout (§5), tags, publish, trash, lyrics,
-│   │                            ReplayGain, playlists, re-file tool
-│   ├── navidrome/               Subsonic client: scan, search, share
-│   ├── http/                    routes, Telegram login, live updates, built-in web page
-│   └── tools/                   ffmpeg, fpcalc, songrec, rsgain, yt-dlp runners + yt-dlp updater
-├── web/                         React (from ununknown/frontend): workbench + Mini App
-├── tests/                       end-to-end tests with small audio fixtures (from both projects)
-└── .github/workflows/           ci.yml · release.yml (one image) · security.yml
+│   ├── main.rs  config.rs       startup, folders, background loops; MAGPIE_* settings
+│   ├── acquire/                 NEW (Phase 2): links, matching, yt-dlp, download queue + worker
+│   ├── application/
+│   │   ├── scan/ smart_approval.rs metadata_completion.rs artwork.rs input_dedup.rs   identify
+│   │   ├── apply.rs             filing step
+│   │   └── library.rs           NEW (Phase 1): layout, trash, library index, cover, playlists
+│   ├── domain/                  audio reading, matcher, credits, genres
+│   ├── infrastructure/          db, providers (20 sources), media tools, lyrics, navidrome
+│   ├── http/                    API routes and handlers (incl. requests.rs)
+│   └── telegram/                Phase 3
+├── web/                         React: review workbench + Get music (Mini App in Phase 4)
+├── bot/                         old Python bot — deleted in Phase 3
+├── scripts/                     docker-entrypoint.sh, setup-folders.sh
+├── docs/TECHNICAL-OVERVIEW.md
+└── .github/workflows/           magpie.yml · bot.yml · release.yml · security.yml
 ```
 
 ### 7.1 Where every part of the old projects goes
@@ -743,22 +741,39 @@ Turned ununknown into the magpie program and gave it a real library.
   album gain; an inbox duplicate and a re-sent song went to the trash; a half-downloaded file was
   left alone; Navidrome listed all three, the single as `single`.
 - The old Python bot still runs as an optional bridge: `docker compose --profile bot up -d`.
-- Not done yet: the source still uses ununknown's folder names (`application/`, `infrastructure/`,
-  `domain/`, `http/`) instead of the §7 module folders. That reshuffle is mechanical and happens in
-  Phase 2, when `jobs/` and `acquire/` arrive.
+- The source keeps ununknown's folder names (`application/`, `infrastructure/`, `domain/`,
+  `http/`); Phase 2 decided not to rename them (see Phase 2).
 
-### Phase 2 — Getting music, in Rust
-Port the bot's "get it" half, and make it usable from the web page first (easy to test without Telegram).
-- The one job queue: requests → items → jobs, retries, limits, event bus, live updates in the web page.
-- `acquire/`: link reading for Spotify, Apple Music, Shazam, YouTube, Deezer; playlist/album expansion
-  (Spotify public-page reading, since the Spotify API no longer shows other people's playlists);
-  YouTube Music source matching with the merged scorer; yt-dlp download.
-- *Wanted* info becomes a candidate. "Already have it?" check before downloading.
-- yt-dlp bundled + nightly self-update.
-- Web page: **"Paste a link"** box with live progress.
-- ⛔ Deletes from `bot/` nothing yet (the Python bot still serves Telegram).
-- ✅ Done when pasting a Spotify playlist link in the web page gives a Navidrome playlist in the same
-  order, every song stored once — and pasting it again downloads nothing.
+### Phase 2 — Getting music, in Rust ✅ built (2026-11-10)
+- **Get music** in the web page: paste a link, follow every song until it is in the library,
+  retry failed songs.
+- `src/acquire/`: link reading for Spotify (embed page), Apple Music (iTunes Lookup API, public
+  playlist page), Deezer (public API), YouTube/YouTube Music (yt-dlp) and Shazam; YouTube Music
+  source matching with the bot's scoring rules; yt-dlp download (stream copy, m4a/opus).
+- One queue in the database (`requests`, `wanted`, `playlists`), retries after 30 s / 2 min / 10 min,
+  at most `MAGPIE_MAX_PARALLEL_DOWNLOADS` at a time, survives restarts.
+- "Already have it?" before downloading: same link or video, ISRC, or same title (versions kept
+  apart) + first artist + length.
+- Downloads land in `.magpie/staging/` and go through the **same** inbox pipeline (identify, review,
+  cover, lyrics, gain, library check). The link's title/artist/album/ISRC are written as tags first.
+- Playlist links become `library/Playlists/<Owner - Name>.m3u8` in the link's order; sending the
+  same playlist again rewrites the same file and downloads only what is missing.
+- Albums stay together: a song whose catalog year differs from an album folder that already
+  exists joins that folder and year.
+- The image bundles yt-dlp (zipapp, self-updating daily into `DATA_DIR/bin`) and Deno.
+- Decided on the way:
+  - **No anonymous-token tricks.** The old bot read Spotify playlists past 100 songs with the
+    embed page's access token, and Apple collections with a token taken from Apple's website.
+    magpie uses only public pages and documented APIs. Spotify playlists are therefore read as
+    far as the public embed page shows (about 100 songs).
+  - **No generic `jobs/` module:** the `wanted` table is the queue; a second abstraction would
+    only add code.
+  - **No source-folder reshuffle:** `acquire/` sits next to the inherited folders; renaming those
+    would change hundreds of imports and nothing else (see §7).
+  - **No event bus yet:** the web page polls every 2 s while something is moving. Telegram status
+    messages (Phase 3) will read the same tables.
+- ✅ Done when pasting a Spotify playlist link gives a Navidrome playlist in the same order, every
+  song stored once, and pasting it again downloads nothing.
 
 ### Phase 3 — Telegram in Rust → one image
 Port the bot's "talk to people" half. After this phase, magpie-fi is one image.

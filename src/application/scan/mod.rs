@@ -44,7 +44,11 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
         return Ok(0);
     }
     let cfg = state.config.read().await.clone();
-    let (files, walk_errors) = discover_files_in_background(cfg.input_dir).await?;
+    let (files, walk_errors) = discover_files_in_background(cfg.input_dir.clone()).await?;
+    // magpie's own downloads are complete when they appear in staging, so they
+    // skip the settle wait.
+    let (downloads, _) =
+        discover_files_in_background(cfg.staging_dir.to_string_lossy().into_owned()).await?;
     for error in walk_errors {
         state
             .log_entry(
@@ -54,7 +58,8 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
             .await;
     }
     let settle = Duration::from_secs(cfg.inbox_settle_seconds);
-    let pending = automatic_pending_files(&state.pool, files, settle).await?;
+    let mut pending = automatic_pending_files(&state.pool, files, settle).await?;
+    pending.extend(automatic_pending_files(&state.pool, downloads, Duration::ZERO).await?);
     if pending.is_empty() {
         state
             .finish_workflow(WorkflowPhase::Idle, "idle", "Inbox: nothing new")

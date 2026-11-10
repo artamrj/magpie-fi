@@ -8,6 +8,7 @@ import { NavButton } from "./components/NavButton";
 import { TrackRow } from "./components/TrackRow";
 import { TrackInspector, InspectorEmpty } from "./components/TrackInspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
+import { GetMusic } from "./components/GetMusic";
 import { ProcessingDock } from "./components/ProcessingDock";
 import { EmptyState, QueueSkeleton } from "./components/EmptyStates";
 import type { QueueFilter, QueueOrder, Theme } from "./trackUtils";
@@ -37,6 +38,9 @@ const emptySetup: Setup = {
   lyrics: true,
   rsgain: false,
   library_songs: 0,
+  ytdlp: false,
+  audio_format: "m4a",
+  max_parallel_downloads: 2,
   navidrome: { configured: false },
   sources: {},
 };
@@ -52,6 +56,7 @@ export function App() {
   const setup = setupQuery.data ?? emptySetup;
   const [selectedId, setSelectedId] = useState<number>();
   const [filter, setFilter] = useState<QueueFilter>("all");
+  const [view, setView] = useState<"get" | "queue">("queue");
   const [queueOrder, setQueueOrder] = useState<QueueOrder>("queue");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
@@ -302,6 +307,7 @@ export function App() {
   }, [selectedId, visibleTracks]);
 
   const changeFilter = (next: QueueFilter) => {
+    setView("queue");
     setFilter(next);
     const nextTrack =
       next === "all"
@@ -350,27 +356,33 @@ export function App() {
           </div>
           <nav className="workspace-nav" aria-label="Workspace views">
             <NavButton
+              className="get-music-tab"
+              active={view === "get"}
+              onClick={() => setView("get")}
+              label="Get music"
+            />
+            <NavButton
               className="all-tracks-tab"
-              active={filter === "all"}
+              active={view === "queue" && filter === "all"}
               onClick={() => changeFilter("all")}
               label="All tracks"
               count={tracks.length}
             />
             <div className="status-tabs" role="group" aria-label="Filter tracks by status">
               <NavButton
-                active={filter === "review"}
+                active={view === "queue" && filter === "review"}
                 onClick={() => changeFilter("review")}
                 label="Review"
                 count={counts.review}
               />
               <NavButton
-                active={filter === "problems"}
+                active={view === "queue" && filter === "problems"}
                 onClick={() => changeFilter("problems")}
                 label="Issues"
                 count={counts.problems}
               />
               <NavButton
-                active={filter === "ready"}
+                active={view === "queue" && filter === "ready"}
                 onClick={() => changeFilter("ready")}
                 label="Ready"
                 count={counts.ready}
@@ -423,27 +435,33 @@ export function App() {
 
       <nav className="mobile-nav" aria-label="Workspace views">
         <NavButton
+          className="get-music-tab"
+          active={view === "get"}
+          onClick={() => setView("get")}
+          label="Get music"
+        />
+        <NavButton
           className="all-tracks-tab"
-          active={filter === "all"}
+          active={view === "queue" && filter === "all"}
           onClick={() => changeFilter("all")}
           label="All tracks"
           count={tracks.length}
         />
         <div className="status-tabs" role="group" aria-label="Filter tracks by status">
           <NavButton
-            active={filter === "review"}
+            active={view === "queue" && filter === "review"}
             onClick={() => changeFilter("review")}
             label="Review"
             count={counts.review}
           />
           <NavButton
-            active={filter === "problems"}
+            active={view === "queue" && filter === "problems"}
             onClick={() => changeFilter("problems")}
             label="Issues"
             count={counts.problems}
           />
           <NavButton
-            active={filter === "ready"}
+            active={view === "queue" && filter === "ready"}
             onClick={() => changeFilter("ready")}
             label="Ready"
             count={counts.ready}
@@ -478,155 +496,159 @@ export function App() {
         )}
       </div>
 
-      <main className="workspace" id="workspace">
-        <section className="queue-panel" aria-labelledby="queue-title">
-          <header className="queue-header">
-            <div className="queue-heading">
-              <h1 id="queue-title">{filterTitle(filter)}</h1>
-              <span className="queue-count">{visibleTracks.length}</span>
-            </div>
-            <label className="search-field">
-              <Icon name="search" size={16} />
-              <span className="sr-only">Search queue</span>
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search title, artist, album…"
-              />
-            </label>
-            <button
-              className="queue-order-button compact-button"
-              onClick={cycleQueueOrder}
-              aria-label={`Order tracks by ${queueOrderLabels[queueOrder]}`}
-              title={`Current order: ${queueOrderLabels[queueOrder]}. Click to change.`}
-            >
-              <Icon name="menu" size={14} />
-              <span>{queueOrderLabels[queueOrder]}</span>
-            </button>
-            {autoApprovable > 0 && filter === "review" && (
+      {view === "get" ? (
+        <GetMusic onError={setError} />
+      ) : (
+        <main className="workspace" id="workspace">
+          <section className="queue-panel" aria-labelledby="queue-title">
+            <header className="queue-header">
+              <div className="queue-heading">
+                <h1 id="queue-title">{filterTitle(filter)}</h1>
+                <span className="queue-count">{visibleTracks.length}</span>
+              </div>
+              <label className="search-field">
+                <Icon name="search" size={16} />
+                <span className="sr-only">Search queue</span>
+                <input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search title, artist, album…"
+                />
+              </label>
               <button
-                className="compact-button accent"
-                disabled={autoApproving}
-                onClick={autoApprove}
+                className="queue-order-button compact-button"
+                onClick={cycleQueueOrder}
+                aria-label={`Order tracks by ${queueOrderLabels[queueOrder]}`}
+                title={`Current order: ${queueOrderLabels[queueOrder]}. Click to change.`}
               >
-                <Icon name="sparkles" size={15} />
-                {autoApproving ? "Checking…" : `Auto-select ${autoApprovable}`}
+                <Icon name="menu" size={14} />
+                <span>{queueOrderLabels[queueOrder]}</span>
               </button>
-            )}
-            {retryableArtwork > 0 && filter === "review" && (
-              <button
-                className="compact-button accent issue-retry-button"
-                disabled={busy || retryingIssues}
-                onClick={() => void retryIssues()}
-              >
-                {retryingIssues || busy ? (
-                  <span className="spinner" />
-                ) : (
-                  <Icon name="refresh" size={15} />
-                )}
-                {retryingIssues || busy
-                  ? "Retrying…"
-                  : `Retry ${retryableArtwork} ${retryableArtwork === 1 ? "cover" : "covers"}`}
-              </button>
-            )}
-            {counts.problems > 0 && filter === "problems" && (
-              <button
-                className="compact-button accent issue-retry-button"
-                disabled={busy || retryingIssues}
-                onClick={() => void retryIssues()}
-              >
-                {retryingIssues || busy ? (
-                  <span className="spinner" />
-                ) : (
-                  <Icon name="refresh" size={15} />
-                )}
-                {retryingIssues || busy ? "Checking…" : `Check & fix ${counts.problems}`}
-              </button>
-            )}
-          </header>
+              {autoApprovable > 0 && filter === "review" && (
+                <button
+                  className="compact-button accent"
+                  disabled={autoApproving}
+                  onClick={autoApprove}
+                >
+                  <Icon name="sparkles" size={15} />
+                  {autoApproving ? "Checking…" : `Auto-select ${autoApprovable}`}
+                </button>
+              )}
+              {retryableArtwork > 0 && filter === "review" && (
+                <button
+                  className="compact-button accent issue-retry-button"
+                  disabled={busy || retryingIssues}
+                  onClick={() => void retryIssues()}
+                >
+                  {retryingIssues || busy ? (
+                    <span className="spinner" />
+                  ) : (
+                    <Icon name="refresh" size={15} />
+                  )}
+                  {retryingIssues || busy
+                    ? "Retrying…"
+                    : `Retry ${retryableArtwork} ${retryableArtwork === 1 ? "cover" : "covers"}`}
+                </button>
+              )}
+              {counts.problems > 0 && filter === "problems" && (
+                <button
+                  className="compact-button accent issue-retry-button"
+                  disabled={busy || retryingIssues}
+                  onClick={() => void retryIssues()}
+                >
+                  {retryingIssues || busy ? (
+                    <span className="spinner" />
+                  ) : (
+                    <Icon name="refresh" size={15} />
+                  )}
+                  {retryingIssues || busy ? "Checking…" : `Check & fix ${counts.problems}`}
+                </button>
+              )}
+            </header>
 
-          <div className="track-list" role="list" aria-label="Music queue">
-            {loading ? (
-              <QueueSkeleton />
-            ) : !connected && tracks.length === 0 ? (
-              <EmptyState
-                icon="alert"
-                title="The studio is offline"
-                description="Start the local Rust backend, then reconnect to load your workspace."
-                action="Reconnect"
-                onAction={() => void invalidateStatusAndTracks()}
-              />
-            ) : tracks.length === 0 ? (
-              <EmptyState
-                icon={workflow?.phase === "finish" ? "check" : "music"}
-                title={
-                  busy
-                    ? "Listening to new music"
-                    : workflow?.phase === "finish"
-                      ? "Everything is filed"
-                      : "Nothing waiting"
-                }
-                description={
-                  busy
-                    ? "Audio files will appear here as they are discovered and identified."
-                    : workflow?.phase === "finish"
-                      ? `New songs are in your library: ${setup.library_dir}.`
-                      : "Drop music into the inbox folder. magpie checks it every minute."
-                }
-              />
-            ) : visibleTracks.length === 0 ? (
-              <EmptyState
-                icon={filter === "review" || filter === "ready" ? "check" : "search"}
-                title={
-                  filter === "review"
-                    ? "Nothing needs review"
-                    : filter === "ready"
-                      ? "No tracks are ready yet"
-                      : "No tracks found"
-                }
-                description={
-                  filter === "review"
-                    ? "All current matches are resolved. Your library is ready for the next step."
-                    : filter === "ready"
-                      ? "Accept a match or enter metadata manually to prepare a track for writing."
-                      : "Try another search or switch workspace views."
-                }
+            <div className="track-list" role="list" aria-label="Music queue">
+              {loading ? (
+                <QueueSkeleton />
+              ) : !connected && tracks.length === 0 ? (
+                <EmptyState
+                  icon="alert"
+                  title="The studio is offline"
+                  description="Start the local Rust backend, then reconnect to load your workspace."
+                  action="Reconnect"
+                  onAction={() => void invalidateStatusAndTracks()}
+                />
+              ) : tracks.length === 0 ? (
+                <EmptyState
+                  icon={workflow?.phase === "finish" ? "check" : "music"}
+                  title={
+                    busy
+                      ? "Listening to new music"
+                      : workflow?.phase === "finish"
+                        ? "Everything is filed"
+                        : "Nothing waiting"
+                  }
+                  description={
+                    busy
+                      ? "Audio files will appear here as they are discovered and identified."
+                      : workflow?.phase === "finish"
+                        ? `New songs are in your library: ${setup.library_dir}.`
+                        : "Drop music into the inbox folder. magpie checks it every minute."
+                  }
+                />
+              ) : visibleTracks.length === 0 ? (
+                <EmptyState
+                  icon={filter === "review" || filter === "ready" ? "check" : "search"}
+                  title={
+                    filter === "review"
+                      ? "Nothing needs review"
+                      : filter === "ready"
+                        ? "No tracks are ready yet"
+                        : "No tracks found"
+                  }
+                  description={
+                    filter === "review"
+                      ? "All current matches are resolved. Your library is ready for the next step."
+                      : filter === "ready"
+                        ? "Accept a match or enter metadata manually to prepare a track for writing."
+                        : "Try another search or switch workspace views."
+                  }
+                />
+              ) : (
+                visibleTracks.map((track) => (
+                  <TrackRow
+                    key={track.id}
+                    track={track}
+                    active={track.id === selectedId}
+                    onSelect={selectTrack}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+
+          <aside
+            className={`inspector-panel ${mobileInspector ? "mobile-open" : ""}`}
+            aria-label="Metadata inspector"
+          >
+            <button
+              className="mobile-close icon-button"
+              onClick={() => setMobileInspector(false)}
+              aria-label="Close inspector"
+            >
+              <Icon name="x" />
+            </button>
+            {selected ? (
+              <TrackInspector
+                track={selected}
+                onChoose={choose}
+                onSaved={() => queryClient.invalidateQueries({ queryKey: queryKeys.tracks })}
               />
             ) : (
-              visibleTracks.map((track) => (
-                <TrackRow
-                  key={track.id}
-                  track={track}
-                  active={track.id === selectedId}
-                  onSelect={selectTrack}
-                />
-              ))
+              <InspectorEmpty busy={busy} />
             )}
-          </div>
-        </section>
-
-        <aside
-          className={`inspector-panel ${mobileInspector ? "mobile-open" : ""}`}
-          aria-label="Metadata inspector"
-        >
-          <button
-            className="mobile-close icon-button"
-            onClick={() => setMobileInspector(false)}
-            aria-label="Close inspector"
-          >
-            <Icon name="x" />
-          </button>
-          {selected ? (
-            <TrackInspector
-              track={selected}
-              onChoose={choose}
-              onSaved={() => queryClient.invalidateQueries({ queryKey: queryKeys.tracks })}
-            />
-          ) : (
-            <InspectorEmpty busy={busy} />
-          )}
-        </aside>
-      </main>
+          </aside>
+        </main>
+      )}
 
       <ProcessingDock
         workflow={workflow}

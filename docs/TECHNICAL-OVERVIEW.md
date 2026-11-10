@@ -214,6 +214,22 @@ The **apply service** (`src/application/apply.rs`) files every Ready track:
 
 ---
 
+## 4b. Getting music from links (`src/acquire/`)
+
+| Part | File | Job |
+|---|---|---|
+| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube, the Shazam provider. Only public pages and documented APIs. |
+| Queue | `store.rs`, `migrations/0007_requests.sql` | `requests` (one per link), `wanted` (one per song, in order), `playlists` (one per playlist link). Retries after 30 s, 2 min, 10 min; then failed. |
+| Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first (`NORMAL`), ordinary videos only as a strict fallback (`STRICT`). |
+| yt-dlp | `ytdlp.rs` | YouTube Music song search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
+| Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie/staging/` → write the link's title/artist/album/ISRC as tags. |
+
+Downloads are then identified and filed by the normal inbox cycle, which also walks
+`.magpie/staging/` (without the settle wait). When a download is filed, or recognised as a song
+that is already in the library, `acquire::downloaded_file_done` records the library path and
+rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths). Downloads are
+deleted after filing instead of going to the trash.
+
 ## 5a. Library index
 
 `library_items` (`src/application/library.rs`) keeps one row per audio file in the
@@ -445,6 +461,10 @@ are evicted first (checked at startup and hourly while idle).
 | `POST /api/source/resolve` | Resolve a Shazam/Spotify/YouTube/… link to metadata |
 | `GET  /api/candidates/{id}/artwork/preview`, etc. | Artwork previews |
 | `POST /api/write` | File all Ready tracks into the library now |
+| `POST /api/requests` | Read a link and queue its songs |
+| `GET  /api/requests` | The latest requests with progress counts |
+| `GET  /api/requests/{id}` | Every song of one request with its status |
+| `POST /api/requests/{id}/retry` | Queue a request's failed songs again |
 
 ---
 

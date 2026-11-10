@@ -33,6 +33,12 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "navidrome": navidrome,
         "library_songs": library_songs,
         "rsgain": crate::infrastructure::media::rsgain::available(),
+        "ytdlp": crate::acquire::ytdlp::available(&cfg),
+        "audio_format": match cfg.audio_format {
+            crate::config::AudioFormat::M4a => "m4a",
+            crate::config::AudioFormat::Opus => "opus",
+        },
+        "max_parallel_downloads": cfg.max_parallel_downloads,
         "sources": {
             "musicbrainz": true,
             "navahang": true,

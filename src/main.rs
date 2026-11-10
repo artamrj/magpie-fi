@@ -1,3 +1,4 @@
+mod acquire;
 mod app;
 mod application;
 mod config;
@@ -31,8 +32,9 @@ async fn main() -> Result<()> {
     let address = listen_address()?;
     let frontend = frontend_directory()?;
 
-    let config = config::Config::from_env()?;
+    let mut config = config::Config::from_env()?;
     prepare_folders(&config)?;
+    resolve_folders(&mut config)?;
     let pool = infrastructure::db::connect(&config.db_path).await?;
     infrastructure::db::cleanup(&pool, &config).await?;
     infrastructure::db::run_daily_cache_cleanup_if_due(&pool).await?;
@@ -112,6 +114,21 @@ async fn main() -> Result<()> {
             }
         }
     });
+    tokio::spawn(acquire::worker::run(state.clone()));
+    let updater_state = state.clone();
+    tokio::spawn(async move {
+        // yt-dlp breaks whenever YouTube changes, so it is updated every day.
+        loop {
+            let config = updater_state.config.read().await.clone();
+            if config.ytdlp_self_update {
+                match acquire::ytdlp::self_update(&config).await {
+                    Ok(message) => tracing::info!(%message, "yt-dlp update check"),
+                    Err(error) => tracing::warn!(%error, "yt-dlp update failed"),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
     let api = http::router().layer(middleware::from_fn(http::protect_local_api));
     let app = Router::new().nest("/api", api);
     let app = if let Some(directory) = &frontend {
@@ -180,6 +197,7 @@ fn prepare_folders(config: &config::Config) -> Result<()> {
         Some(Path::new(&config.input_dir)),
         Some(Path::new(&config.output_dir)),
         Some(config.trash_dir.as_path()),
+        Some(config.staging_dir.as_path()),
         database_folder,
     ]
     .into_iter()
@@ -188,6 +206,25 @@ fn prepare_folders(config: &config::Config) -> Result<()> {
         std::fs::create_dir_all(folder)
             .with_context(|| format!("could not create folder {}", folder.display()))?;
     }
+    Ok(())
+}
+
+/// Uses the real paths of the music folders (symlinks resolved), the same form
+/// the inbox scan records for every file, so "is this file in staging?" is a
+/// simple prefix check everywhere.
+fn resolve_folders(config: &mut config::Config) -> Result<()> {
+    let real = |path: &Path| {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("cannot open folder {}", path.display()))
+    };
+    config.input_dir = real(Path::new(&config.input_dir))?
+        .to_string_lossy()
+        .into_owned();
+    config.output_dir = real(Path::new(&config.output_dir))?
+        .to_string_lossy()
+        .into_owned();
+    config.trash_dir = real(&config.trash_dir)?;
+    config.staging_dir = real(&config.staging_dir)?;
     Ok(())
 }
 

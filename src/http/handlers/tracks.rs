@@ -43,8 +43,8 @@ pub async fn remove_track(
         ));
     }
 
-    let input_dir = s.config.read().await.input_dir.clone();
-    let input_dir = tokio::fs::canonicalize(&input_dir)
+    let cfg = s.config.read().await.clone();
+    let input_dir = tokio::fs::canonicalize(&cfg.input_dir)
         .await
         .map_err(|error| anyhow::anyhow!("could not verify the music folder: {error}"))?;
     let source = tokio::fs::canonicalize(&track.path)
@@ -56,9 +56,10 @@ pub async fn remove_track(
                 ApiError::Internal(error.into())
             }
         })?;
-    if source == input_dir || !source.starts_with(&input_dir) {
+    let in_inbox = source != input_dir && source.starts_with(&input_dir);
+    if !in_inbox && !source.starts_with(&cfg.staging_dir) {
         return Err(ApiError::validation(
-            "Refusing to remove a file outside the configured music folder",
+            "Refusing to remove a file outside the inbox",
         ));
     }
     if !tokio::fs::metadata(&source).await?.is_file() {
@@ -67,9 +68,22 @@ pub async fn remove_track(
         ));
     }
 
-    tokio::fs::remove_file(&source).await.map_err(|error| {
-        ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}"))
-    })?;
+    // Your own files go to the trash; magpie's downloads are simply deleted.
+    crate::application::library::discard_original(
+        &cfg.trash_dir,
+        &cfg.staging_dir,
+        &input_dir,
+        &source,
+    )
+    .await
+    .map_err(|error| ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}")))?;
+    sqlx::query(
+        "UPDATE wanted SET status='failed',error='Removed in review',updated_at=? WHERE staging_path=?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(source.to_string_lossy().as_ref())
+    .execute(&s.pool)
+    .await?;
 
     let canonical_path = source.to_string_lossy().into_owned();
     let mut transaction = s.pool.begin().await?;

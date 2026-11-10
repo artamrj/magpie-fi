@@ -98,6 +98,9 @@ pub struct AppState {
     pub soundcloud_auth: crate::infrastructure::providers::soundcloud::SoundCloudAuth,
     pub workflow: RwLock<Workflow>,
     automation_notify: Notify,
+    acquire_notify: Notify,
+    /// A playlist file changed without a filing step that scans Navidrome.
+    pub playlist_scan_pending: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -122,6 +125,8 @@ impl AppState {
                 ..Default::default()
             }),
             automation_notify: Notify::new(),
+            acquire_notify: Notify::new(),
+            playlist_scan_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -193,6 +198,15 @@ impl AppState {
 
     pub async fn wait_for_automation_change(&self) {
         self.automation_notify.notified().await;
+    }
+
+    /// Wakes the download worker (new songs queued, or a slot became free).
+    pub fn notify_acquire(&self) {
+        self.acquire_notify.notify_one();
+    }
+
+    pub async fn wait_for_acquire(&self) {
+        self.acquire_notify.notified().await;
     }
 
     pub async fn set_workflow(

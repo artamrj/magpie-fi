@@ -53,6 +53,14 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
             </p>
           </section>
           <section>
+            <h3>Downloads</h3>
+            <p className="settings-hint">
+              {setup.ytdlp
+                ? `yt-dlp ready · ${setup.audio_format.toUpperCase()} · ${setup.max_parallel_downloads} at a time`
+                : "yt-dlp is not installed, so links cannot be downloaded."}
+            </p>
+          </section>
+          <section>
             <h3>Extras</h3>
             <p className="settings-hint">
               Lyrics: {setup.lyrics ? "on (LRCLIB)" : "off"} · Album loudness:{" "}

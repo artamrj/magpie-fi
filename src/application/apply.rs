@@ -173,7 +173,7 @@ pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
     let mut items: Vec<PreviewItem> = Vec::new();
     let mut selected_count = 0;
     for group in input_dedup::group_recordings(&evidence) {
-        let Some((candidate_owner, candidate)) = group.members.iter().find_map(|index| {
+        let Some((candidate_owner, mut candidate)) = group.members.iter().find_map(|index| {
             sources[*index]
                 .candidate
                 .clone()
@@ -205,6 +205,8 @@ pub(crate) async fn prepare_apply(s: &Arc<AppState>) -> Result<PreparedApply> {
             .count();
         let source = &sources[representative];
         let track = &source.track;
+        // Songs of an album that is already in the library join its folder and year.
+        library::align_with_existing_release(std::path::Path::new(&cfg.output_dir), &mut candidate);
         let dest = PathBuf::from(destination(&cfg, track, &candidate)?);
         let duplicates = group
             .members
@@ -840,7 +842,9 @@ pub async fn apply(s: Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
         let reused_existing = publication.reused_existing();
 
         // 3. The original goes to the trash, the library remembers the new file.
-        trash_source_after_output(&src, &final_path, &cfg.trash_dir, &inbox).await?;
+        trash_source_after_output(&src, &final_path, &cfg.trash_dir, &cfg.staging_dir, &inbox)
+            .await?;
+        crate::acquire::downloaded_file_done(&s, &src, &final_path, reused_existing).await;
         if let Some(old) = replaces.as_ref().filter(|old| **old != final_path) {
             for file in std::iter::once(old.clone()).chain(lyrics::sidecars(old)) {
                 library::move_to_trash(&cfg.trash_dir, &library_root, &file).await?;
@@ -968,9 +972,12 @@ async fn skip_known_recording(
         }),
     );
     for (track_id, path, missing) in sources {
+        let original = std::path::Path::new(path);
         if !missing {
-            library::move_to_trash(&cfg.trash_dir, inbox, std::path::Path::new(path)).await?;
+            library::discard_original(&cfg.trash_dir, &cfg.staging_dir, inbox, original).await?;
         }
+        crate::acquire::downloaded_file_done(s, original, std::path::Path::new(library_path), true)
+            .await;
         sqlx::query("DELETE FROM tracks WHERE id=?")
             .bind(track_id.0)
             .execute(&s.pool)
@@ -1096,10 +1103,12 @@ async fn finish_duplicate(
             source,
             output,
             &cfg.trash_dir,
+            &cfg.staging_dir,
             std::path::Path::new(&cfg.input_dir),
         )
         .await?;
     }
+    crate::acquire::downloaded_file_done(state, source, output, true).await;
     sqlx::query("DELETE FROM tracks WHERE id=?")
         .bind(duplicate.track_id.0)
         .execute(&state.pool)
@@ -1189,20 +1198,22 @@ async fn paths_resolve_to_same_target(
     Ok(source == destination)
 }
 
-/// Moves the original to the trash, but only after the filed song exists.
+/// Moves the original to the trash (or deletes it when it was one of magpie's
+/// own downloads), but only after the filed song exists.
 async fn trash_source_after_output(
     source: &std::path::Path,
     destination: &std::path::Path,
     trash: &std::path::Path,
+    staging: &std::path::Path,
     inbox: &std::path::Path,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let output = tokio::fs::metadata(destination)
         .await
         .map_err(|error| anyhow::anyhow!("filed song is unavailable: {error}"))?;
     if !output.is_file() {
         anyhow::bail!("filed song is not a regular file")
     }
-    library::move_to_trash(trash, inbox, source).await
+    library::discard_original(trash, staging, inbox, source).await
 }
 
 #[cfg(test)]
@@ -1619,9 +1630,16 @@ mod tests {
             .await
             .unwrap();
         assert!(published.reused_existing());
-        let trashed = trash_source_after_output(&source, published.path(), &trash, &inbox)
-            .await
-            .unwrap();
+        let trashed = trash_source_after_output(
+            &source,
+            published.path(),
+            &trash,
+            &directory.path().join("staging"),
+            &inbox,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(!source.exists());
         assert!(trashed.ends_with("input.mp3"));
@@ -1667,16 +1685,18 @@ mod tests {
         let output = directory.path().join("output.mp3");
         tokio::fs::write(&source, b"original").await.unwrap();
 
+        let staging = directory.path().join("staging");
         assert!(
-            trash_source_after_output(&source, &output, &trash, &inbox)
+            trash_source_after_output(&source, &output, &trash, &staging, &inbox)
                 .await
                 .is_err()
         );
         assert!(source.exists());
 
         tokio::fs::write(&output, b"corrected").await.unwrap();
-        let trashed = trash_source_after_output(&source, &output, &trash, &inbox)
+        let trashed = trash_source_after_output(&source, &output, &trash, &staging, &inbox)
             .await
+            .unwrap()
             .unwrap();
         assert!(!source.exists());
         assert_eq!(tokio::fs::read(&trashed).await.unwrap(), b"original");

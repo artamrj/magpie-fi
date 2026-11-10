@@ -8,8 +8,37 @@ export type Setup = {
   lyrics: boolean;
   rsgain: boolean;
   library_songs: number;
+  ytdlp: boolean;
+  audio_format: string;
+  max_parallel_downloads: number;
   navidrome: { configured: boolean; url?: string; reachable?: boolean };
   sources: Record<string, boolean>;
+};
+/** A link someone asked for (GET /api/requests). */
+export type MusicRequest = {
+  id: number;
+  url: string;
+  kind: "track" | "album" | "playlist";
+  title?: string;
+  owner?: string;
+  status: "reading" | "ready" | "failed";
+  error?: string;
+  created_at: string;
+  total: number;
+  done: number;
+  working: number;
+  review: number;
+  failed: number;
+};
+/** One song of a request (GET /api/requests/{id}). */
+export type WantedSong = {
+  position: number;
+  title: string;
+  artist?: string;
+  status: string;
+  error?: string;
+  library_path?: string;
+  attempts: number;
 };
 export type Candidate = {
   id: number;

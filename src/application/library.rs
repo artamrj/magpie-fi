@@ -120,6 +120,76 @@ fn is_compilation(candidate: &Candidate) -> bool {
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("compilation"))
 }
 
+/// Keeps an album together. Catalogs often disagree about a year (the single's
+/// year for one song, the album's for the next), which would give one album
+/// two folders and two albums in Navidrome. When the album artist already has
+/// a folder for this album (same name and kind, another year), the song takes
+/// that folder's year.
+pub fn align_with_existing_release(library: &Path, candidate: &mut Candidate) {
+    let probe = destination(library, candidate, "x");
+    let (Some(release_folder), Some(artist_folder)) =
+        (probe.parent(), probe.parent().and_then(Path::parent))
+    else {
+        return;
+    };
+    let Some(current) = release_folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let suffix = match release_kind(candidate) {
+        ReleaseKind::Single => " [Single]",
+        ReleaseKind::Ep => " [EP]",
+        ReleaseKind::Album => "",
+    };
+    let album = current
+        .strip_suffix(suffix)
+        .map(|name| strip_year(name).0.to_owned())
+        .unwrap_or_else(|| current.clone());
+    let Ok(entries) = std::fs::read_dir(artist_folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current || !entry.path().is_dir() {
+            continue;
+        }
+        let Some(rest) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        if suffix.is_empty() && (rest.ends_with(" [Single]") || rest.ends_with(" [EP]")) {
+            continue;
+        }
+        if let (existing_album, Some(year)) = strip_year(rest)
+            && existing_album == album
+        {
+            candidate.year = Some(year.to_owned());
+            if candidate
+                .release_date
+                .as_deref()
+                .is_some_and(|date| !date.starts_with(year))
+            {
+                candidate.release_date = None;
+            }
+            return;
+        }
+    }
+}
+
+/// "Discovery (2001)" → ("Discovery", Some("2001")).
+fn strip_year(name: &str) -> (&str, Option<&str>) {
+    if let Some(open) = name.rfind(" (")
+        && name.ends_with(')')
+    {
+        let year = &name[open + 2..name.len() - 1];
+        if year.len() == 4 && year.chars().all(|character| character.is_ascii_digit()) {
+            return (&name[..open], Some(year));
+        }
+    }
+    (name, None)
+}
+
 fn release_year(candidate: &Candidate) -> Option<String> {
     [candidate.year.as_deref(), candidate.release_date.as_deref()]
         .into_iter()
@@ -548,6 +618,48 @@ pub async fn write_folder_cover(album_folder: &Path, image: &[u8]) -> Result<Opt
     Ok(Some(target))
 }
 
+// ── Playlists ───────────────────────────────────────────────────────────────
+
+/// Writes `library/Playlists/<name>.m3u8` with paths relative to the playlist
+/// file, which Navidrome imports automatically. Songs outside the library are
+/// left out. Returns true when the file changed.
+pub async fn write_playlist(library: &Path, name: &str, songs: &[String]) -> Result<bool> {
+    let folder = library.join("Playlists");
+    tokio::fs::create_dir_all(&folder).await?;
+    let mut content = format!("#EXTM3U\n#PLAYLIST:{}\n", name.replace('\n', " "));
+    for song in songs {
+        let Ok(relative) = Path::new(song).strip_prefix(library) else {
+            continue;
+        };
+        content.push_str("../");
+        content.push_str(&relative.to_string_lossy());
+        content.push('\n');
+    }
+    let target = folder.join(format!("{}.m3u8", safe_name(name, "Playlist")));
+    if tokio::fs::read_to_string(&target).await.ok().as_deref() == Some(content.as_str()) {
+        return Ok(false);
+    }
+    let temporary = folder.join(format!(".{}.m3u8.part", safe_name(name, "Playlist")));
+    tokio::fs::write(&temporary, &content).await?;
+    tokio::fs::rename(&temporary, &target).await?;
+    Ok(true)
+}
+
+/// Removes a file that magpie created itself (a download in staging) or moves
+/// anything else to the trash.
+pub async fn discard_original(
+    trash: &Path,
+    staging: &Path,
+    inbox: &Path,
+    file: &Path,
+) -> Result<Option<PathBuf>> {
+    if file.starts_with(staging) {
+        tokio::fs::remove_file(file).await?;
+        return Ok(None);
+    }
+    move_to_trash(trash, inbox, file).await.map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +756,31 @@ mod tests {
             path(&value, "mp3"),
             "/lib/Daft Punk/Discovery/Digital Love.mp3"
         );
+    }
+
+    #[test]
+    fn a_new_song_joins_its_album_even_when_catalogs_disagree_on_the_year() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path();
+        std::fs::create_dir_all(library.join("Daft Punk/Discovery (2001)")).unwrap();
+        std::fs::create_dir_all(library.join("Daft Punk/Discovery (2001) [Single]")).unwrap();
+        let mut song = candidate();
+        song.album = Some("Discovery".into());
+        song.year = Some("2000".into());
+        song.release_date = Some("2000-11-13".into());
+
+        align_with_existing_release(library, &mut song);
+
+        assert_eq!(song.year.as_deref(), Some("2001"));
+        assert_eq!(song.release_date, None);
+        assert!(path(&song, "m4a").contains("/Discovery (2001)/"));
+
+        // A different album keeps its own year.
+        let mut other = candidate();
+        other.album = Some("Homework".into());
+        other.year = Some("1997".into());
+        align_with_existing_release(library, &mut other);
+        assert_eq!(other.year.as_deref(), Some("1997"));
     }
 
     #[test]
@@ -786,6 +923,69 @@ mod tests {
         assert!(is_upgrade(&new("flac"), &existing("m4a")));
         assert!(!is_upgrade(&new("mp3"), &existing("m4a")));
         assert!(!is_upgrade(&new("flac"), &existing("flac")));
+    }
+
+    #[tokio::test]
+    async fn playlists_use_relative_paths_and_skip_outside_songs() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let songs = vec![
+            library
+                .join("A/Album (2001)/01 - One.m4a")
+                .to_string_lossy()
+                .into_owned(),
+            "/elsewhere/two.m4a".to_owned(),
+            library
+                .join("B/Single (2020) [Single]/01 - Three.m4a")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        assert!(
+            write_playlist(&library, "Arta - Road Trip", &songs)
+                .await
+                .unwrap()
+        );
+        let text = tokio::fs::read_to_string(library.join("Playlists/Arta - Road Trip.m3u8"))
+            .await
+            .unwrap();
+        assert_eq!(
+            text,
+            "#EXTM3U\n#PLAYLIST:Arta - Road Trip\n../A/Album (2001)/01 - One.m4a\n../B/Single (2020) [Single]/01 - Three.m4a\n"
+        );
+        assert!(
+            !write_playlist(&library, "Arta - Road Trip", &songs)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn own_downloads_are_deleted_and_other_files_trashed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (trash, staging, inbox) = (
+            directory.path().join("trash"),
+            directory.path().join("staging"),
+            directory.path().join("inbox"),
+        );
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::create_dir_all(&inbox).await.unwrap();
+        let download = staging.join("w1.m4a");
+        let dropped = inbox.join("mine.mp3");
+        tokio::fs::write(&download, b"d").await.unwrap();
+        tokio::fs::write(&dropped, b"m").await.unwrap();
+
+        assert_eq!(
+            discard_original(&trash, &staging, &inbox, &download)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!download.exists());
+        let trashed = discard_original(&trash, &staging, &inbox, &dropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(trashed.starts_with(&trash));
     }
 
     #[tokio::test]

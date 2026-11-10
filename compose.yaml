@@ -32,6 +32,12 @@ services:
       MAGPIE_INBOX_SETTLE_SECONDS: "${MAGPIE_INBOX_SETTLE_SECONDS:-}"
       MAGPIE_TRASH_DAYS: "${MAGPIE_TRASH_DAYS:-}"
       MAGPIE_LYRICS: "${MAGPIE_LYRICS:-}"
+      MAGPIE_AUDIO_FORMAT: "${MAGPIE_AUDIO_FORMAT:-}"
+      MAGPIE_MAX_PARALLEL_DOWNLOADS: "${MAGPIE_MAX_PARALLEL_DOWNLOADS:-}"
+      MAGPIE_DOWNLOAD_PAUSE_SECONDS: "${MAGPIE_DOWNLOAD_PAUSE_SECONDS:-}"
+      MAGPIE_MAX_COLLECTION_TRACKS: "${MAGPIE_MAX_COLLECTION_TRACKS:-}"
+      # Used only when config/ytdlp/cookies.txt exists.
+      MAGPIE_YTDLP_COOKIES: /config/cookies.txt
       MAGPIE_ACOUSTID_KEY: "${MAGPIE_ACOUSTID_KEY:-}"
       MAGPIE_AUDD_TOKEN: "${MAGPIE_AUDD_TOKEN:-}"
       MAGPIE_SPOTIFY_CLIENT_ID: "${MAGPIE_SPOTIFY_CLIENT_ID:-}"
@@ -47,6 +53,7 @@ services:
       # trash are instant renames.
       - ${MUSIC_ROOT:-./music}:/music
       - ${DATA_ROOT:-./data}/magpie:/data
+      - ./config/ytdlp:/config:ro
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -85,8 +92,9 @@ services:
       start_period: 20s
       retries: 3
 
-  # Temporary bridge (BLUEPRINT.md §8): the old Python Telegram bot drops its
-  # downloads into the inbox until the bot is rewritten inside magpie (Phase 3).
+  # Temporary Telegram bridge (BLUEPRINT.md §8): the old Python bot drops its
+  # downloads into the inbox until Telegram moves into magpie (Phase 3).
+  # Links pasted into magpie's own web page do not need it.
   # Start it with: docker compose --profile bot up -d
   bot:
     profiles: [bot]
@@ -103,13 +111,13 @@ services:
       MUSIC_DIR: /music
       DOWNLOAD_TMP_DIR: /music/.incoming
       DATA_DIR: /data
-      AUDIO_FORMAT: "${AUDIO_FORMAT:-m4a}"
+      AUDIO_FORMAT: "${MAGPIE_AUDIO_FORMAT:-m4a}"
       METADATA_LOOKUP: "true"
       # magpie fetches lyrics when it files the song.
       LYRICS: "false"
-      MAX_PARALLEL_DOWNLOADS: "${MAX_PARALLEL_DOWNLOADS:-2}"
-      DOWNLOAD_PAUSE_SECONDS: "${DOWNLOAD_PAUSE_SECONDS:-3}"
-      MAX_COLLECTION_TRACKS: "${MAX_COLLECTION_TRACKS:-1000}"
+      MAX_PARALLEL_DOWNLOADS: "${MAGPIE_MAX_PARALLEL_DOWNLOADS:-2}"
+      DOWNLOAD_PAUSE_SECONDS: "${MAGPIE_DOWNLOAD_PAUSE_SECONDS:-3}"
+      MAX_COLLECTION_TRACKS: "${MAGPIE_MAX_COLLECTION_TRACKS:-1000}"
       YTDLP_COOKIES_FILE: "${YTDLP_COOKIES_FILE:-}"
       RECEIVED_STICKER_ID: "${RECEIVED_STICKER_ID:-}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
