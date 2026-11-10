@@ -164,21 +164,20 @@ export function ReviewList({
       {busy && workflow && (
         <div className="busy-strip" role="status">
           <Spinner />
-          <span>
+          <span className="busy-text">
             {workflow.phase === "apply" ? "Filing" : "Identifying"}
             {workflow.total
-              ? ` ${Math.min(workflow.current || workflow.processed, workflow.total)} of ${workflow.total}`
-              : ""}
-            {workflow.current_file ? ` · ${workflow.current_file}` : ""}
+              ? ` ${Math.min(Math.max(workflow.current, workflow.processed) + 1, workflow.total)} of ${workflow.total}`
+              : "…"}
           </span>
-          <progress
-            max={workflow.total || 1}
-            value={Math.max(workflow.processed, workflow.current)}
-            aria-label="Progress"
-          />
           <button type="button" className="text-button" onClick={() => void stop()}>
             Stop
           </button>
+          {workflow.current_file && (
+            <span className="busy-file" dir="auto">
+              {workflow.current_file}
+            </span>
+          )}
         </div>
       )}
 
