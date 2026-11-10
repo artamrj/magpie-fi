@@ -150,3 +150,57 @@ export type Workflow = {
   total: number;
   processed: number;
 };
+
+/** Files tab: a folder of `library/`. Paths are relative to the library; "" is the library. */
+export type LibraryFolderEntry = { path: string; name: string; songs: number; folders: number };
+export type LibrarySong = {
+  path: string;
+  name: string;
+  title: string;
+  artist?: string | null;
+  album?: string | null;
+  format: string;
+  duration?: number | null;
+};
+export type LibraryFolder = {
+  path: string;
+  name: string;
+  folders: LibraryFolderEntry[];
+  songs: LibrarySong[];
+  songs_inside: number;
+};
+export type LibrarySearch = { folders: LibraryFolderEntry[]; songs: LibrarySong[]; more: boolean };
+/** Every tag of one song, read from the file. */
+export type SongDetails = {
+  path: string;
+  name: string;
+  folder: string;
+  size: number;
+  format: string;
+  title?: string | null;
+  artist?: string | null;
+  artists: string[];
+  album?: string | null;
+  album_artist?: string | null;
+  track?: number | null;
+  track_total?: number | null;
+  disc?: number | null;
+  disc_total?: number | null;
+  year?: string | null;
+  release_date?: string | null;
+  genre?: string | null;
+  composer?: string | null;
+  label?: string | null;
+  isrc?: string | null;
+  musicbrainz_recording?: string | null;
+  musicbrainz_release?: string | null;
+  track_gain?: string | null;
+  album_gain?: string | null;
+  lyrics?: string | null;
+  has_cover: boolean;
+  duration: number;
+  bitrate?: number | null;
+  sample_rate?: number | null;
+  bit_depth?: number | null;
+  channels?: number | null;
+};

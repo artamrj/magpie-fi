@@ -3,10 +3,13 @@ import { busyPhases } from "../app/trackUtils";
 import { api } from "./client";
 import type {
   ArtistSummary,
+  LibraryFolder,
+  LibrarySearch,
   Me,
   MusicRequest,
   RecentSong,
   Setup,
+  SongDetails,
   Track,
   WantedSong,
   Workflow,
@@ -20,6 +23,7 @@ export const queryKeys = {
   requests: ["requests"] as const,
   recent: ["library", "recent"] as const,
   artists: ["artists"] as const,
+  files: ["files"] as const,
 };
 
 export function useArtistsQuery() {
@@ -95,5 +99,36 @@ export function useRecentSongsQuery() {
     queryKey: queryKeys.recent,
     queryFn: () => api<RecentSong[]>("/library/recent"),
     refetchInterval: 15000,
+  });
+}
+
+const pathParam = (path: string) => encodeURIComponent(path);
+
+/** One folder of the library ("" is the library itself). */
+export function useFolderQuery(path: string, enabled = true) {
+  return useQuery({
+    queryKey: [...queryKeys.files, "folder", path],
+    queryFn: () => api<LibraryFolder>(`/files?path=${pathParam(path)}`),
+    enabled,
+    staleTime: 10000,
+  });
+}
+
+/** Songs and folders matching every word; keeps the last results while typing. */
+export function useFileSearchQuery(query: string, within: string) {
+  return useQuery({
+    queryKey: [...queryKeys.files, "search", query, within],
+    queryFn: () =>
+      api<LibrarySearch>(`/files/search?q=${encodeURIComponent(query)}&in=${pathParam(within)}`),
+    enabled: query.length > 0,
+    placeholderData: (previous) => previous,
+    staleTime: 10000,
+  });
+}
+
+export function useSongDetailsQuery(path: string) {
+  return useQuery({
+    queryKey: [...queryKeys.files, "song", path],
+    queryFn: () => api<SongDetails>(`/files/song?path=${pathParam(path)}`),
   });
 }

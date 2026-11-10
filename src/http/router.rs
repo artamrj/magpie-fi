@@ -22,6 +22,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tracks", get(handlers::list_tracks))
         .route("/artists", get(handlers::list_artists))
         .route("/artists/{id}", post(handlers::change_artist))
+        .route("/files", get(handlers::list_folder))
+        .route("/files/search", get(handlers::search_files))
+        .route("/files/song", get(handlers::song_details))
+        .route("/files/artwork", get(handlers::song_artwork))
+        .route("/files/audio", get(handlers::song_audio))
         .route(
             "/tracks/{id}",
             axum::routing::delete(handlers::remove_track),
@@ -120,5 +125,28 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"], "API route not found");
+    }
+
+    #[tokio::test]
+    async fn the_files_tab_refuses_paths_outside_the_library() {
+        let state = test_state().await;
+        for uri in [
+            "/files?path=..%2Fsecret",
+            "/files/song?path=%2Fetc%2Fpasswd",
+            "/files/audio?path=a%2F..%2F..%2Fx.mp3",
+            "/files/artwork?path=.magpie-fi%2Fstaging%2Fx.mp3",
+            "/files/search?q=x&in=..",
+        ] {
+            let response = router()
+                .with_state(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{uri} must be refused"
+            );
+        }
     }
 }

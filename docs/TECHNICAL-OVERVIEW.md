@@ -259,6 +259,16 @@ The best-quality file of each group (lossless first, then bitrate, then path) is
 online; the others become `duplicate/skipped` and are trashed when it is filed. Remixes, live
 versions and different lengths never group. The same grouping runs again when filing.
 
+**Files tab** (`src/application/file_browser.rs`, read-only). Every path the page sends is
+relative to `library/` and goes through `file_browser::resolve`: absolute paths, `..`, hidden or
+NAS folders (`.`/`@`) and links that lead outside the library are refused (422). A folder
+listing reads the folder itself (so unindexed files show, named after the file) and takes
+titles and song counts from `library_items`, so no tags are read to list a folder. Search
+needs every word to appear in the title, artist, album, path or `title_key` (so `ي`/`ی` and
+accents do not matter for titles), returns at most 100 songs, and finds folders whose path holds
+every word and whose own name holds one. One song's details are read fresh from the file with
+`tag_writer::read_details`, exactly as written (nothing cleaned up).
+
 ---
 
 ## 9. Smart auto-selection
@@ -454,6 +464,13 @@ All routes are under `/api` (`src/http/router.rs`).
 | `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie-fi |
 | `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
 | `GET /library/recent` | The songs filed most recently |
+| `GET /artists` | Every artist with song count, spellings and "looks like two" |
+| `POST /artists/{id}` | Rename, join, split or confirm an artist (retags and moves its songs) |
+| `GET /files?path=` | One folder of `library/` ("" is the library): folders with counts, songs |
+| `GET /files/search?q=&in=` | Songs and folders matching every word, optionally inside one folder |
+| `GET /files/song?path=` | Every tag of one song, read from the file |
+| `GET /files/artwork?path=` | The cover inside one song |
+| `GET /files/audio?path=` | Stream one song (range requests) |
 | `POST /requests` | Read a link and queue its songs |
 | `GET /requests` | The latest requests with progress counts |
 | `GET /requests/{id}` | Every song of one request with its status |
@@ -476,6 +493,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | Cover worker | `src/application/artwork.rs` |
 | Filing | `src/application/apply.rs` |
 | Library layout, index, trash, playlists | `src/application/library.rs` |
+| Files tab (browse, search, song details) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |
 | Getting music from links | `src/acquire/` |
 | Telegram bot | `src/telegram/` |
 | Tracks and candidates in the database | `src/infrastructure/db/` |

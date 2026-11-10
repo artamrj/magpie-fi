@@ -302,7 +302,20 @@ pub async fn track_audio(
     headers: HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     let track = track_db::track(&s.pool, id).await?;
-    let path = std::path::Path::new(&track.path);
+    stream_audio(
+        std::path::Path::new(&track.path),
+        audio_mime(track.format.as_deref().unwrap_or_default()),
+        &headers,
+    )
+    .await
+}
+
+/// Streams an audio file with byte ranges, so the player can seek anywhere.
+pub(super) async fn stream_audio(
+    path: &std::path::Path,
+    mime: &'static str,
+    headers: &HeaderMap,
+) -> ApiResult<axum::response::Response> {
     let metadata = tokio::fs::metadata(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ApiError::not_found("audio source file no longer exists")
@@ -339,7 +352,7 @@ pub async fn track_audio(
 
     let mut response = axum::response::Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, audio_mime(&track))
+        .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::CACHE_CONTROL, "private, no-store");
@@ -385,8 +398,8 @@ fn parse_byte_range(
     Ok(Some((start, end)))
 }
 
-fn audio_mime(track: &Track) -> &'static str {
-    match track.format.as_deref().unwrap_or_default() {
+pub(super) fn audio_mime(format: &str) -> &'static str {
+    match format {
         "mp3" => "audio/mpeg",
         "m4a" | "mp4" | "aac" => "audio/mp4",
         "flac" => "audio/flac",
@@ -805,7 +818,7 @@ pub async fn candidate_artwork_preview(
     }
 }
 
-fn artwork_response(artwork: Vec<u8>) -> ApiResult<axum::response::Response> {
+pub(super) fn artwork_response(artwork: Vec<u8>) -> ApiResult<axum::response::Response> {
     let mime = artwork_mime(&artwork);
     Ok(axum::response::Response::builder()
         .header(axum::http::header::CONTENT_TYPE, mime)

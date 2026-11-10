@@ -877,7 +877,7 @@ button.cell:active {
   background: var(--bar);
   border-top: 0.5px solid var(--sep);
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   z-index: 4;
 }
 .tabbar button {
@@ -1091,6 +1091,181 @@ button.cell:active {
 }
 
 /* ---------- Wide browser window (never inside Telegram) ---------- */
+/* ---------- Files tab ---------- */
+.folder-lead {
+  width: 40px;
+  height: 40px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--info-soft);
+  color: var(--accent);
+}
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin: 14px 4px 0;
+  font-size: 14px;
+}
+.crumbs span {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.crumbs button {
+  color: var(--link);
+  padding: 2px 2px;
+  overflow-wrap: anywhere;
+}
+.crumbs svg {
+  color: var(--hint);
+}
+.crumbs .here button {
+  color: var(--sub);
+  font-weight: 600;
+  opacity: 1;
+}
+.search-clear {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--hint);
+  color: var(--bg);
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.search-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.search-scope button {
+  padding: 5px 12px;
+  border-radius: 99px;
+  background: var(--fill);
+  color: var(--sub);
+  font-size: 14px;
+}
+.search-scope button.on {
+  background: var(--button);
+  color: var(--button-text);
+}
+.file-meta {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  font-size: 13px;
+  color: var(--hint);
+  font-variant-numeric: tabular-nums;
+}
+.info-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  min-height: 46px;
+  position: relative;
+  font-size: 16px;
+}
+.info-row + .info-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 0;
+  border-top: 0.5px solid var(--sep);
+}
+.info-row > span:first-child {
+  font-size: 14px;
+  color: var(--sub);
+}
+.info-row b {
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+.info-row i {
+  font-style: normal;
+  color: var(--hint);
+}
+.info-row .mono {
+  font:
+    13px/1.35 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
+  color: var(--sub);
+}
+/* A path never turns around for a Persian folder name. */
+.path-text {
+  display: block;
+  text-align: left;
+  unicode-bidi: isolate;
+}
+.tree {
+  margin-top: 14px;
+  background: var(--section);
+  border-radius: var(--radius);
+  padding: 4px 0;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding-inline-end: 12px;
+  font-size: 14.5px;
+}
+button.tree-row:hover {
+  background: var(--fill);
+}
+.tree-row.selected,
+button.tree-row.selected:hover {
+  background: var(--button);
+  color: var(--button-text);
+}
+.tree-row.selected small,
+.tree-row.selected .tree-folder {
+  color: inherit;
+}
+.tree-note {
+  color: var(--hint);
+  font-size: 13.5px;
+}
+.twisty {
+  width: 14px;
+  flex: none;
+  color: var(--hint);
+  transition: transform 0.15s;
+}
+.twisty.open {
+  transform: rotate(90deg);
+}
+.tree-folder {
+  color: var(--accent);
+}
+.tree-name {
+  flex: 1;
+  min-width: 0;
+  /* Next to its icon, also for a Persian name. */
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-row small {
+  color: var(--hint);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (min-width: 1024px) {
   html:not(.in-telegram) body {
     overflow: hidden;

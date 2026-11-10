@@ -151,7 +151,7 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   image), so everything comes from one origin, as Telegram's Mini App rules require.
 - The web page is designed as a Telegram Mini App and looks the same in a browser: one column
   of Telegram-style grouped lists, colours from Telegram's theme variables (`--tg-theme-*`, with
-  Telegram's iOS day and night colours as fallbacks), and three tabs:
+  Telegram's iOS day and night colours as fallbacks), and four tabs:
   - **Add**: paste a link (or send one to the bot), then a short list like a browser's
     downloads: what is on the way now, and what settled in the last day (added, needs your
     pick, failed with the reason and a Retry); older entries behind "Show earlier". A song that
@@ -166,6 +166,10 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
   - **Library**: counts, artists (rename, join, split a duet, from a bottom sheet) and status
     (bot, sources, folders, log out).
+  - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
+    wide screen), a search over titles, artists, albums and paths, and one song's tags, cover,
+    sound and path with a player. Read-only for now; hidden folders (`.magpie-fi`, `@eaDir`)
+    and anything outside `library/` are never shown.
   A browser window wider than 1024 px shows a sidebar, the list and the song side by side
   (Enter uses the match, → goes to the next song). Telegram's panel is never that wide.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the

@@ -238,6 +238,86 @@ fn embedded_lyrics(file: &lofty::file::TaggedFile) -> Option<String> {
     })
 }
 
+/// The tags of a library file exactly as written, for the Files tab. Unlike
+/// `domain::audio::read`, nothing is cleaned up or guessed from the file name.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SongTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    /// The separate ARTISTS values (empty when the file has none).
+    pub artists: Vec<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub track: Option<u32>,
+    pub track_total: Option<u32>,
+    pub disc: Option<u32>,
+    pub disc_total: Option<u32>,
+    pub year: Option<String>,
+    pub release_date: Option<String>,
+    pub genre: Option<String>,
+    pub composer: Option<String>,
+    pub label: Option<String>,
+    pub isrc: Option<String>,
+    pub musicbrainz_recording: Option<String>,
+    pub musicbrainz_release: Option<String>,
+    pub track_gain: Option<String>,
+    pub album_gain: Option<String>,
+    pub lyrics: Option<String>,
+    pub has_cover: bool,
+    pub duration: f64,
+    pub bitrate: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u8>,
+}
+
+pub fn read_details(path: &Path) -> Result<SongTags> {
+    let file = Probe::open(path)?.guess_file_type()?.read()?;
+    let props = file.properties();
+    let mut details = SongTags {
+        duration: props.duration().as_secs_f64(),
+        bitrate: props.audio_bitrate(),
+        sample_rate: props.sample_rate(),
+        bit_depth: props.bit_depth(),
+        channels: props.channels(),
+        lyrics: embedded_lyrics(&file),
+        has_cover: valid_embedded_artwork(&file).is_some(),
+        ..SongTags::default()
+    };
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(details);
+    };
+    let text = |key: ItemKey| {
+        tag.get_string(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    details.title = text(ItemKey::TrackTitle);
+    details.artist = text(ItemKey::TrackArtist);
+    details.artists = tag
+        .get_strings(ItemKey::TrackArtists)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect();
+    details.album = text(ItemKey::AlbumTitle);
+    details.album_artist = text(ItemKey::AlbumArtist);
+    details.track = tag.track();
+    details.track_total = tag.track_total();
+    details.disc = tag.disk();
+    details.disc_total = tag.disk_total();
+    details.year = text(ItemKey::RecordingDate).or_else(|| text(ItemKey::Year));
+    details.release_date = text(ItemKey::ReleaseDate);
+    details.genre = text(ItemKey::Genre);
+    details.composer = text(ItemKey::Composer);
+    details.label = text(ItemKey::Label);
+    details.isrc = text(ItemKey::Isrc);
+    details.musicbrainz_recording = text(ItemKey::MusicBrainzRecordingId);
+    details.musicbrainz_release = text(ItemKey::MusicBrainzReleaseId);
+    details.track_gain = text(ItemKey::ReplayGainTrackGain);
+    details.album_gain = text(ItemKey::ReplayGainAlbumGain);
+    Ok(details)
+}
+
 pub fn read_lyrics(path: &Path) -> Result<Option<String>> {
     let file = Probe::open(path)?.guess_file_type()?.read()?;
     Ok(embedded_lyrics(&file))

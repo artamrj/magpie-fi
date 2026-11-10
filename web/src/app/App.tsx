@@ -6,6 +6,7 @@ import { Icon, type IconName } from "./Icons";
 import { AddMusic } from "./components/AddMusic";
 import { CoverScreen } from "./components/CoverScreen";
 import { EmptyState } from "./components/EmptyStates";
+import { Files, type FilesNav } from "./components/Files";
 import { Library } from "./components/Library";
 import { ReviewList, type Feedback } from "./components/ReviewList";
 import { SongScreen } from "./components/SongScreen";
@@ -29,11 +30,12 @@ const emptySetup: Setup = {
   sources: {},
 };
 
-type Tab = "add" | "review" | "library";
+type Tab = "add" | "review" | "library" | "files";
 const tabs: Array<{ id: Tab; label: string; icon: IconName }> = [
   { id: "add", label: "Add", icon: "plus" },
   { id: "review", label: "Review", icon: "inbox" },
   { id: "library", label: "Library", icon: "library" },
+  { id: "files", label: "Files", icon: "folder" },
 ];
 
 type Toast = { id: number; message: string; error?: boolean; undo?: () => Promise<void> };
@@ -71,6 +73,7 @@ export function App() {
   const [coverMode, setCoverMode] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [startDecided, setStartDecided] = useState(startView === "review");
+  const [filesNav, setFilesNav] = useState<FilesNav>({ song: false });
 
   // First open: land on Review when something waits, else on Add.
   useEffect(() => {
@@ -133,7 +136,9 @@ export function App() {
     else setOpenId(undefined);
   }, [coverMode]);
   const showBack = !wide && tab === "review" && (openId !== undefined || coverMode);
-  useTelegramBackButton(showBack ? goBack : undefined);
+  useTelegramBackButton(showBack ? goBack : tab === "files" ? filesNav.back : undefined);
+  // The Files tab keeps the tab bar while browsing folders and hides it for one song.
+  const hideTabs = showBack || (tab === "files" && filesNav.song);
 
   const openTrack = (trackId: number) => {
     setCoverMode(false);
@@ -298,6 +303,8 @@ export function App() {
           </>
         ) : tab === "add" ? (
           <AddMusic wide feedback={feedback} onOpenTrack={openFromElsewhere} />
+        ) : tab === "files" ? (
+          <Files wide onNav={setFilesNav} />
         ) : (
           <Library setup={setup} wide feedback={feedback} />
         )}
@@ -314,6 +321,8 @@ export function App() {
       )
     ) : tab === "add" ? (
       <AddMusic wide={false} feedback={feedback} onOpenTrack={openFromElsewhere} />
+    ) : tab === "files" ? (
+      <Files wide={false} onNav={setFilesNav} />
     ) : (
       <Library setup={setup} wide={false} feedback={feedback} />
     );
@@ -321,7 +330,7 @@ export function App() {
   return (
     <div className="app">
       {screen}
-      {!showBack && (
+      {!hideTabs && (
         <nav className="tabbar" aria-label="Sections">
           {tabs.map((item) => (
             <button

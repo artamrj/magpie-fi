@@ -3,6 +3,7 @@ pub mod artist_changes;
 pub mod artists;
 pub mod artwork;
 pub mod canonical_names;
+pub mod file_browser;
 pub mod files;
 pub mod input_dedup;
 pub mod library;

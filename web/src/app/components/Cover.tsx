@@ -69,3 +69,14 @@ export function OriginalCover({ track, size }: { track: Track; size: Size }) {
     />
   );
 }
+
+/** The cover inside a library song (Files tab). */
+export function LibraryCover({ path, size }: { path: string; size: Size }) {
+  return (
+    <Cover
+      src={`/api/files/artwork?path=${encodeURIComponent(path)}`}
+      alt="Cover inside the song"
+      size={size}
+    />
+  );
+}

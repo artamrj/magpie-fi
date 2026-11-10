@@ -343,7 +343,7 @@ function Hero({ track, candidate }: { track: Track; candidate?: Candidate }) {
 }
 
 /** Play, pause and seek anywhere in the song. The audio loads on the first play only. */
-function Player({ src, duration }: { src: string; duration?: number }) {
+export function Player({ src, duration }: { src: string; duration?: number }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);

@@ -18,6 +18,7 @@ use std::{path::PathBuf, sync::Arc};
 
 mod apply;
 mod artists;
+mod files;
 mod requests;
 mod scan;
 mod settings;
@@ -25,6 +26,7 @@ mod tracks;
 
 pub use apply::start_apply;
 pub use artists::{change_artist, list_artists};
+pub use files::{list_folder, search_files, song_artwork, song_audio, song_details};
 pub use requests::{create_request, list_requests, recent_library, request_songs, retry_request};
 pub use scan::{check_inbox, retry_issues, run_automatic_cycle, stop_scan};
 pub use settings::setup;
