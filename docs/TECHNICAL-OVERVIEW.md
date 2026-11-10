@@ -125,8 +125,10 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
 Each duplicate group is one job (`scan::process::process_file`). A job gets two attempts.
 
 1. **Corrupt** files are marked `corrupt` and go to Issues.
-2. **Identify** with the source cascade (§10). A source that answers 401, 429 or times out is
-   skipped for the rest of that check.
+2. **Identify** with the source cascade (§10). A source that answers 401 (wrong key) is skipped
+   for the rest of that check. A 429 or a timeout pauses it for 30 s, doubling up to 5 minutes,
+   after which it is asked again. iTunes gets at most one search every 3 s (Apple allows ~20 a
+   minute).
 3. **Sort** candidates by trust tier, then score.
 4. **Smart auto-selection** (§9) decides. No candidates → `unmatched`; candidates that fail the
    rules → Review with the exact reason (ambiguous release, conflicting album, duration
@@ -170,13 +172,16 @@ step now. `src/application/apply.rs`:
 2. **Per song**:
    - **Already in the library?** (`library::find_same_recording`). If yes and the new file is not
      an upgrade (lossless over lossy), the new file and its inbox duplicates go to the trash.
-   - **Cover**: fetch the verified bytes; no usable cover → back to Review.
-   - **Copy** to a temporary file in the album folder, **write and verify tags** and the
-     embedded cover, **publish** without overwriting anything (§12).
+   - **Cover**: fetch the verified bytes; no usable cover → back to Review, with the cover marked
+     as needed so the inspector asks for one.
+   - **Lyrics** from LRCLIB (`MAGPIE_LYRICS`, 10 s limit; a failed lookup means no new lyrics).
+   - **Copy** to a temporary file in the album folder, **write and verify tags**, the embedded
+     cover and the lyrics, **publish** without overwriting anything (§12).
    - **Original to trash** (`.magpie-fi/trash/<date>/…`), only after the new file exists. A replaced
      lossy copy and its lyrics go there too. Downloads from staging are deleted instead.
-   - **Index** the new file, write `cover.jpg` into the album folder if it has none, save LRCLIB
-     lyrics as `.lrc` (synced) or `.txt` (`MAGPIE_LYRICS`). None of these extras can undo the filing.
+   - **Index** the new file. With `MAGPIE_SIDECARS=true` also write `cover.jpg` into the album
+     folder if it has none and save the lyrics as `.lrc` (synced) or `.txt`. None of these extras
+     can undo the filing.
    - If anything fails, that song is marked `failed` (Issues) and the next one continues.
 3. **After the batch**: `rsgain easy` on every album folder that got new songs writes track and
    album ReplayGain (R128 tags for Opus). Without rsgain no gain tags are written and one warning
@@ -326,9 +331,14 @@ second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was
 - `collect_artwork_candidates`: the candidate's own artwork list and `cover_url`, plus covers
   already verified for the same release or ISRC in the library. Release IDs are compared only
   when they are MusicBrainz IDs.
-- Each image must match the selected release (release ID, ISRC + album, or compatible album +
-  artist) unless you chose it. It is downloaded and checked; broken, blank or single-colour images
-  and images smaller than 300×300 are rejected.
+- Each image must belong to the selected recording: you chose it, it came with that match's own
+  catalog record, or it shares the release ID, the ISRC (+ album), or a compatible album + artist.
+  Albums are compared without release labels (`Farangis` = `Farangis - Single`); a catalog row
+  without an album name only needs the artist (it already agreed on the title). The image is
+  downloaded and checked; broken, blank or single-colour images and images smaller than 300×300
+  are rejected.
+- The candidate and track cover previews use the same check, so the page only shows a cover that
+  would be written.
 - `ensure_usable_cover`: temporary failures (timeout, 429, 5xx) mark the cover retryable; if the
   stored URLs are unusable it tries a fresh Deezer/iTunes lookup once. Only then is the cover
   "missing".
@@ -468,6 +478,6 @@ Inbox cycle (every minute)
   │     └─ unsure / unmatched → REVIEW;  corrupt → ISSUES
   └─ file every READY song: already in library? (trash, or lossless upgrade)
        → verified cover → temp copy → tags (verified) → no-clobber publish
-       → original to trash → index → cover.jpg → lyrics;  failure → ISSUES
+       → original to trash → index;  failure → ISSUES
        → after the batch: rsgain per album folder → Navidrome's watcher sees the files
 ```

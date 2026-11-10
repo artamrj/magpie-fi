@@ -7,6 +7,7 @@ pub mod library;
 pub mod metadata_completion;
 pub mod scan;
 pub mod smart_approval;
+pub mod tidy;
 
 use crate::{app::AppState, infrastructure::providers::Candidate};
 use anyhow::Result;

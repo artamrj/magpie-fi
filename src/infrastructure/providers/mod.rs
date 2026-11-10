@@ -130,6 +130,10 @@ pub struct ArtworkCandidate {
     pub provider: String,
     pub url: String,
     pub user_confirmed: bool,
+    /// The cover came with the exact catalog record this candidate is, so it
+    /// belongs to it by definition (no album or artist comparison needed).
+    #[serde(default)]
+    pub own_record: bool,
     pub release_id: Option<String>,
     pub isrc: Option<String>,
     pub album: Option<String>,

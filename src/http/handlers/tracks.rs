@@ -625,6 +625,7 @@ pub async fn update_artwork(
         provider: "User verified".into(),
         url: cover_url.clone(),
         user_confirmed: true,
+        own_record: false,
         release_id: selected.release_id.clone(),
         isrc: selected.isrc.clone(),
         album: selected.album.clone(),
@@ -726,17 +727,12 @@ pub async fn artwork_preview(
     State(s): State<Arc<AppState>>,
     Path(id): Path<TrackId>,
 ) -> ApiResult<axum::response::Response> {
+    // Only the cover that will be written; the file's old cover has its own
+    // preview, so a refused cover never looks accepted.
     let (track, candidate) = track_db::selected(&s.pool, id).await?;
-    let artwork =
-        match crate::application::apply::resolve_artwork(&s, &track.filename, &candidate).await {
-            Ok(bytes) => Some(bytes),
-            Err(_) => tokio::task::spawn_blocking(move || {
-                tag_writer::read_artwork(std::path::Path::new(&track.path))
-            })
-            .await
-            .map_err(anyhow::Error::from)??,
-        }
-        .ok_or_else(|| ApiError::not_found("No valid artwork is available for this track"))?;
+    let artwork = crate::application::apply::resolve_artwork(&s, &track.filename, &candidate)
+        .await
+        .map_err(|_| ApiError::not_found("No matching cover is available for this track"))?;
     artwork_response(artwork)
 }
 
@@ -761,23 +757,13 @@ pub async fn candidate_artwork_preview(
     let candidate = track_db::candidate(&s.pool, id)
         .await?
         .ok_or_else(|| ApiError::not_found("candidate not found"))?;
-    let mut urls = candidate.cover_url.into_iter().collect::<Vec<_>>();
-    for item in candidate.artwork_candidates {
-        if !urls.contains(&item.url) {
-            urls.push(item.url);
-        }
+    // The same check as filing: the page only shows a cover that would be used.
+    match crate::application::artwork::resolve_for_write(&s.pool, &s.client, &candidate).await {
+        Ok(bytes) => artwork_response(bytes),
+        Err(_) => Err(ApiError::not_found(
+            "No matching catalog artwork is available for this candidate",
+        )),
     }
-    for url in urls {
-        if let Ok(bytes) =
-            providers::cover_art_archive::fetch_url_cached(&s.pool, &s.client, &url).await
-            && tag_writer::validate_artwork(&bytes).is_ok()
-        {
-            return artwork_response(bytes);
-        }
-    }
-    Err(ApiError::not_found(
-        "No valid catalog artwork is available for this candidate",
-    ))
 }
 
 fn artwork_response(artwork: Vec<u8>) -> ApiResult<axum::response::Response> {

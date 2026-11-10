@@ -1,5 +1,6 @@
-//! Lyrics from LRCLIB (https://lrclib.net), saved next to the song so Navidrome
-//! shows them: `.lrc` for synced lyrics, `.txt` for plain lyrics.
+//! Lyrics from LRCLIB (https://lrclib.net). Normally they go inside the song
+//! (Navidrome reads LRC timestamps there as synced lyrics); with sidecars on they
+//! are also saved next to it: `.lrc` for synced lyrics, `.txt` for plain lyrics.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -37,6 +38,43 @@ pub async fn fetch_and_save(
     if sidecar_exists(audio).await {
         return Ok(Saved::Nothing);
     }
+    match lookup(client, title, artist, album, duration).await? {
+        Some(track) => save(audio, &track).await,
+        None => Ok(Saved::Nothing),
+    }
+}
+
+/// The lyrics to put inside the song: synced (LRC text) when LRCLIB has them,
+/// plain otherwise. `None` for instrumentals and songs LRCLIB does not know.
+pub async fn fetch(
+    client: &reqwest::Client,
+    title: &str,
+    artist: &str,
+    album: Option<&str>,
+    duration: Option<f64>,
+) -> Result<Option<String>> {
+    Ok(lookup(client, title, artist, album, duration)
+        .await?
+        .and_then(|track| best_text(&track)))
+}
+
+fn best_text(track: &LrclibTrack) -> Option<String> {
+    if track.instrumental {
+        return None;
+    }
+    [&track.synced_lyrics, &track.plain_lyrics]
+        .into_iter()
+        .find_map(|value| crate::infrastructure::providers::nonempty(value.as_deref()))
+        .map(|value| value.trim_end().to_owned())
+}
+
+async fn lookup(
+    client: &reqwest::Client,
+    title: &str,
+    artist: &str,
+    album: Option<&str>,
+    duration: Option<f64>,
+) -> Result<Option<LrclibTrack>> {
     let mut query = vec![
         ("track_name", title.to_owned()),
         ("artist_name", artist.to_owned()),
@@ -47,12 +85,16 @@ pub async fn fetch_and_save(
     if let Some(duration) = duration.filter(|duration| *duration > 0.0) {
         query.push(("duration", format!("{}", duration.round() as i64)));
     }
-    let response = client.get(LRCLIB_GET).query(&query).send().await?;
+    let response = client
+        .get(LRCLIB_GET)
+        .query(&query)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Saved::Nothing);
+        return Ok(None);
     }
-    let track: LrclibTrack = response.error_for_status()?.json().await?;
-    save(audio, &track).await
+    Ok(Some(response.error_for_status()?.json().await?))
 }
 
 async fn save(audio: &Path, track: &LrclibTrack) -> Result<Saved> {
@@ -86,6 +128,14 @@ async fn sidecar_exists(audio: &Path) -> bool {
         }
     }
     false
+}
+
+/// The `.lrc` or `.txt` lyrics next to a song that can be put inside it.
+pub fn embeddable_sidecar(audio: &Path) -> Option<PathBuf> {
+    ["lrc", "txt"]
+        .into_iter()
+        .map(|extension| audio.with_extension(extension))
+        .find(|path| path.is_file())
 }
 
 /// The lyric files that belong to a song (moved along when the song moves).
@@ -134,5 +184,10 @@ mod tests {
         };
         let third = directory.path().join("03 - Instrumental.m4a");
         assert_eq!(save(&third, &instrumental).await.unwrap(), Saved::Nothing);
+
+        // Inside the song: synced text first, nothing for instrumentals.
+        assert_eq!(best_text(&both).as_deref(), Some("[00:01.00] hello"));
+        assert_eq!(best_text(&plain).as_deref(), Some("words"));
+        assert_eq!(best_text(&instrumental), None);
     }
 }

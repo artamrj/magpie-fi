@@ -206,7 +206,7 @@ async fn run_files(
         // library while still avoiding the burst traffic that triggers Shazam
         // rate limits.
         songrec: Semaphore::new(2),
-        disabled_providers: Mutex::new(HashSet::new()),
+        disabled_providers: Mutex::new(HashMap::new()),
     });
     state
         .set_workflow(
@@ -412,7 +412,7 @@ pub(super) struct PipelineLimits {
     pub(super) fingerprint: Semaphore,
     pub(super) acoustid: Semaphore,
     pub(super) songrec: Semaphore,
-    pub(super) disabled_providers: Mutex<HashSet<String>>,
+    pub(super) disabled_providers: Mutex<HashMap<String, ProviderPause>>,
 }
 
 pub(super) struct FileJob {
@@ -450,6 +450,53 @@ pub(super) struct FingerprintEvidence<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits() -> PipelineLimits {
+        PipelineLimits {
+            metadata: Semaphore::new(1),
+            fingerprint: Semaphore::new(1),
+            acoustid: Semaphore::new(1),
+            songrec: Semaphore::new(1),
+            disabled_providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_source_is_paused_and_asked_again_later() {
+        let limits = limits();
+        let rate_limited = || anyhow::anyhow!("HTTP status client error (429 Too Many Requests)");
+
+        handle_provider_error(&limits, "a.mp3", "itunes", rate_limited()).await;
+        assert!(provider_disabled(&limits, "itunes").await);
+        assert!(!provider_disabled(&limits, "deezer").await);
+
+        // Another song failing during the same pause does not lengthen it.
+        assert_eq!(pause_provider(&limits, "itunes", false).await, None);
+
+        // Once the pause is over the source is asked again; the next failure waits longer.
+        limits
+            .disabled_providers
+            .lock()
+            .await
+            .get_mut("itunes")
+            .unwrap()
+            .until = Some(Instant::now());
+        assert!(!provider_disabled(&limits, "itunes").await);
+        assert_eq!(
+            pause_provider(&limits, "itunes", false).await.as_deref(),
+            Some("for 60 s")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_key_turns_the_source_off_for_the_scan() {
+        let limits = limits();
+        let refused = anyhow::anyhow!("HTTP status client error (401 Unauthorized)");
+        handle_provider_error(&limits, "a.mp3", "spotify", refused).await;
+        assert!(provider_disabled(&limits, "spotify").await);
+        assert_eq!(pause_provider(&limits, "spotify", false).await, None);
+        assert!(provider_disabled(&limits, "spotify").await);
+    }
 
     #[test]
     fn discovery_skips_hidden_and_nas_folders() {
@@ -722,6 +769,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(urls.contains(&"https://example.test/correct.jpg"));
         assert!(!urls.contains(&"https://example.test/wrong.jpg"));
+
+        // Each candidate knows which cover came with its own catalog record,
+        // including the YouTube row that agrees with nobody else.
+        let own = |candidate: &infra_providers::Candidate| {
+            candidate
+                .artwork_candidates
+                .iter()
+                .filter(|item| item.own_record)
+                .map(|item| item.url.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            own(&candidates[0]),
+            ["https://example.test/musicbrainz.jpg"]
+        );
+        assert_eq!(own(&candidates[2]), ["https://example.test/wrong.jpg"]);
     }
 
     #[test]

@@ -59,15 +59,37 @@ pub async fn search(
 }
 
 async fn search_term(pool: &SqlitePool, client: &Client, term: &str) -> Result<Value> {
-    cached(pool, "itunes", &search_key(term), Duration::days(7), || {
-        request_json(client.get("https://itunes.apple.com/search").query(&[
-            ("term", term),
-            ("media", "music"),
-            ("entity", "song"),
-            ("limit", "10"),
-        ]))
-    })
+    cached(
+        pool,
+        "itunes",
+        &search_key(term),
+        Duration::days(7),
+        || async {
+            wait_turn().await;
+            request_json(client.get("https://itunes.apple.com/search").query(&[
+                ("term", term),
+                ("media", "music"),
+                ("entity", "song"),
+                ("limit", "10"),
+            ]))
+            .await
+        },
+    )
     .await
+}
+
+/// Apple allows about 20 searches a minute per address and answers 429 above
+/// that; one request every 3 s (cached answers are free) stays under it.
+async fn wait_turn() {
+    static NEXT_REQUEST: std::sync::OnceLock<tokio::sync::Mutex<tokio::time::Instant>> =
+        std::sync::OnceLock::new();
+    let gate = NEXT_REQUEST.get_or_init(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
+    let mut next = gate.lock().await;
+    let now = tokio::time::Instant::now();
+    if *next > now {
+        tokio::time::sleep(*next - now).await;
+    }
+    *next = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
 }
 
 /// Apple's track and collection IDs stay in `raw_json`: the candidate's

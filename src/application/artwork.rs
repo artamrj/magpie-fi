@@ -317,6 +317,7 @@ async fn verify_artwork_candidates(
             continue;
         }
         let trusted_exact = item.user_confirmed
+            || item.own_record
             || item
                 .release_id
                 .as_deref()
@@ -370,7 +371,7 @@ fn mark_cover_verified(candidate: &mut Candidate, verified: bool, source: &str) 
 /// A catalog artwork candidate may only be used for a recording it actually
 /// belongs to. User-confirmed and exact-release URLs are always accepted.
 fn artwork_matches_candidate(candidate: &Candidate, artwork: &ArtworkCandidate) -> bool {
-    if artwork.user_confirmed {
+    if artwork.user_confirmed || artwork.own_record {
         return true;
     }
     if artwork
@@ -398,16 +399,20 @@ fn artwork_matches_candidate(candidate: &Candidate, artwork: &ArtworkCandidate) 
                 .as_deref()
                 .is_none_or(|artist| text_similarity(artist, &candidate.artist) >= 0.82);
     }
-    artwork.album.as_deref().is_some_and(|album| {
-        albums_compatible(Some(album), candidate.album.as_deref())
-            && artwork
-                .artist
-                .as_deref()
-                .is_some_and(|artist| text_similarity(artist, &candidate.artist) >= 0.82)
-    })
+    let same_artist = artwork
+        .artist
+        .as_deref()
+        .is_some_and(|artist| text_similarity(artist, &candidate.artist) >= 0.82);
+    // Entries are only created for rows that already agreed on the recording
+    // (same title), so a row without an album name only needs the artist.
+    same_artist
+        && match artwork.album.as_deref() {
+            Some(album) => albums_compatible(Some(album), candidate.album.as_deref()),
+            None => true,
+        }
 }
 
-fn is_retryable_artwork_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable_artwork_error(error: &anyhow::Error) -> bool {
     error.chain().any(|source| {
         source
             .downcast_ref::<reqwest::Error>()
@@ -457,6 +462,54 @@ mod tests {
         assert!(artwork_matches_candidate(&selected, &artwork));
         selected.release_type = Some("album".into());
         assert!(!artwork_matches_candidate(&selected, &artwork));
+    }
+
+    #[test]
+    fn a_chosen_single_keeps_the_cover_its_catalog_showed() {
+        // After choosing, "Farangis - Single" becomes "Farangis"; the cover rows
+        // were stored with the catalog's own album name.
+        let selected = candidate("itunes", Some("Farangis"));
+        let catalog_row = ArtworkCandidate {
+            provider: "Deezer".into(),
+            url: "https://example.test/farangis.jpg".into(),
+            album: Some("Farangis - Single".into()),
+            artist: Some("Siavash Ghomayshi".into()),
+            ..Default::default()
+        };
+        assert!(artwork_matches_candidate(&selected, &catalog_row));
+
+        // Rows without an album (Navahang, Radio Javan singles) only need the artist.
+        let no_album = ArtworkCandidate {
+            album: None,
+            ..catalog_row.clone()
+        };
+        assert!(artwork_matches_candidate(&selected, &no_album));
+        let other_artist = ArtworkCandidate {
+            artist: Some("Ebi".into()),
+            ..no_album
+        };
+        assert!(!artwork_matches_candidate(&selected, &other_artist));
+
+        // The match's own record always fits, whatever it calls the album.
+        let own = ArtworkCandidate {
+            own_record: true,
+            album: Some("Something else entirely".into()),
+            ..catalog_row
+        };
+        assert!(artwork_matches_candidate(&selected, &own));
+    }
+
+    #[test]
+    fn a_different_album_is_still_refused() {
+        let selected = candidate("itunes", Some("Khabe Baroon"));
+        let other_album = ArtworkCandidate {
+            provider: "Deezer".into(),
+            url: "https://example.test/best-of.jpg".into(),
+            album: Some("Greatest Hits 1990-2010".into()),
+            artist: Some("Siavash Ghomayshi".into()),
+            ..Default::default()
+        };
+        assert!(!artwork_matches_candidate(&selected, &other_album));
     }
 
     #[test]

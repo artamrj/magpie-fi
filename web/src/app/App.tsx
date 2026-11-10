@@ -37,6 +37,7 @@ const emptySetup: Setup = {
   trash_days: 30,
   inbox_check_seconds: 60,
   lyrics: true,
+  sidecars: false,
   rsgain: false,
   library_songs: 0,
   ytdlp: false,
@@ -145,14 +146,17 @@ export function App() {
 
   const choose = (trackId: number, candidateId: number) =>
     run(async () => {
-      const result = await post<{ ready: boolean }>(`/tracks/${trackId}/choose`, {
-        candidate_id: candidateId,
-      });
+      const result = await post<{ ready: boolean; cover_verified: boolean }>(
+        `/tracks/${trackId}/choose`,
+        { candidate_id: candidateId },
+      );
       await queryClient.invalidateQueries({ queryKey: queryKeys.tracks });
       setNotice(
-        !result.ready
-          ? "Match accepted, but this track still needs a verified cover before it can be cleaned."
-          : "Match accepted. This track is ready to clean.",
+        result.ready
+          ? "Match accepted. This track is ready to clean."
+          : !result.cover_verified
+            ? "Match accepted. No matching cover was found for it: pick or paste one in the inspector."
+            : "Match accepted, but some details are still missing. The inspector shows which.",
       );
     });
 

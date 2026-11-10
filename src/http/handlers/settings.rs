@@ -40,6 +40,7 @@ pub async fn setup(State(s): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "trash_days": cfg.trash_days,
         "inbox_check_seconds": cfg.inbox_check_seconds,
         "lyrics": cfg.lyrics,
+        "sidecars": cfg.sidecars,
         "telegram": telegram,
         "library_songs": library_songs,
         "rsgain": rsgain,

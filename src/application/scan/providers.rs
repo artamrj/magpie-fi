@@ -31,9 +31,11 @@ pub(crate) async fn identify(
         out.extend(query_youtube(state, limits, &cfg.youtube_api_key, current, filename).await);
     }
     out.extend(query_musicbrainz_text(state, limits, current, filename).await);
-    match query_itunes(state, current, filename).await {
-        Ok(candidates) => out.extend(candidates),
-        Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
+    if !provider_disabled(limits, "itunes").await {
+        match query_itunes(state, current, filename).await {
+            Ok(candidates) => out.extend(candidates),
+            Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
+        }
     }
     out.extend(query_deezer(state, limits, current, filename).await);
     out.extend(query_radiojavan(state, limits, current, filename).await);
@@ -180,9 +182,11 @@ pub(crate) async fn query_recognized_catalogs(
 ) -> Vec<infra_providers::Candidate> {
     let mut out = Vec::new();
     out.extend(query_musicbrainz_text(state, limits, recognized, filename).await);
-    match query_itunes(state, recognized, filename).await {
-        Ok(candidates) => out.extend(candidates),
-        Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
+    if !provider_disabled(limits, "itunes").await {
+        match query_itunes(state, recognized, filename).await {
+            Ok(candidates) => out.extend(candidates),
+            Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
+        }
     }
     out.extend(query_deezer(state, limits, recognized, filename).await);
     out.extend(query_radiojavan(state, limits, recognized, filename).await);
@@ -926,9 +930,15 @@ pub(crate) fn enrich_artwork_fallbacks(candidates: &mut [infra_providers::Candid
     let covers = (0..candidates.len())
         .map(|index| {
             let candidate = &candidates[index];
+            let own_url = candidate.cover_url.as_deref();
             let mut sources = candidates
                 .iter()
-                .filter(|other| other.cover_url.is_some() && artwork_agrees(candidate, other))
+                .enumerate()
+                .filter(|(other_index, other)| {
+                    other.cover_url.is_some()
+                        && (*other_index == index || artwork_agrees(candidate, other))
+                })
+                .map(|(_, other)| other)
                 .collect::<Vec<_>>();
             sources.sort_by(|left, right| {
                 artwork_provider_priority(&right.provider)
@@ -941,6 +951,7 @@ pub(crate) fn enrich_artwork_fallbacks(candidates: &mut [infra_providers::Candid
                 .map(|source| infra_providers::ArtworkCandidate {
                     provider: provider_name(&source.provider).to_owned(),
                     url: source.cover_url.clone().unwrap_or_default(),
+                    own_record: source.cover_url.as_deref() == own_url,
                     release_id: source.release_id.clone(),
                     isrc: source.isrc.clone(),
                     album: source.album.clone(),
@@ -1023,6 +1034,7 @@ pub(crate) async fn apply_artwork_override(
                 provider: "User verified".into(),
                 url: cover_url.clone(),
                 user_confirmed: true,
+                own_record: false,
                 release_id: candidate.release_id.clone(),
                 isrc: candidate.isrc.clone(),
                 album: candidate.album.clone(),
@@ -1116,16 +1128,49 @@ pub(crate) fn log_provider_skip(filename: &str, provider: &str, reason: &str) {
     tracing::debug!(file = filename, provider, "provider skipped: {reason}");
 }
 
-pub(crate) async fn provider_disabled(limits: &PipelineLimits, provider: &str) -> bool {
-    limits.disabled_providers.lock().await.contains(provider)
+/// Why a source is not asked right now.
+pub(crate) struct ProviderPause {
+    /// `None`: off for the rest of this scan (a wrong key does not fix itself).
+    pub(super) until: Option<Instant>,
+    failures: u32,
 }
 
-pub(crate) async fn disable_provider(limits: &PipelineLimits, provider: &str) -> bool {
+pub(crate) async fn provider_disabled(limits: &PipelineLimits, provider: &str) -> bool {
     limits
         .disabled_providers
         .lock()
         .await
-        .insert(provider.to_owned())
+        .get(provider)
+        .is_some_and(|pause| pause.until.is_none_or(|until| Instant::now() < until))
+}
+
+/// Pauses a source after a failure. A refused key turns it off for the rest of
+/// the scan; a rate limit or timeout pauses it for 30 s, doubling up to 5
+/// minutes, so a busy source is asked again later instead of never. Returns
+/// how long, or `None` when it was already paused.
+pub(crate) async fn pause_provider(
+    limits: &PipelineLimits,
+    provider: &str,
+    permanent: bool,
+) -> Option<String> {
+    let mut pauses = limits.disabled_providers.lock().await;
+    let now = Instant::now();
+    let pause = pauses.entry(provider.to_owned()).or_insert(ProviderPause {
+        until: Some(now),
+        failures: 0,
+    });
+    let until = pause.until?;
+    if now < until {
+        return None;
+    }
+    if permanent {
+        pause.until = None;
+        return Some("for the rest of this scan".into());
+    }
+    pause.failures += 1;
+    let seconds = (30_u64 << (pause.failures - 1).min(4)).min(300);
+    pause.until = Some(now + Duration::from_secs(seconds));
+    Some(format!("for {seconds} s"))
 }
 
 pub(crate) async fn handle_provider_error(
@@ -1136,25 +1181,28 @@ pub(crate) async fn handle_provider_error(
 ) {
     let error_text = format!("{error:#}");
     let lower = error_text.to_ascii_lowercase();
-    let disable_reason = if lower.contains("401 unauthorized") {
-        Some("authentication failed; check the configured API key/token")
+    let pause_reason = if lower.contains("401 unauthorized") {
+        Some((
+            "authentication failed; check the configured API key/token",
+            true,
+        ))
     } else if lower.contains("429 too many requests") {
-        Some("rate limited by provider")
+        Some(("rate limited by provider", false))
     } else if lower.contains("504 gateway timeout") || lower.contains("timed out") {
-        Some("provider timed out")
+        Some(("provider timed out", false))
     } else {
         None
     };
 
-    if let Some(reason) = disable_reason
-        && disable_provider(limits, provider).await
-    {
-        tracing::warn!(
-            file = filename,
-            provider,
-            error = error_text,
-            "provider disabled for this scan: {reason}"
-        );
+    if let Some((reason, permanent)) = pause_reason {
+        if let Some(how_long) = pause_provider(limits, provider, permanent).await {
+            tracing::warn!(
+                file = filename,
+                provider,
+                error = error_text,
+                "provider paused {how_long}: {reason}"
+            );
+        }
         return;
     }
     tracing::error!(

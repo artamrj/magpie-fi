@@ -6,6 +6,7 @@ export type Setup = {
   trash_days: number;
   inbox_check_seconds: number;
   lyrics: boolean;
+  sidecars: boolean;
   rsgain: boolean;
   library_songs: number;
   ytdlp: boolean;

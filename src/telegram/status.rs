@@ -110,9 +110,7 @@ async fn ask_reviews(context: &Context) -> Result<()> {
             "callback_data": format!("drop:{}", question.track_id),
         })]);
         if let Some(url) = super::mini_app_url(&context.state.config.public_url, "review") {
-            rows.push(vec![
-                json!({"text": "📱 Open review", "web_app": {"url": url}}),
-            ]);
+            rows.push(vec![super::mini_app_button("📱 Open review", &url)]);
         }
         let song = match &question.artist {
             Some(artist) => format!("{artist} – {}", question.title),

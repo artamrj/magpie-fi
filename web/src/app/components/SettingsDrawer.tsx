@@ -73,8 +73,9 @@ export function SettingsDrawer({ setup, onClose }: { setup: Setup; onClose: () =
           <section>
             <h3>Extras</h3>
             <p className="settings-hint">
-              Lyrics: {setup.lyrics ? "on (LRCLIB)" : "off"} · Album loudness:{" "}
-              {setup.rsgain ? "on (rsgain)" : "track only (rsgain not installed)"}
+              Lyrics: {setup.lyrics ? "on (LRCLIB)" : "off"} · Cover and lyrics:{" "}
+              {setup.sidecars ? "inside the song and as separate files" : "inside the song"} · Album
+              loudness: {setup.rsgain ? "on (rsgain)" : "track only (rsgain not installed)"}
             </p>
           </section>
           <ProviderStatus sources={setup.sources} />

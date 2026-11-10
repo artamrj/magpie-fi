@@ -88,17 +88,15 @@ async fn serve(state: Arc<AppState>, config: TelegramConfig, bot: Bot) {
         )
         .await;
     // Owners get a "magpie-fi" button next to the message box that opens the web page.
-    if let Some(url) = mini_app_url(&state.config.public_url, "") {
+    if mini_app_url(&state.config.public_url, "").is_some() {
         for owner in &config.owners {
-            let _: Option<bool> = bot
-                .try_call(
-                    "setChatMenuButton",
-                    &json!({"chat_id": owner, "menu_button": {
-                        "type": "web_app", "text": "magpie-fi", "web_app": {"url": url}
-                    }}),
-                )
-                .await;
+            set_menu_button(&bot, &state.config.public_url, *owner).await;
         }
+    } else {
+        tracing::warn!(
+            "MAGPIE_PUBLIC_URL is not an https:// address, so the bot has no Mini App button; \
+             set it to the page's public HTTPS address (for example a Cloudflare Tunnel)"
+        );
     }
     let context = Arc::new(Context {
         state,
@@ -451,7 +449,23 @@ async fn on_command(
         return Ok(());
     }
     match name {
-        "start" => send(context, chat, &texts::welcome(true, user_id), None).await,
+        "start" => {
+            let mut keyboard = None;
+            if role == Role::Owner {
+                set_menu_button(&context.bot, &context.state.config.public_url, user_id).await;
+                keyboard = mini_app_url(&context.state.config.public_url, "").map(|url| {
+                    json!({"inline_keyboard": [[mini_app_button("📱 Open magpie-fi", &url)]]})
+                });
+            }
+            send_with(
+                context,
+                chat,
+                &texts::welcome(true, user_id),
+                None,
+                keyboard,
+            )
+            .await
+        }
         "help" => send(context, chat, &texts::help(role == Role::Owner), None).await,
         "queue" => send(context, chat, &queue_text(context).await?, None).await,
         "health" => send(context, chat, &health_text(context).await, None).await,
@@ -472,9 +486,15 @@ async fn on_command(
                     ""
                 }
             );
-            let keyboard = public_url.is_some().then(
-                || json!({"inline_keyboard": [[{"text": "🌐 Open magpie-fi", "url": link}]]}),
-            );
+            // Inside Telegram the Mini App logs in by itself; the link is for a browser.
+            let mut rows = Vec::new();
+            if let Some(url) = mini_app_url(&public_url, "") {
+                rows.push(vec![mini_app_button("📱 Open in Telegram", &url)]);
+            }
+            if public_url.is_some() {
+                rows.push(vec![json!({"text": "🌐 Open in a browser", "url": link})]);
+            }
+            let keyboard = (!rows.is_empty()).then(|| json!({ "inline_keyboard": rows }));
             send_with(context, chat, &text, None, keyboard).await
         }
         "guests" if role == Role::Owner => {
@@ -522,10 +542,16 @@ async fn health_text(context: &Context) -> String {
         .await
         .is_ok_and(|metadata| !metadata.permissions().readonly());
     let check = |ok: bool| if ok { "✅" } else { "⚠️" };
+    let mini_app = if mini_app_url(&config.public_url, "").is_some() {
+        "✅".to_owned()
+    } else {
+        "⚠️ off: set MAGPIE_PUBLIC_URL to the page's https:// address".to_owned()
+    };
     format!(
         "<b>Health</b>\n\
          Library: {} {songs} songs\n\
-         yt-dlp: {}",
+         yt-dlp: {}\n\
+         Mini App: {mini_app}",
         check(writable),
         check(crate::acquire::ytdlp::available(config)),
     )
@@ -792,6 +818,27 @@ async fn details_text(context: &Context, request: i64) -> Result<String> {
     Ok(text)
 }
 
+/// Shows the "magpie-fi" Mini App button next to the message box in an owner's
+/// chat. Telegram keeps it, so this only needs to run again when something changed.
+async fn set_menu_button(bot: &Bot, public_url: &Option<String>, chat: i64) {
+    let Some(url) = mini_app_url(public_url, "") else {
+        return;
+    };
+    let _: Option<bool> = bot
+        .try_call(
+            "setChatMenuButton",
+            &json!({"chat_id": chat, "menu_button": {
+                "type": "web_app", "text": "magpie-fi", "web_app": {"url": url}
+            }}),
+        )
+        .await;
+}
+
+/// An inline button that opens the page inside Telegram, not in the browser.
+pub fn mini_app_button(text: &str, url: &str) -> Value {
+    json!({"text": text, "web_app": {"url": url}})
+}
+
 /// The web page as a Telegram Mini App. Telegram only opens HTTPS addresses.
 pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
     let url = public_url
@@ -1000,6 +1047,12 @@ mod tests {
     const FRIEND: u64 = 200;
 
     async fn start() -> (tempfile::TempDir, Arc<FakeTelegram>, Arc<AppState>) {
+        start_with(None).await
+    }
+
+    async fn start_with(
+        public_url: Option<&str>,
+    ) -> (tempfile::TempDir, Arc<FakeTelegram>, Arc<AppState>) {
         let fake = Arc::new(FakeTelegram::default());
         let app = Router::new()
             .route("/{bot}/{method}", post(fake_api))
@@ -1018,6 +1071,7 @@ mod tests {
             owners: vec![OWNER as i64],
         };
         config.telegram = Some(telegram.clone());
+        config.public_url = public_url.map(str::to_owned);
         let pool =
             crate::infrastructure::db::connect(directory.path().join("t.sqlite").to_str().unwrap())
                 .await
@@ -1026,6 +1080,46 @@ mod tests {
         let bot = Bot::with_api_url(&format!("http://{address}"), &telegram.token).unwrap();
         tokio::spawn(serve(state.clone(), telegram, bot));
         (directory, fake, state)
+    }
+
+    #[tokio::test]
+    async fn owners_get_mini_app_buttons_that_open_inside_telegram() {
+        let (_directory, fake, _state) = start_with(Some("https://music.example")).await;
+        let menu = wait_for(&fake, "setChatMenuButton", "web_app").await;
+        assert_eq!(menu["chat_id"], json!(OWNER));
+        assert_eq!(
+            menu["menu_button"]["web_app"]["url"],
+            "https://music.example/"
+        );
+
+        fake.push(message(1, OWNER, "/start"));
+        let welcome = wait_for(&fake, "sendMessage", "Open magpie-fi").await;
+        assert_eq!(
+            welcome["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://music.example/"
+        );
+
+        fake.push(message(2, OWNER, "/web"));
+        let login = wait_for(&fake, "sendMessage", "Open in a browser").await;
+        let rows = &login["reply_markup"]["inline_keyboard"];
+        assert_eq!(rows[0][0]["web_app"]["url"], "https://music.example/");
+        assert!(
+            rows[1][0]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://music.example/")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_https_there_is_no_mini_app_button() {
+        let (_directory, fake, _state) = start().await;
+        fake.push(message(1, OWNER, "/start"));
+        let welcome = wait_for(&fake, "sendMessage", "/help shows").await;
+        assert!(welcome.get("reply_markup").is_none());
+        assert!(fake.calls("setChatMenuButton").is_empty());
+        fake.push(message(2, OWNER, "/health"));
+        wait_for(&fake, "sendMessage", "MAGPIE_PUBLIC_URL").await;
     }
 
     #[tokio::test]

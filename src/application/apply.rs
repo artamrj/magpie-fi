@@ -772,7 +772,7 @@ async fn file_item(
     let artwork = match resolve_artwork(s, &item.filename, candidate).await {
         Ok(artwork) => artwork,
         Err(error) => {
-            return_track_for_cover(s, item.track_id, &error).await?;
+            return_track_for_cover(s, item.track_id, candidate.id, &error).await?;
             return Ok(Filing::NotFiled);
         }
     };
@@ -794,8 +794,13 @@ async fn file_item(
         )
     })?;
 
-    // 2. Tags (verified) and atomic publish.
-    let published = match write_tags(s, &temporary, candidate, &artwork).await {
+    // 2. Tags, cover and lyrics (verified) and atomic publish.
+    let lyrics = if cfg.lyrics && !cfg.sidecars {
+        fetch_lyrics(s, item).await
+    } else {
+        None
+    };
+    let published = match write_tags(s, &temporary, candidate, &artwork, lyrics).await {
         Ok(()) => publish_no_clobber(&temporary, &dest, Some(&src), Some(&artwork)).await,
         Err(error) => Err(error),
     };
@@ -848,14 +853,17 @@ async fn file_item(
     )
     .await?;
 
-    // 4. Extras. None of them can undo a successful filing.
+    // 4. Extras. None of them can undo a successful filing. Separate cover and
+    // lyrics files only when asked for: normally they are inside the song.
     if let Some(album_folder) = final_path.parent() {
-        if let Err(error) = library::write_folder_cover(album_folder, &artwork).await {
+        if cfg.sidecars
+            && let Err(error) = library::write_folder_cover(album_folder, &artwork).await
+        {
             tracing::warn!(%error, folder = %album_folder.display(), "could not write cover file");
         }
         touched_albums.insert(album_folder.to_path_buf());
     }
-    if cfg.lyrics {
+    if cfg.lyrics && cfg.sidecars {
         save_lyrics(s, item, &final_path).await;
     }
     if reused_existing {
@@ -899,6 +907,7 @@ async fn write_tags(
     target: &Path,
     candidate: &Candidate,
     artwork: &[u8],
+    lyrics: Option<String>,
 ) -> Result<()> {
     let permit = s.tag_writes.clone().acquire_owned().await?;
     let path = target.to_path_buf();
@@ -907,9 +916,17 @@ async fn write_tags(
     let sanitized = tokio::task::spawn_blocking(move || {
         let target = path;
         let _permit = permit;
-        let sanitized = tag_writer::write_resilient(&target, &candidate, Some(artwork.clone()))?;
+        let sanitized = tag_writer::write_resilient(
+            &target,
+            &candidate,
+            Some(artwork.clone()),
+            lyrics.as_deref(),
+        )?;
         tag_writer::verify_written_metadata(&target, &candidate)?;
         tag_writer::verify_embedded_artwork(&target, &artwork)?;
+        if let Some(lyrics) = lyrics.as_deref() {
+            tag_writer::verify_lyrics(&target, lyrics)?;
+        }
         Ok::<_, anyhow::Error>(sanitized)
     })
     .await??;
@@ -959,6 +976,27 @@ async fn skip_known_recording(
     Ok(())
 }
 
+/// Lyrics to put inside the song. A failed lookup only means no new lyrics.
+async fn fetch_lyrics(s: &AppState, item: &PreviewItem) -> Option<String> {
+    let candidate = &item.candidate;
+    let names = crate::domain::credits::normalize_featured(&candidate.artist, &candidate.title);
+    match lyrics::fetch(
+        &s.client,
+        &names.title,
+        &names.artist,
+        candidate.album.as_deref(),
+        item.evidence.duration,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(%error, file = %item.filename, "lyrics lookup failed");
+            None
+        }
+    }
+}
+
 async fn save_lyrics(s: &AppState, item: &PreviewItem, audio: &Path) {
     let candidate = &item.candidate;
     let names = crate::domain::credits::normalize_featured(&candidate.artist, &candidate.title);
@@ -998,20 +1036,39 @@ async fn finish_batch(touched_albums: &BTreeSet<PathBuf>) {
     }
 }
 
+/// The cover failed at the last check. The match stays chosen, but its cover is
+/// marked as missing (or as a temporary failure that "Check & fix" retries), so
+/// the page asks for a cover instead of showing a verified one that is stuck.
 async fn return_track_for_cover(
     state: &AppState,
     track_id: TrackId,
+    candidate_id: Option<i64>,
     error: &anyhow::Error,
 ) -> Result<()> {
     let detail = format!("Cover verification failed before writing: {error:#}");
+    let status = if crate::application::artwork::is_retryable_artwork_error(error) {
+        crate::infrastructure::providers::ArtworkStatus::RetryableError
+    } else {
+        crate::infrastructure::providers::ArtworkStatus::CoverRequired
+    };
+    let mut transaction = state.pool.begin().await?;
     sqlx::query(
         "UPDATE tracks SET status='needs_review',stage='review',stage_message=?,error=NULL,updated_at=? WHERE id=?",
     )
     .bind(&detail)
     .bind(Utc::now().to_rfc3339())
     .bind(track_id.0)
-    .execute(&state.pool)
+    .execute(&mut *transaction)
     .await?;
+    if let Some(candidate_id) = candidate_id {
+        sqlx::query("UPDATE candidates SET artwork_status=?,artwork_message=? WHERE id=?")
+            .bind(status)
+            .bind(&detail)
+            .bind(candidate_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
     tracing::warn!(track_id = track_id.0, detail, "track returned to review");
     Ok(())
 }
@@ -1142,6 +1199,49 @@ mod tests {
             .write_to(&mut output, image::ImageFormat::Png)
             .unwrap();
         output.into_inner()
+    }
+
+    #[tokio::test]
+    async fn a_cover_that_fails_at_filing_is_asked_for_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("cover-recheck.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/song.mp3','song.mp3','selected',0,'now','now','now','ready')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let candidate_id = sqlx::query("INSERT INTO candidates(track_id,provider,title,artist,score,artwork_status) VALUES(?,'deezer','Song','Artist',80,'verified')")
+            .bind(track_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let state = AppState::new(crate::config::Config::default(), pool.clone());
+
+        return_track_for_cover(
+            &state,
+            TrackId(track_id),
+            Some(candidate_id),
+            &anyhow!("no usable matching cover could be downloaded"),
+        )
+        .await
+        .unwrap();
+
+        let stage: String = sqlx::query_scalar("SELECT stage FROM tracks WHERE id=?")
+            .bind(track_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cover: String = sqlx::query_scalar("SELECT artwork_status FROM candidates WHERE id=?")
+            .bind(candidate_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stage, "review");
+        assert_eq!(cover, "cover_required");
     }
 
     #[tokio::test]
@@ -1608,12 +1708,14 @@ mod tests {
             &existing,
             &candidate,
             Some(artwork_a.clone()),
+            None,
         )
         .unwrap();
         crate::infrastructure::media::tag_writer::write(
             &temporary,
             &candidate,
             Some(artwork_b.clone()),
+            None,
         )
         .unwrap();
 

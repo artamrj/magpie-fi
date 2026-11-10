@@ -512,7 +512,13 @@ pub(crate) fn albums_compatible(selected: Option<&str>, donor: Option<&str>) -> 
         selected.and_then(|value| nonempty(Some(value))),
         donor.and_then(|value| nonempty(Some(value))),
     ) {
-        (Some(selected), Some(donor)) => text_similarity(selected, donor) >= 0.72,
+        // "Farangis" and "Farangis - Single" are the same release title.
+        (Some(selected), Some(donor)) => {
+            text_similarity(
+                &comparable_release_title(selected),
+                &comparable_release_title(donor),
+            ) >= 0.72
+        }
         _ => false,
     }
 }

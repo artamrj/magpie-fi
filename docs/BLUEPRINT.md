@@ -65,7 +65,8 @@ only for the song list, the audio comes from YouTube); not Lidarr (no "monitor e
 5. **One copy per recording.** Duplicates are found by proof (same bytes, same fingerprint, same
    ISRC or MusicBrainz ID with matching length), never by title alone. A lossless copy replaces a
    lossy one; anything else that is already there goes to the trash.
-6. **No Navidrome API.** magpie-fi only writes files (songs, `cover.jpg`, `.lrc`, `.m3u8`).
+6. **No Navidrome API.** magpie-fi only writes files (songs with tags, cover and lyrics inside,
+   and `.m3u8` playlists).
    Navidrome's file watcher picks them up. No Navidrome credentials, no coupling to its versions.
 7. **Tools are bundled programs.** ffmpeg, fpcalc, SongRec, rsgain, yt-dlp and Deno ship in the
    image and are run with timeouts. A missing optional tool turns a feature off, it doesn't stop
@@ -122,8 +123,8 @@ were kept on purpose (§8).
  │ scan:  read tags → decode check → fingerprint → group duplicates                    │
  │        → 15 sources → smart auto-select → completion → verified cover               │
  │        sure → Ready        unsure → Review (web page, Telegram question)            │
- │ apply: Ready → already in library? → tags + cover → no-clobber publish → trash      │
- │        → index → cover.jpg → lyrics → playlists;  failure → Issues                  │
+ │ apply: Ready → already in library? → tags + cover + lyrics → no-clobber publish     │
+ │        → trash → index → playlists;  failure → Issues                               │
  │        after the batch: rsgain per album folder                                     │
  └───────────────────────────────────────┬────────────────────────────────────────────┘
                                          ▼
@@ -212,9 +213,7 @@ MUSIC_ROOT/                         one filesystem: every move is an atomic rena
 ├── library/                        Navidrome's music folder; only magpie-fi writes here
 │   ├── Radiohead/
 │   │   ├── OK Computer (1997)/
-│   │   │   ├── cover.jpg
-│   │   │   ├── 01 - Airbag.flac
-│   │   │   ├── 01 - Airbag.lrc
+│   │   │   ├── 01 - Airbag.flac          tags, cover and lyrics inside the file
 │   │   │   └── 02 - Paranoid Android.flac
 │   │   └── Creep (1992) [Single]/
 │   │       └── 01 - Creep.m4a
@@ -265,9 +264,10 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 | Track and disc number and totals, date, genre, ISRC, label, language, composer | |
 | MusicBrainz recording, release, artist and album-artist IDs | only real MusicBrainz IDs; Navidrome uses them for stable album identity |
 | Release type (`RELEASETYPE` / "MusicBrainz Album Type"), compilation flag | Navidrome can show albums, singles and EPs apart |
-| Embedded front cover + `cover.jpg` in the album folder | verified, matching the release |
+| Embedded front cover | verified, matching the release |
 | ReplayGain track + album (`rsgain easy` per album folder) | R128 tags for Opus; skipped with a warning if rsgain is missing |
-| `.lrc` (synced) or `.txt` (plain) lyrics from LRCLIB | next to the song; never overwrites existing lyrics |
+| Lyrics from LRCLIB, inside the song: LRC text with timestamps (synced) or plain | `LYRICS` (FLAC/Opus), `©lyr` (M4A), `USLT` (MP3); lyrics already inside a file are kept |
+| Only with `MAGPIE_SIDECARS=true`: `cover.jpg` per album folder, `.lrc`/`.txt` next to the song | for players that only read separate files; never overwrites existing ones |
 | `Playlists/<Owner - Name>.m3u8` | one per playlist link, in the link's order |
 
 Tags are written and verified on a temporary copy **before** the file enters `library/`, so
@@ -275,8 +275,11 @@ Navidrome never sees a half-tagged file and never sees a retag and a move in one
 
 ### 5.4 Navidrome
 
-Recommended Navidrome settings: file watcher on, playlists auto-imported from `Playlists`, `Scanner.PurgeMissing = "never"`, `.lrc` lyrics and
-`cover.*` first.
+Recommended Navidrome settings: file watcher on, playlists auto-imported from `Playlists`,
+`Scanner.PurgeMissing = "never"`. Navidrome uses the cover and lyrics inside each song (it reads
+LRC timestamps there as synced lyrics) because the album folders hold no `cover.*` or `.lrc` files.
+Libraries filed before one-file mode are tidied once: lyrics files are put inside their songs and,
+where every song has its cover inside, `cover.*` goes to the trash.
 
 ---
 

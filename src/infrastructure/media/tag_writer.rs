@@ -8,7 +8,7 @@ use lofty::{
     picture::{Picture, PictureType},
     prelude::*,
     probe::Probe,
-    tag::{ItemKey, ItemValue, Tag, TagItem},
+    tag::{ItemKey, ItemValue, Tag, TagItem, TagType},
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -16,7 +16,14 @@ use std::path::Path;
 /// Cover images larger than this are refused.
 pub const MAX_ARTWORK_BYTES: usize = 20 * 1024 * 1024;
 
-pub fn write(path: &Path, candidate: &Candidate, artwork: Option<Vec<u8>>) -> Result<()> {
+/// Rewrites the tags from `candidate`, with the cover and lyrics inside the
+/// file. Without new `lyrics`, lyrics already in the file are kept.
+pub fn write(
+    path: &Path,
+    candidate: &Candidate,
+    artwork: Option<Vec<u8>>,
+    lyrics: Option<&str>,
+) -> Result<()> {
     let mut candidate = candidate.clone();
     crate::application::metadata_completion::normalize_release_fields(&mut candidate);
     let ext = path
@@ -29,6 +36,7 @@ pub fn write(path: &Path, candidate: &Candidate, artwork: Option<Vec<u8>>) -> Re
     }
     let mut file = Probe::open(path)?.guess_file_type()?.read()?;
     let preserved_artwork = valid_embedded_artwork(&file);
+    let preserved_lyrics = embedded_lyrics(&file);
     // Rebuild the primary tag instead of mutating it. Real music collections often
     // contain malformed frames that can be read but cannot be saved again.
     file.insert_tag(Tag::new(file.primary_tag_type()));
@@ -126,7 +134,56 @@ pub fn write(path: &Path, candidate: &Candidate, artwork: Option<Vec<u8>>) -> Re
         picture.set_pic_type(PictureType::CoverFront);
         tag.push_picture(picture);
     }
+    if let Some(text) = lyrics.map(str::to_owned).or(preserved_lyrics) {
+        set(tag, lyrics_key(tag.tag_type()), &text);
+    }
     file.save_to_path(path, WriteOptions::default())?;
+    Ok(())
+}
+
+/// ID3v2 (MP3) only has unsynchronised lyrics (USLT); the LRC text with its
+/// timestamps goes there. Vorbis comments (FLAC, Opus, Ogg) use `LYRICS` and
+/// MP4 uses `©lyr`. Navidrome reads LRC timestamps in all of them as synced.
+fn lyrics_key(tag_type: TagType) -> ItemKey {
+    if tag_type == TagType::Id3v2 {
+        ItemKey::UnsyncLyrics
+    } else {
+        ItemKey::Lyrics
+    }
+}
+
+fn embedded_lyrics(file: &lofty::file::TaggedFile) -> Option<String> {
+    file.tags().iter().find_map(|tag| {
+        [ItemKey::Lyrics, ItemKey::UnsyncLyrics]
+            .into_iter()
+            .find_map(|key| tag.get_string(key))
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+pub fn read_lyrics(path: &Path) -> Result<Option<String>> {
+    let file = Probe::open(path)?.guess_file_type()?.read()?;
+    Ok(embedded_lyrics(&file))
+}
+
+/// Adds lyrics to a filed song without touching its other tags.
+pub fn embed_lyrics(path: &Path, text: &str) -> Result<()> {
+    let mut file = Probe::open(path)?.guess_file_type()?.read()?;
+    if file.primary_tag().is_none() {
+        file.insert_tag(Tag::new(file.primary_tag_type()));
+    }
+    let tag = file.primary_tag_mut().expect("primary tag present");
+    set(tag, lyrics_key(tag.tag_type()), text);
+    file.save_to_path(path, WriteOptions::default())?;
+    verify_lyrics(path, text)
+}
+
+pub fn verify_lyrics(path: &Path, expected: &str) -> Result<()> {
+    let written = read_lyrics(path)?.unwrap_or_default();
+    if written.trim() != expected.trim() {
+        bail!("written lyrics do not match");
+    }
     Ok(())
 }
 
@@ -232,14 +289,15 @@ pub fn write_resilient(
     path: &Path,
     candidate: &Candidate,
     artwork: Option<Vec<u8>>,
+    lyrics: Option<&str>,
 ) -> Result<bool> {
-    match write(path, candidate, artwork.clone()) {
+    match write(path, candidate, artwork.clone(), lyrics) {
         Ok(()) => Ok(false),
         Err(initial_error) => {
             sanitize_legacy_metadata(path).with_context(|| {
                 format!("initial tag read failed ({initial_error}); lossless tag cleanup failed")
             })?;
-            write(path, candidate, artwork).with_context(|| {
+            write(path, candidate, artwork, lyrics).with_context(|| {
                 format!("tag cleanup succeeded, but writing still failed ({initial_error})")
             })?;
             Ok(true)
@@ -587,11 +645,57 @@ mod tests {
             ..Default::default()
         };
         let artwork = one_pixel_png();
-        write(&path, &candidate, Some(artwork.clone())).unwrap();
-        write(&path, &candidate, None).unwrap();
+        write(&path, &candidate, Some(artwork.clone()), None).unwrap();
+        write(&path, &candidate, None, None).unwrap();
 
         let file = Probe::open(&path).unwrap().read().unwrap();
         assert_eq!(file.primary_tag().unwrap().pictures()[0].data(), artwork);
+    }
+
+    #[test]
+    fn lyrics_go_inside_every_format_and_are_kept_on_retag() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let synced = "[00:01.00] first line\n[00:02.50] second line";
+        for (name, codec) in [
+            ("song.mp3", "libmp3lame"),
+            ("song.flac", "flac"),
+            ("song.m4a", "aac"),
+            ("song.opus", "libopus"),
+        ] {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.2")
+                .args(["-c:a", codec])
+                .arg(&path)
+                .status()
+                .unwrap();
+            if !status.success() {
+                continue; // this ffmpeg lacks the encoder
+            }
+            let candidate = Candidate {
+                title: "Song".into(),
+                artist: "Artist".into(),
+                ..Default::default()
+            };
+            write(&path, &candidate, Some(one_pixel_png()), Some(synced)).unwrap();
+            verify_lyrics(&path, synced).unwrap();
+
+            // Retagging without new lyrics keeps the ones inside.
+            write(&path, &candidate, None, None).unwrap();
+            assert_eq!(
+                read_lyrics(&path).unwrap().as_deref(),
+                Some(synced),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -628,7 +732,7 @@ mod tests {
             ..Default::default()
         };
         let artwork = one_pixel_png();
-        write(&path, &candidate, Some(artwork.clone())).unwrap();
+        write(&path, &candidate, Some(artwork.clone()), None).unwrap();
 
         assert_eq!(
             native_flac_front_cover(&path).unwrap().as_deref(),
@@ -664,7 +768,7 @@ mod tests {
                 release_type: Some("Single".into()),
                 ..Default::default()
             };
-            write(&path, &candidate, Some(one_pixel_png())).unwrap();
+            write(&path, &candidate, Some(one_pixel_png()), None).unwrap();
 
             let file = Probe::open(&path).unwrap().read().unwrap();
             let tag = file.primary_tag().unwrap();
@@ -780,7 +884,7 @@ mod tests {
                 is_compilation: true,
                 ..Default::default()
             };
-            write(&path, &candidate, None).unwrap();
+            write(&path, &candidate, None, None).unwrap();
             verify_written_metadata(&path, &candidate)
                 .unwrap_or_else(|error| panic!("{extension}: {error:#}"));
 
@@ -799,7 +903,7 @@ mod tests {
                 )],
                 ..Default::default()
             };
-            write(&path, &band, None).unwrap();
+            write(&path, &band, None, None).unwrap();
             verify_written_metadata(&path, &band)
                 .unwrap_or_else(|error| panic!("{extension} band identity: {error:#}"));
         }

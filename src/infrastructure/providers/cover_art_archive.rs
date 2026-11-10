@@ -37,12 +37,6 @@ pub async fn fetch(client: &Client, url: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-pub async fn fetch_url_cached(pool: &SqlitePool, client: &Client, url: &str) -> Result<Vec<u8>> {
-    fetch_verified_url_cached(pool, client, url, false)
-        .await
-        .map(|(data, _)| data)
-}
-
 /// A checked cover image and what it is. `trusted_exact_release` accepts a
 /// plain single-colour image (some real releases have one).
 pub async fn fetch_verified_url_cached(

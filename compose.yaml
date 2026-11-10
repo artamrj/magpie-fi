@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
     ports:
       # Loopback only: use Tailscale Funnel or an SSH tunnel to reach it from elsewhere.
-      - "127.0.0.1:${MAGPIE_PORT:-7331}:7331"
+      - "{MAGPIE_PORT:-7331}:7331"
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
@@ -28,6 +28,7 @@ services:
       MAGPIE_INBOX_SETTLE_SECONDS: "${MAGPIE_INBOX_SETTLE_SECONDS:-}"
       MAGPIE_TRASH_DAYS: "${MAGPIE_TRASH_DAYS:-}"
       MAGPIE_LYRICS: "${MAGPIE_LYRICS:-}"
+      MAGPIE_SIDECARS: "${MAGPIE_SIDECARS:-}"
       MAGPIE_AUDIO_FORMAT: "${MAGPIE_AUDIO_FORMAT:-}"
       MAGPIE_MAX_PARALLEL_DOWNLOADS: "${MAGPIE_MAX_PARALLEL_DOWNLOADS:-}"
       MAGPIE_DOWNLOAD_PAUSE_SECONDS: "${MAGPIE_DOWNLOAD_PAUSE_SECONDS:-}"

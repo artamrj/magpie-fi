@@ -52,6 +52,9 @@ pub struct Config {
     pub inbox_settle_seconds: u64,
     pub trash_days: u64,
     pub lyrics: bool,
+    /// Also write `cover.jpg` per album folder and `.lrc`/`.txt` next to songs.
+    /// Off: everything (tags, cover, lyrics) lives inside the audio file.
+    pub sidecars: bool,
     pub telegram: Option<TelegramConfig>,
     /// The web page's public HTTPS address (needed for the Telegram Mini App).
     pub public_url: Option<String>,
@@ -98,6 +101,7 @@ impl Config {
             inbox_settle_seconds: 30,
             trash_days: 30,
             lyrics: true,
+            sidecars: false,
             telegram: None,
             public_url: None,
             audio_format: AudioFormat::M4a,
@@ -155,6 +159,7 @@ impl Config {
         config.inbox_settle_seconds = number("MAGPIE_INBOX_SETTLE_SECONDS", 30)?;
         config.trash_days = number("MAGPIE_TRASH_DAYS", 30)?;
         config.lyrics = flag("MAGPIE_LYRICS", true)?;
+        config.sidecars = flag("MAGPIE_SIDECARS", false)?;
         config.audio_format = match get("MAGPIE_AUDIO_FORMAT").as_deref() {
             None | Some("m4a") => AudioFormat::M4a,
             Some("opus") => AudioFormat::Opus,
