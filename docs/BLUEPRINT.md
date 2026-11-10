@@ -166,8 +166,10 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     differences as chips, details on demand), pick a cover, file anyway, repair, or remove. The
     manual tag editor is a mode of that screen. The screen's action is Telegram's native Main
     Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
-  - **Library**: counts, artists (rename, join, split a duet, from a bottom sheet) and status
-    (bot, sources, folders, log out).
+  - **Artists**: song and artist counts, and the artists (rename, join, split a duet, from a
+    bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
+    log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar
+    instead, one short line per fact with the details on hover.
   - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
     wide screen), a search over titles, artists, albums and paths, and one song's tags, cover,
     sound and path with a player. The tags (title, artist, album, album artist, track, disc,

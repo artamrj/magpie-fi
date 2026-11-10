@@ -8,7 +8,6 @@ import type {
   LibrarySearch,
   Me,
   MusicRequest,
-  RecentSong,
   Setup,
   SongDetails,
   Track,
@@ -22,7 +21,6 @@ export const queryKeys = {
   status: ["status"] as const,
   tracks: ["tracks"] as const,
   requests: ["requests"] as const,
-  recent: ["library", "recent"] as const,
   artists: ["artists"] as const,
   files: ["files"] as const,
 };
@@ -92,14 +90,6 @@ export function useRequestSongsQuery(request: MusicRequest) {
     queryKey: [...queryKeys.requests, request.id],
     queryFn: () => api<WantedSong[]>(`/requests/${request.id}`),
     refetchInterval: isActiveRequest(request) ? 3000 : false,
-  });
-}
-
-export function useRecentSongsQuery() {
-  return useQuery({
-    queryKey: queryKeys.recent,
-    queryFn: () => api<RecentSong[]>("/library/recent"),
-    refetchInterval: 15000,
   });
 }
 

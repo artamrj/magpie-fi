@@ -10,6 +10,7 @@ import { Files, type FilesNav } from "./components/Files";
 import { Library } from "./components/Library";
 import { ReviewList, type Feedback } from "./components/ReviewList";
 import { SongScreen } from "./components/SongScreen";
+import { SidebarStatus } from "./components/Status";
 import { haptic, startTrack, startView, telegram, useTelegramBackButton } from "./telegram";
 import { busyPhases, friendlyError, isProblem, isReview, preferredTrack } from "./trackUtils";
 
@@ -34,7 +35,7 @@ type Tab = "add" | "review" | "library" | "files";
 const tabs: Array<{ id: Tab; label: string; icon: IconName }> = [
   { id: "add", label: "Add", icon: "plus" },
   { id: "review", label: "Review", icon: "inbox" },
-  { id: "library", label: "Library", icon: "library" },
+  { id: "library", label: "Artists", icon: "users" },
   { id: "files", label: "Files", icon: "folder" },
 ];
 
@@ -274,13 +275,10 @@ export function App() {
               </button>
             ))}
           </nav>
-          <div className="status">
-            <i />
-            {busy ? workflow?.message || "Working" : "Watching the inbox"}
-            <br />
-            {setup.library_songs.toLocaleString()} songs · bot{" "}
-            {setup.telegram.configured ? "on" : "off"}
-          </div>
+          <SidebarStatus
+            setup={setup}
+            activity={busy ? workflow?.message || "Working" : undefined}
+          />
         </aside>
         {tab === "review" ? (
           <>

@@ -800,7 +800,7 @@ button.cell:active {
 }
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
   margin-top: 12px;
 }
@@ -1385,21 +1385,95 @@ button.tree-row.selected:hover {
   .wide .sidebar nav .badge {
     margin-left: auto;
   }
-  .wide .sidebar .status {
+  /* Server status at the foot of the sidebar: one short line per fact, details on hover. */
+  .side-status {
     margin-top: auto;
-    font-size: 12.5px;
-    color: var(--hint);
-    padding: 10px;
-    line-height: 1.5;
-    overflow-wrap: anywhere;
+    background: var(--section);
+    border-radius: 12px;
+    padding: 10px 12px 8px;
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--sub);
   }
-  .wide .sidebar .status i {
-    display: inline-block;
+  .side-status-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    column-gap: 7px;
+    padding-bottom: 8px;
+    border-bottom: 0.5px solid var(--sep);
+  }
+  .side-status-head i {
     width: 7px;
     height: 7px;
     border-radius: 50%;
     background: var(--good);
-    margin-right: 6px;
+    box-shadow: 0 0 0 3px var(--good-soft);
+  }
+  .side-status-head i.busy {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--info-soft);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .side-status-head span {
+    color: var(--text);
+    font-weight: 600;
+    font-size: 12.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .side-status-head small {
+    grid-column: 2;
+    color: var(--hint);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .side-status ul {
+    list-style: none;
+    margin: 0;
+    padding: 6px 0;
+    display: grid;
+    gap: 1px;
+  }
+  .side-status li {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 3px 0;
+    min-width: 0;
+    cursor: default;
+  }
+  .side-status li svg {
+    flex: none;
+    color: var(--hint);
+  }
+  .side-status li span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .side-status-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 7px;
+    border-top: 0.5px solid var(--sep);
+    color: var(--hint);
+    font-size: 11.5px;
+  }
+  .side-status-foot button {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--link);
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 2px 0;
+  }
+  .side-status-foot button:hover {
+    text-decoration: underline;
   }
   .wide .pane,
   .wide .detail {
