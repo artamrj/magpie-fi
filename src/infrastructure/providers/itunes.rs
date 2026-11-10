@@ -1,5 +1,5 @@
-use super::Candidate;
 use super::request_json;
+use super::{ArtworkCandidate, Candidate};
 use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::Result;
 use chrono::Duration;
@@ -56,6 +56,55 @@ pub async fn search(
         );
     }
     Ok(out)
+}
+
+/// Album covers found by the album's name and artist (`entity=album`), for a
+/// song whose own search returned no usable cover. The caller checks that the
+/// album and artist match the chosen release.
+pub async fn album_covers(
+    pool: &SqlitePool,
+    client: &Client,
+    artist: &str,
+    album: &str,
+) -> Result<Vec<ArtworkCandidate>> {
+    let term = format!("{} {}", artist.trim(), album.trim());
+    let raw = cached(
+        pool,
+        "itunes",
+        &search_key(&format!("album:{term}")),
+        Duration::days(7),
+        || async {
+            wait_turn().await;
+            request_json(client.get("https://itunes.apple.com/search").query(&[
+                ("term", term.as_str()),
+                ("media", "music"),
+                ("entity", "album"),
+                ("limit", "10"),
+            ]))
+            .await
+        },
+    )
+    .await?;
+    Ok(parse_album_covers(&raw))
+}
+
+fn parse_album_covers(raw: &Value) -> Vec<ArtworkCandidate> {
+    raw["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|album| {
+            Some(ArtworkCandidate {
+                provider: "Apple Music (album)".into(),
+                url: album["artworkUrl100"]
+                    .as_str()?
+                    .replace("100x100bb", "1200x1200bb"),
+                album: album["collectionName"].as_str().map(str::to_owned),
+                artist: album["artistName"].as_str().map(str::to_owned),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 async fn search_term(pool: &SqlitePool, client: &Client, term: &str) -> Result<Value> {

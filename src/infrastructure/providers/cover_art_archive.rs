@@ -14,6 +14,13 @@ use sqlx::SqlitePool;
 
 const CACHE: &str = "artwork-url";
 
+/// The front cover of a MusicBrainz release group: the album across all its
+/// editions. Used when the chosen edition has no image of its own; another
+/// edition of the same album usually does.
+pub fn release_group_front_url(release_group_id: &str) -> String {
+    format!("https://coverartarchive.org/release-group/{release_group_id}/front-500")
+}
+
 /// Downloads an image, refusing anything over the size limit (also while it
 /// streams in, when the server sends no length).
 pub async fn fetch(client: &Client, url: &str) -> Result<Vec<u8>> {

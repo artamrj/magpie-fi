@@ -1,4 +1,4 @@
-use super::{ArtistCredit, Candidate, phrase, request_json};
+use super::{ArtistCredit, ArtworkCandidate, Candidate, phrase, request_json};
 use crate::infrastructure::provider_cache::{cached, search_key};
 use anyhow::{Result, bail};
 use chrono::Duration;
@@ -56,6 +56,67 @@ async fn fetch_search(pool: &SqlitePool, client: &Client, query: &str) -> Result
         },
     )
     .await
+}
+
+/// Album covers found by the album's name and artist (`search/album`), the
+/// filtered query first, then plain words. The caller checks that album and
+/// artist match the chosen release.
+pub async fn album_covers(
+    pool: &SqlitePool,
+    client: &Client,
+    artist: &str,
+    album: &str,
+) -> Result<Vec<ArtworkCandidate>> {
+    let (artist, album) = (artist.trim(), album.trim());
+    for query in [
+        format!("artist:{} album:{}", phrase(artist), phrase(album)),
+        format!("{artist} {album}"),
+    ] {
+        let raw = cached(
+            pool,
+            "deezer",
+            &search_key(&format!("album:{query}")),
+            Duration::days(7),
+            || async {
+                let value = request_json(
+                    client
+                        .get("https://api.deezer.com/search/album")
+                        .query(&[("q", query.as_str()), ("limit", "10")]),
+                )
+                .await?;
+                if let Some(message) = value["error"]["message"].as_str() {
+                    bail!("Deezer API error: {message}");
+                }
+                Ok(value)
+            },
+        )
+        .await?;
+        let covers = parse_album_covers(&raw);
+        if !covers.is_empty() {
+            return Ok(covers);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn parse_album_covers(raw: &Value) -> Vec<ArtworkCandidate> {
+    raw["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|album| {
+            Some(ArtworkCandidate {
+                provider: "Deezer (album)".into(),
+                url: album["cover_xl"]
+                    .as_str()
+                    .or_else(|| album["cover_big"].as_str())?
+                    .to_owned(),
+                album: album["title"].as_str().map(str::to_owned),
+                artist: album["artist"]["name"].as_str().map(str::to_owned),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 pub async fn lookup_isrc(
@@ -123,6 +184,19 @@ fn parse_results(raw: &Value) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_covers_carry_their_album_and_artist() {
+        let raw = serde_json::json!({"data": [
+            {"title": "Koohe Yakh", "artist": {"name": "Ebi"}, "cover_xl": "https://e.test/xl.jpg"},
+            {"title": "No cover", "artist": {"name": "Ebi"}}
+        ]});
+        let covers = parse_album_covers(&raw);
+        assert_eq!(covers.len(), 1);
+        assert_eq!(covers[0].url, "https://e.test/xl.jpg");
+        assert_eq!(covers[0].album.as_deref(), Some("Koohe Yakh"));
+        assert_eq!(covers[0].artist.as_deref(), Some("Ebi"));
+    }
 
     #[test]
     fn a_filtered_search_is_retried_as_plain_words() {

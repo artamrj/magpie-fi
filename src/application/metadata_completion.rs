@@ -612,6 +612,8 @@ fn record_report(candidate: &mut Candidate, donors: &[&Candidate], report: &Comp
             }
         });
     let artwork_failures = breakdown["metadata_completion"]["artwork_failures"].clone();
+    // Written by the cover worker; the cover finder reads it to space its searches.
+    let cover_searched_at = breakdown["metadata_completion"]["cover_searched_at"].clone();
     breakdown["sources"] = serde_json::json!(sources);
     breakdown["metadata_completion"] = serde_json::json!({
         "score": report.score,
@@ -620,7 +622,8 @@ fn record_report(candidate: &mut Candidate, donors: &[&Candidate], report: &Comp
         "missing_fields": report.missing_fields,
         "cover_source": cover_source,
         "cover_verified": cover_verified,
-        "artwork_failures": artwork_failures
+        "artwork_failures": artwork_failures,
+        "cover_searched_at": cover_searched_at
     });
     candidate.score_breakdown = Some(breakdown.to_string());
 }

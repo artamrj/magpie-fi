@@ -226,9 +226,8 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
   within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
   the audio's length. Other releases of the same recording (the single and the album, a store
-  that lists fewer singers with the same length) are not rivals. When the chosen release has no
-  cover, another release of the same recording is tried (never a compilation). Review says in
-  plain words what is unsure.
+  that lists fewer singers with the same length) are not rivals. Review says in plain words what
+  is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
   existing values are never replaced.
 - **The file decides who is the main singer.** Sources disagree about duets and featured
@@ -243,6 +242,12 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
 - **Verified covers.** A cover must belong to the chosen release, download, decode, and not be
   blank or tiny. No verified cover → no filing (the song waits in Review). A cover verified for
   one track of an album is reused for the others.
+- **Tags before covers.** Correct tags matter more than a cover: the best match is never swapped
+  for another release just because that one has a cover. A sure match without a cover waits in
+  Review with the match chosen, and the page only asks for a cover. Covers are looked for by the
+  song, then by the album (album name and artist on Apple Music and Deezer, other editions of the
+  same MusicBrainz album). The **cover finder** searches again after each inbox check (each song
+  at most every 12 hours) and files the song as soon as one is found.
 - **Review.** Choose a candidate, paste a song link, type the details, change the cover, or
   remove the file. In Telegram: pick one of three buttons or "None of these".
 

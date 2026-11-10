@@ -25,9 +25,6 @@ pub struct RankedDecision {
     pub candidate_index: usize,
     pub confidence: f64,
     pub explanation: String,
-    /// Other releases of the same recording that pass the same checks, best
-    /// first. Filing falls back to them when the chosen release has no cover.
-    pub alternates: Vec<usize>,
 }
 
 struct Evaluated<'a> {
@@ -100,15 +97,6 @@ pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<Ran
     {
         return None;
     }
-    let alternates = evaluated
-        .iter()
-        .skip(1)
-        // A compilation is never a fallback: the song belongs with its own album.
-        .filter(|other| {
-            other.total >= 68.0 && !other.candidate.is_compilation && same_recording(best, other)
-        })
-        .map(|other| other.index)
-        .collect();
 
     let mut reasons = Vec::new();
     if best.isrc_proof {
@@ -148,7 +136,6 @@ pub fn rank(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> Option<Ran
         } else {
             reasons.join(", ")
         },
-        alternates,
     })
 }
 
@@ -1127,8 +1114,10 @@ mod tests {
             2.0,
         );
         let candidates = vec![apple.clone(), deezer.clone()];
-        let decision = rank(evidence(), &candidates).expect("one song, two listings");
-        assert_eq!(decision.alternates.len(), 1);
+        assert!(
+            rank(evidence(), &candidates).is_some(),
+            "one song, two listings"
+        );
 
         // With a length that does not match the file, a shorter credit stays a rival.
         let mut far = deezer;
@@ -1201,24 +1190,6 @@ mod tests {
             1.0,
         );
         assert!(rank(evidence(), &[session]).is_none());
-    }
-
-    #[test]
-    fn a_compilation_is_never_the_fallback_release() {
-        let evidence = TrackEvidence {
-            filename: "Ebi - Gheseh Eshgh.mp3",
-            title: Some("Gheseh Eshgh"),
-            artist: Some("Ebi"),
-            album: Some("Koohe Yakh"),
-            isrc: None,
-        };
-        let album = performed(1, "itunes", "Gheseh Eshgh", "Ebi", "Koohe Yakh", 0.3);
-        let single = performed(2, "deezer", "Gheseh Eshgh", "Ebi", "Gheseh Eshgh", 1.0);
-        let mut hits = performed(3, "deezer", "Gheseh Eshgh", "Ebi", "48 Golden Hits", 1.0);
-        hits.is_compilation = true;
-        let decision = rank(evidence, &[album, single, hits]).unwrap();
-        assert_eq!(decision.candidate_index, 0);
-        assert_eq!(decision.alternates, vec![1]);
     }
 
     #[test]

@@ -287,9 +287,10 @@ sped-up or pitch-shifted upload does not match by sound.
 
 Notes on E (first part, Nov 2026, built ahead of D): the approval keeps its margin only against a
 *different* recording and checks every rival, not only the runner-up; the file's own ISRC tag
-is proof (with a length within 3 s); SongRec listens when the text sources cannot decide; a
-release without a cover falls back to another release of the same recording; Review states the
-reason in plain words. Still open: claims table, state machine, "waiting for source".
+is proof (with a length within 3 s); SongRec listens when the text sources cannot decide; Review
+states the reason in plain words. A sure match without a cover keeps its release and tags and waits with
+the match chosen; covers are also searched by album, and a cover finder looks again after each
+inbox check (§2.5). Still open: claims table, state machine, "waiting for source".
 
 Notes on A: a refused cover's URL is still cleared from `cover_url`, but every option stays in the
 candidate's cover list, so nothing is lost. Songs scanned while a source was paused are not yet

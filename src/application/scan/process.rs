@@ -175,7 +175,8 @@ pub(crate) async fn process(
             "providers returned candidates"
         );
         let outcome = decide(state, &info, filename, &candidates).await?;
-        if !matches!(outcome, Decided::Filed { .. }) && can_listen_again {
+        let sure = matches!(outcome, Decided::Filed { .. } | Decided::NeedsCover { .. });
+        if !sure && can_listen_again {
             tracing::info!(
                 file,
                 "the text sources could not decide; listening to the audio"
@@ -225,6 +226,17 @@ pub(crate) async fn process(
                 tracing::warn!(file, "{reason}");
                 Ok(ProcessOutcome::NeedsReview)
             }
+            Decided::NeedsCover { index, candidate } => {
+                candidates[index] = candidate;
+                candidates.swap(0, index);
+                let message = format!(
+                    "The song was recognized as {} by {}, but no cover for this release was found yet. The cover finder keeps looking; you can also pick or paste one.",
+                    candidates[0].title, candidates[0].artist
+                );
+                persist_waiting_for_cover(&state.pool, path, &info, &candidates, &message).await?;
+                tracing::warn!(file, "{message}");
+                Ok(ProcessOutcome::NeedsReview)
+            }
             Decided::Incomplete {
                 index,
                 candidate,
@@ -244,10 +256,6 @@ pub(crate) async fn process(
     }
 }
 
-/// How many other releases of the same recording are tried when the chosen
-/// one has no verified cover. Each try may download covers.
-const MAX_ALTERNATE_RELEASES: usize = 3;
-
 enum Decided {
     Filed {
         candidate: infra_providers::Candidate,
@@ -257,7 +265,14 @@ enum Decided {
     Unsure {
         reason: String,
     },
-    /// The recording is known, but no release of it has everything filing needs.
+    /// The recording and its release are known; only a verified cover is missing.
+    /// The match is kept as it is: correct tags matter more than a cover, and the
+    /// cover finder looks for one separately (`application::cover_finder`).
+    NeedsCover {
+        index: usize,
+        candidate: infra_providers::Candidate,
+    },
+    /// The release lacks a title, artist or album.
     Incomplete {
         index: usize,
         candidate: infra_providers::Candidate,
@@ -265,8 +280,8 @@ enum Decided {
     },
 }
 
-/// Picks the recording, then the first of its releases that can be filed
-/// complete (title, artist, album, verified cover).
+/// Picks the best match and completes it. The release is never swapped for
+/// another one just because that one has a cover.
 async fn decide(
     state: &Arc<AppState>,
     info: &audio::AudioInfo,
@@ -288,54 +303,39 @@ async fn decide(
             reason: crate::application::smart_approval::unsure_reason(evidence(), candidates),
         });
     };
-    let mut first_incomplete = None;
-    let releases = std::iter::once(ranked.candidate_index).chain(
-        ranked
-            .alternates
-            .iter()
-            .copied()
-            .take(MAX_ALTERNATE_RELEASES),
-    );
-    for index in releases {
-        let mut candidate = candidates[index].clone();
-        let completion = crate::application::finalize_selection(
-            state,
-            &mut candidate,
-            Some(crate::application::Donors {
-                candidates,
-                existing_album: info.album.as_deref(),
-            }),
-            Some(crate::application::FileTags {
-                artist: info.artist.as_deref(),
-                title: info.title.as_deref(),
-            }),
-        )
-        .await?;
-        if completion.core_complete {
-            let fallback = if index == ranked.candidate_index {
-                ""
-            } else {
-                "; the best release had no usable cover, so another release of the same song was used"
-            };
-            let message = format!(
-                "Smart auto-selected ({:.0}%): {}{fallback}; {}",
-                ranked.confidence,
-                ranked.explanation,
-                completion.summary()
-            );
-            return Ok(Decided::Filed { candidate, message });
-        }
-        if first_incomplete.is_none() {
-            let missing = completion
-                .missing_fields
-                .iter()
-                .filter(|field| matches!(field.as_str(), "title" | "artist" | "album" | "cover"))
-                .cloned()
-                .collect();
-            first_incomplete = Some((index, candidate, missing));
-        }
+    let index = ranked.candidate_index;
+    let mut candidate = candidates[index].clone();
+    let completion = crate::application::finalize_selection(
+        state,
+        &mut candidate,
+        Some(crate::application::Donors {
+            candidates,
+            existing_album: info.album.as_deref(),
+        }),
+        Some(crate::application::FileTags {
+            artist: info.artist.as_deref(),
+            title: info.title.as_deref(),
+        }),
+    )
+    .await?;
+    if completion.core_complete {
+        let message = format!(
+            "Smart auto-selected ({:.0}%): {}; {}",
+            ranked.confidence,
+            ranked.explanation,
+            completion.summary()
+        );
+        return Ok(Decided::Filed { candidate, message });
     }
-    let (index, candidate, missing) = first_incomplete.expect("the chosen release is always tried");
+    let missing = completion
+        .missing_fields
+        .iter()
+        .filter(|field| matches!(field.as_str(), "title" | "artist" | "album" | "cover"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing == ["cover"] {
+        return Ok(Decided::NeedsCover { index, candidate });
+    }
     Ok(Decided::Incomplete {
         index,
         candidate,

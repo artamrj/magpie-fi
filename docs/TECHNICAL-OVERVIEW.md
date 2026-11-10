@@ -325,13 +325,14 @@ A candidate is approved automatically only when:
 - its version tags match the file's (`session` counts as a version, so "Marie (Dach Session)" is
   not "Marie"), and its length is at most 15 s off the audio.
 
-**Recording first, release second** (`scan::process::decide`). The chosen release is completed and
-needs title, artist, album and a verified cover. Without them, up to 3 other releases of the
-same recording that pass the same checks are tried, best first; compilations are never used for
-this. If none is complete, the song waits in Review.
+**The best match is kept, cover or not** (`scan::process::decide`). The chosen release is
+completed and needs title, artist, album and a verified cover. Correct tags matter more than a
+cover, so the release is never swapped for another one that has a cover. When only the cover is
+missing, the song waits in Review **with its match chosen** (as when you pick it yourself), the
+page asks only for a cover, and the cover finder (§11) keeps looking.
 
-**Listening as a tie-breaker.** When the text sources cannot decide (no approval, or no complete
-release) and SongRec has not listened yet, `identify` runs again with `Listen::Always`: SongRec
+**Listening as a tie-breaker.** When the text sources cannot decide (no approval, or a release
+missing its title, artist or album) and SongRec has not listened yet, `identify` runs again with `Listen::Always`: SongRec
 recognises the audio and its result is looked up in the catalogs. The text answers come from
 `provider_cache`, so the second pass costs one recognition.
 
@@ -423,9 +424,19 @@ second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was
   are rejected.
 - The candidate and track cover previews use the same check, so the page only shows a cover that
   would be written.
-- `ensure_usable_cover`: temporary failures (timeout, 429, 5xx) mark the cover retryable; if the
-  stored URLs are unusable it tries a fresh Deezer/iTunes lookup once. Only then is the cover
-  "missing".
+- `ensure_usable_cover`: temporary failures (timeout, 429, 5xx) mark the cover retryable. If the
+  stored URLs are unusable it tries, in order: a fresh lookup of the **song** (Deezer by ISRC,
+  iTunes and Deezer by title); then the **album itself**: the front cover of the MusicBrainz
+  release group (any edition of the same album, Cover Art Archive), and album searches by album
+  name and album artist on iTunes (`entity=album`) and Deezer (`search/album`). Each is still
+  checked against album and artist (the album artist counts too). The release and its tags
+  never change. Only then is the cover "missing"; the time of that search is stored as
+  `metadata_completion.cover_searched_at`.
+- **Cover finder** (`src/application/cover_finder.rs`): in every inbox cycle, between identifying
+  and filing, it runs the cover worker again for songs in Review whose chosen match lacks a cover
+  (`cover_required` or `retryable_error`): at most 25 per run, each at most once every 12 hours.
+  It takes the workflow slot. A song whose cover is found becomes Ready and is filed in the same
+  cycle; one the owner changed meanwhile is left alone.
 - `resolve_for_write`: at filing time, returns the exact bytes to embed or fails, so no file is
   written without a matching cover.
 
@@ -545,6 +556,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | Smart auto-selection | `src/application/smart_approval.rs` |
 | Metadata completion | `src/application/metadata_completion.rs` |
 | Cover worker | `src/application/artwork.rs` |
+| Cover finder (songs waiting for a cover) | `src/application/cover_finder.rs` |
 | Filing | `src/application/apply.rs` |
 | Library layout, index, trash, playlists | `src/application/library.rs` |
 | Files tab (browse, search, song details, tag editing, whole folders) | `src/application/file_browser.rs`, `src/http/handlers/files.rs`, `web/src/app/components/Files.tsx` |

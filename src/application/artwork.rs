@@ -9,8 +9,11 @@
 //! selected recording — the candidate's own URL list, agreeing catalog rows,
 //! a fresh catalog search when the stored URLs are unusable, and artwork that
 //! was already verified for the same release elsewhere in the library (so the
-//! first track of an album helps fill in every other track). Every candidate
-//! image is downloaded and inspected before it is accepted.
+//! first track of an album helps fill in every other track). When none of
+//! those works, it looks for the cover of the album itself: by album name and
+//! artist on Apple Music and Deezer, and other editions of the same MusicBrainz
+//! album. The chosen release and its tags never change to get a cover.
+//! Every candidate image is downloaded and inspected before it is accepted.
 
 use crate::infrastructure::providers::{
     ArtworkCandidate, ArtworkStatus, Candidate, cover_art_archive, musicbrainz::is_mbid,
@@ -225,6 +228,22 @@ pub async fn ensure_usable_cover(pool: &SqlitePool, client: &Client, candidate: 
         accept_verified_artwork(candidate, artwork, &item, &info);
         return;
     }
+
+    // Nothing found through the song. Look for the album's own cover.
+    let album_start = artwork.len();
+    let (album_sources, album_retryable) = album_artwork(pool, client, candidate).await;
+    check.retryable |= album_retryable;
+    for item in album_sources {
+        push_new(&mut artwork, item);
+    }
+    let album_check =
+        verify_artwork_candidates(pool, client, candidate, &artwork[album_start..]).await;
+    check.retryable |= album_check.retryable;
+    check.failures.extend(album_check.failures);
+    if let Some((item, _, info)) = album_check.verified {
+        accept_verified_artwork(candidate, artwork, &item, &info);
+        return;
+    }
     if check.retryable {
         mark_retryable_artwork(candidate, artwork, check.failures);
         return;
@@ -238,6 +257,65 @@ pub async fn ensure_usable_cover(pool: &SqlitePool, client: &Client, candidate: 
         format!("No usable matching cover: {}", check.failures.join("; "))
     });
     mark_cover_verified(candidate, false, "cover_required");
+}
+
+/// Covers of the chosen album found by the album, not the song: the release
+/// group's front cover (any edition of the same MusicBrainz album) and album
+/// searches by name and artist. Each is still checked against the album and
+/// artist by [`artwork_matches_candidate`]. Also says whether a source failed
+/// in a way worth retrying.
+async fn album_artwork(
+    pool: &SqlitePool,
+    client: &Client,
+    candidate: &Candidate,
+) -> (Vec<ArtworkCandidate>, bool) {
+    let mut out = Vec::new();
+    let mut retryable = false;
+    if let Some(group) = candidate
+        .release_group_id
+        .as_deref()
+        .filter(|id| is_mbid(id))
+    {
+        // A release group is this album by MusicBrainz ID, so its cover is
+        // labelled with the chosen album and artist.
+        out.push(ArtworkCandidate {
+            provider: "Cover Art Archive (album)".into(),
+            url: cover_art_archive::release_group_front_url(group),
+            album: candidate.album.clone(),
+            artist: Some(candidate.artist.clone()),
+            ..Default::default()
+        });
+    }
+    let Some(album) = candidate
+        .album
+        .as_deref()
+        .filter(|album| !album.trim().is_empty())
+    else {
+        return (out, retryable);
+    };
+    let artist = candidate
+        .album_artist
+        .as_deref()
+        .filter(|artist| !artist.trim().is_empty() && !is_various_artists(artist))
+        .unwrap_or(&candidate.artist);
+    let (itunes, deezer) = tokio::join!(
+        crate::infrastructure::providers::itunes::album_covers(pool, client, artist, album),
+        crate::infrastructure::providers::deezer::album_covers(pool, client, artist, album),
+    );
+    for result in [itunes, deezer] {
+        match result {
+            Ok(found) => out.extend(found),
+            Err(error) => retryable |= is_retryable_artwork_error(&error),
+        }
+    }
+    (out, retryable)
+}
+
+fn is_various_artists(artist: &str) -> bool {
+    matches!(
+        artist.trim().to_lowercase().as_str(),
+        "various artists" | "various" | "va"
+    )
 }
 
 /// Apply-time: return the exact bytes to embed, or fail so the track is
@@ -365,6 +443,12 @@ fn mark_cover_verified(candidate: &mut Candidate, verified: bool, source: &str) 
         .unwrap_or_else(|| serde_json::json!({}));
     breakdown["metadata_completion"]["cover_verified"] = serde_json::json!(verified);
     breakdown["metadata_completion"]["cover_source"] = serde_json::json!(source);
+    // When the last search came up empty, so the cover finder waits before the next one.
+    breakdown["metadata_completion"]["cover_searched_at"] = if verified {
+        Value::Null
+    } else {
+        serde_json::json!(chrono::Utc::now().to_rfc3339())
+    };
     candidate.score_breakdown = Some(breakdown.to_string());
 }
 
@@ -399,10 +483,13 @@ fn artwork_matches_candidate(candidate: &Candidate, artwork: &ArtworkCandidate) 
                 .as_deref()
                 .is_none_or(|artist| text_similarity(artist, &candidate.artist) >= 0.82);
     }
-    let same_artist = artwork
-        .artist
-        .as_deref()
-        .is_some_and(|artist| text_similarity(artist, &candidate.artist) >= 0.82);
+    // An album is listed under its album artist ("ANOTR" for a song by
+    // "ANOTR feat. 54 Ultra"), so either name counts.
+    let same_artist = artwork.artist.as_deref().is_some_and(|artist| {
+        std::iter::once(candidate.artist.as_str())
+            .chain(candidate.album_artist.as_deref())
+            .any(|name| text_similarity(artist, name) >= 0.82)
+    });
     // Entries are only created for rows that already agreed on the recording
     // (same title), so a row without an album name only needs the artist.
     same_artist

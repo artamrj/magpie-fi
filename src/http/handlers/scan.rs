@@ -14,13 +14,19 @@ pub async fn check_inbox(State(s): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({"started": !running, "already_running": running}))
 }
 
-/// One inbox cycle: identify new or changed inbox files, then file every track
-/// that is ready (matched automatically, or approved in review).
+/// One inbox cycle: identify new or changed inbox files, look again for the
+/// covers songs are waiting for, then file every track that is ready (matched
+/// automatically, or approved in review).
 pub async fn run_automatic_cycle(state: Arc<AppState>) -> Result<()> {
     if state.workflow_running().await {
         return Ok(());
     }
     let scanned = crate::application::scan::run_automatic(state.clone()).await?;
+    if state.workflow_cancelled().await {
+        return Ok(());
+    }
+    // Between identifying and filing, so a cover found now is filed in this cycle.
+    crate::application::cover_finder::run(&state).await?;
     if state.workflow_cancelled().await {
         return Ok(());
     }

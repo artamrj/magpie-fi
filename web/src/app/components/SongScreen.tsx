@@ -454,8 +454,9 @@ function Explanation({
   if (coverNeeded)
     return (
       <Callout tone="warn" icon="image">
-        <b>The match is right, but no cover matched this release.</b> Pick one of the covers found,
-        or paste a link.
+        <b>The match is right, but no cover matched this release yet.</b> The cover finder keeps
+        looking after each inbox check. To file it sooner, pick one of the covers found, or paste a
+        link.
       </Callout>
     );
   if (isReady(track))

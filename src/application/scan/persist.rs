@@ -55,6 +55,41 @@ pub(crate) async fn persist_match(
     Ok(())
 }
 
+/// Stores a recognized track whose only gap is the cover: the match stays
+/// chosen (as when the owner picks it), so the page asks for a cover only and
+/// the cover finder can complete it later.
+pub(crate) async fn persist_waiting_for_cover(
+    pool: &sqlx::SqlitePool,
+    path: &Path,
+    info: &audio::AudioInfo,
+    candidates: &[infra_providers::Candidate],
+    message: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let id = upsert_track(
+        &mut tx,
+        path,
+        Some(info),
+        "needs_review",
+        "review",
+        Some(message),
+        None,
+    )
+    .await?;
+    let mut chosen = None;
+    for candidate in candidates.iter().take(5) {
+        let candidate_id = candidates::insert(&mut *tx, id, candidate).await?;
+        chosen.get_or_insert(candidate_id);
+    }
+    sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+        .bind(chosen)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Stores a track that needs review, with its best candidates.
 pub(crate) async fn persist_review(
     pool: &sqlx::SqlitePool,

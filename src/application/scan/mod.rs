@@ -894,6 +894,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sure_match_without_a_cover_stays_chosen_while_it_waits() {
+        let pool = test_pool().await;
+        let path = Path::new("/music/input/marie.mp3");
+        let info = audio::AudioInfo {
+            title: Some("Marie".into()),
+            artist: Some("AnnenMayKantereit".into()),
+            duration: 225.0,
+            format: "mp3".into(),
+            ..Default::default()
+        };
+        let chosen = infra_providers::Candidate {
+            provider: "musicbrainz".into(),
+            title: "Marie".into(),
+            artist: "AnnenMayKantereit".into(),
+            album: Some("Schlagschatten (Sessions / Video Album)".into()),
+            artwork_status: infra_providers::ArtworkStatus::CoverRequired,
+            score: 89.0,
+            raw_json: "{}".into(),
+            ..Default::default()
+        };
+        let other = infra_providers::Candidate {
+            provider: "itunes".into(),
+            album: Some("Schlagschatten".into()),
+            ..chosen.clone()
+        };
+
+        persist_waiting_for_cover(&pool, path, &info, &[chosen, other], "waiting")
+            .await
+            .unwrap();
+
+        let (stage, album): (String, String) = sqlx::query_as(
+            "SELECT tracks.stage,candidates.album FROM tracks
+             JOIN candidates ON candidates.id=tracks.selected_candidate_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stage, "review");
+        assert_eq!(album, "Schlagschatten (Sessions / Video Album)");
+    }
+
+    #[tokio::test]
     async fn persist_review_keeps_non_musicbrainz_provider() {
         let pool = test_pool().await;
         let path = Path::new("/music/input/discogs-review.mp3");

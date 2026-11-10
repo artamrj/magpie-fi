@@ -1162,7 +1162,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("manual-no-cover.sqlite");
         let pool = db::connect(database.to_str().unwrap()).await.unwrap();
-        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        let mut offline = AppState::new(Config::default(), pool.clone());
+        // The cover search must fail here, and fail without the internet.
+        offline.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let state = Arc::new(offline);
         let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/unknown.mp3','unknown.mp3','needs_review',0,'now','now','now','review')")
             .execute(&pool)
             .await
