@@ -47,8 +47,6 @@ pub struct Config {
     pub trash_days: u64,
     pub lyrics: bool,
     pub telegram: Option<TelegramConfig>,
-    /// The magpie rhyme at the end of finished Telegram requests.
-    pub rhyme: bool,
     /// The web page's public HTTPS address (needed for the Telegram Mini App).
     pub public_url: Option<String>,
     /// `m4a` or `opus`: YouTube's own audio stream, never re-encoded to another lossy format.
@@ -100,7 +98,6 @@ impl Config {
             trash_days: 30,
             lyrics: true,
             telegram: None,
-            rhyme: true,
             public_url: None,
             audio_format: AudioFormat::M4a,
             max_parallel_downloads: 2,
@@ -197,7 +194,6 @@ impl Config {
                 })
             }
         };
-        config.rhyme = flag("MAGPIE_RHYME", true)?;
         config.public_url =
             get("MAGPIE_PUBLIC_URL").map(|url| url.trim_end_matches('/').to_owned());
         if let Some(url) = config.public_url.as_deref()

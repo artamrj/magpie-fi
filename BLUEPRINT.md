@@ -45,34 +45,6 @@ This project does the same with songs. The name has three meanings:
 
 It joins the family of names: **sync-me-maybe** (the bot) + **ununknown** (the fixer) → **magpie-fi** (the whole nest).
 
-### The secret rhyme 🐦
-
-An old English counting rhyme says what it means to see magpies:
-
-> *One for sorrow,*
-> *Two for joy,*
-> *Three for a girl,*
-> *Four for a boy,*
-> *Five for silver,*
-> *Six for gold,*
-> *Seven for a secret never to be told.*
-
-magpie-fi hides this rhyme in the bot as an easter egg. Nobody is told; people discover it.
-
-| Rhyme line | When the bot says it |
-|---|---|
-| 🐦 *One for sorrow* | A request finally failed (after all retries). |
-| 🐦🐦 *Two for joy* | A song was filed into the library. |
-| 🐦🐦🐦 *Three for a girl* · 🐦🐦🐦🐦 *Four for a boy* | Not mapped to anything. They stay in the rhyme only, for the full poem in `/help`. |
-| 🐦🐦🐦🐦🐦 *Five for silver* | The song was saved in lossy quality (AAC/Opus from YouTube). |
-| 🐦🐦🐦🐦🐦🐦 *Six for gold* | The song was saved **lossless** (FLAC). |
-| 🐦🐦🐦🐦🐦🐦🐦 *Seven for a secret never to be told* | Hidden `/seven` command (not in the command menu): shows nest stats (songs, artists, hours of music, money not paid to subscriptions) and one random forgotten song from your library. |
-
-Implementation notes:
-- The line goes at the end of the bot's final status message (one short line, in italics), so it never gets in the way.
-- A setting `MAGPIE_RHYME=true|false` turns it off for people who want plain messages.
-- The rhyme is a traditional folk rhyme, so it is free to use.
-
 ---
 
 ## 1. What you have today
@@ -786,8 +758,7 @@ magpie-fi is now one program in one image; the Python bot is gone.
   in the database). 👀 on your message when it arrives, 👌 or 🤷 when it is finished.
 - Review in Telegram: "Not sure which song this is" with up to three candidates and "None of
   these", using the same choose/remove logic as the web page.
-- `/start` `/help` (with the whole rhyme) `/queue` `/health` `/id` `/guests`, hidden `/seven`;
-  the rhyme line on finished requests (`MAGPIE_RHYME`).
+- `/start` `/help` `/queue` `/health` `/id` `/guests`.
 - Files over Telegram's 20 MB bot limit get a clear answer (smaller file, a link, or the inbox
   folder). No self-hosted Bot API server: one more container and app keys for little gain.
 - `frankenstein` is used for Telegram's types only; requests go through magpie's own HTTP client

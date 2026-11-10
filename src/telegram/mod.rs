@@ -453,7 +453,6 @@ async fn on_command(
         "help" => send(context, chat, &texts::help(role == Role::Owner), None).await,
         "queue" => send(context, chat, &queue_text(context).await?, None).await,
         "health" => send(context, chat, &health_text(context).await, None).await,
-        "seven" => send(context, chat, &seven_text(context).await?, None).await,
         "web" if role == Role::Owner => {
             let public_url = context.state.config.read().await.public_url.clone();
             let base = public_url
@@ -528,44 +527,6 @@ async fn health_text(context: &Context) -> String {
         check(writable),
         check(crate::acquire::ytdlp::available(&config)),
     )
-}
-
-/// 🐦×7 Seven for a secret never to be told: a few numbers and one song you forgot.
-async fn seven_text(context: &Context) -> Result<String> {
-    let (songs, artists, seconds, first): (i64, i64, Option<f64>, Option<String>) = sqlx::query_as(
-        "SELECT count(*),count(DISTINCT lower(artist)),sum(duration),min(added_at)
-             FROM library_items",
-    )
-    .fetch_one(&context.state.pool)
-    .await?;
-    let months = first
-        .and_then(|date| chrono::DateTime::parse_from_rfc3339(&date).ok())
-        .map(|date| {
-            ((chrono::Utc::now() - date.with_timezone(&chrono::Utc)).num_days() / 30).max(1)
-        })
-        .unwrap_or(1);
-    let forgotten: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT artist,title FROM library_items WHERE title IS NOT NULL ORDER BY random() LIMIT 1",
-    )
-    .fetch_optional(&context.state.pool)
-    .await?;
-    let mut text = format!(
-        "🐦🐦🐦🐦🐦🐦🐦 <i>Seven for a secret never to be told</i>\n\n\
-         {songs} songs · {artists} artists · {:.0} hours of music\n\
-         About €{} not paid to a streaming subscription so far.",
-        seconds.unwrap_or_default() / 3600.0,
-        months * 11
-    );
-    if let Some((artist, Some(title))) = forgotten {
-        text.push_str(&format!(
-            "\n\nListen again: <b>{}</b>{}",
-            texts::escape(&title),
-            artist
-                .map(|artist| format!(" — {}", texts::escape(&artist)))
-                .unwrap_or_default()
-        ));
-    }
-    Ok(text)
 }
 
 // ── Guests ──────────────────────────────────────────────────────────────────
@@ -1073,9 +1034,9 @@ mod tests {
         let reply = wait_for(&fake, "sendMessage", "private music bot").await;
         assert!(reply["text"].as_str().unwrap().contains("200"));
 
-        // The owner gets help (with the rhyme) and creates an invite.
+        // The owner gets help and creates an invite.
         fake.push(message(2, OWNER, "/help"));
-        wait_for(&fake, "sendMessage", "Seven for a secret").await;
+        wait_for(&fake, "sendMessage", "/guests").await;
         fake.push(message(3, OWNER, "/guests"));
         wait_for(&fake, "sendMessage", "Create an invite link").await;
         fake.push(button(4, OWNER, "invite"));
@@ -1128,7 +1089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_messages_follow_the_request_and_finish_with_the_rhyme() {
+    async fn status_messages_follow_the_request() {
         let (directory, fake, state) = start().await;
         wait_for(&fake, "setMyCommands", "queue").await;
 
@@ -1186,7 +1147,7 @@ mod tests {
         store::finished_download(pool, &staging, &file, "filed")
             .await
             .unwrap();
-        let done = wait_for(&fake, "editMessageText", "Two for joy").await;
+        let done = wait_for(&fake, "editMessageText", "✅").await;
         assert!(
             done["text"]
                 .as_str()

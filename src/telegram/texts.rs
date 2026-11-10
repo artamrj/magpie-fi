@@ -2,16 +2,6 @@
 
 use crate::acquire::store::RequestSummary;
 
-pub const RHYME: [&str; 7] = [
-    "One for sorrow",
-    "Two for joy",
-    "Three for a girl",
-    "Four for a boy",
-    "Five for silver",
-    "Six for gold",
-    "Seven for a secret never to be told",
-];
-
 /// Telegram HTML needs only these three escaped.
 pub fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -50,15 +40,7 @@ pub fn help(owner: bool) -> String {
         text.push_str("/guests · invite people or remove them\n");
         text.push_str("/web · log in to the web page\n");
     }
-    text.push_str("\n<i>");
-    for (index, line) in RHYME.iter().enumerate() {
-        text.push_str(&"🐦".repeat(index + 1));
-        text.push(' ');
-        text.push_str(line);
-        text.push('\n');
-    }
-    text.push_str("</i>");
-    text
+    text.trim_end().to_owned()
 }
 
 /// Answer to an upload over Telegram's 20 MB limit for bots.
@@ -78,8 +60,6 @@ pub fn too_big(name: &str, bytes: u64) -> String {
 pub struct StatusView {
     /// "Artist – Title" for a single song or upload.
     pub song: Option<String>,
-    /// The single song was filed as lossless audio (FLAC and friends).
-    pub lossless: bool,
     /// Songs filed now (not counting ones that were already in the library).
     pub newly_filed: i64,
 }
@@ -90,7 +70,7 @@ pub fn is_final(summary: &RequestSummary) -> bool {
         || (summary.status == "ready" && summary.working == 0 && summary.review == 0)
 }
 
-pub fn status(summary: &RequestSummary, view: &StatusView, rhyme: bool) -> String {
+pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
     let name = match summary.kind.as_str() {
         "track" | "upload" if summary.total <= 1 => {
             view.song.clone().unwrap_or_else(|| "your song".to_owned())
@@ -167,28 +147,7 @@ pub fn status(summary: &RequestSummary, view: &StatusView, rhyme: bool) -> Strin
         text.push_str(&details.join(" · "));
         text.push('\n');
     }
-    if finished
-        && rhyme
-        && let Some(line) = rhyme_line(summary, view)
-    {
-        text.push_str(&format!("\n<i>{line}</i>"));
-    }
     text.trim_end().to_owned()
-}
-
-/// 🐦 One for sorrow (nothing worked), 🐦🐦 Two for joy (songs added), and for
-/// a single song 🐦🐦🐦🐦🐦 Five for silver (lossy) or 🐦🐦🐦🐦🐦🐦 Six for gold (lossless).
-fn rhyme_line(summary: &RequestSummary, view: &StatusView) -> Option<String> {
-    let index = if summary.done == 0 && summary.failed > 0 {
-        0
-    } else if view.newly_filed == 0 {
-        return None;
-    } else if summary.total == 1 {
-        if view.lossless { 5 } else { 4 }
-    } else {
-        1
-    };
-    Some(format!("{} {}", "🐦".repeat(index + 1), RHYME[index]))
 }
 
 fn bar(done: i64, total: i64) -> String {
@@ -227,41 +186,33 @@ mod tests {
     }
 
     #[test]
-    fn playlists_show_progress_and_finish_with_the_rhyme() {
+    fn playlists_show_progress() {
         let view = StatusView {
             newly_filed: 3,
             ..StatusView::default()
         };
-        let busy = status(&summary("playlist", 4, 1, 2, 0, 1), &view, true);
+        let busy = status(&summary("playlist", 4, 1, 2, 0, 1), &view);
         assert!(
             busy.starts_with("⏳ <b>Road &lt;Trip&gt;</b> · playlist"),
             "{busy}"
         );
         assert!(busy.contains("▓▓░░░░░░░░ 1 of 4 in your library"));
         assert!(busy.contains("2 on the way · 1 failed"));
-        assert!(!busy.contains("for joy"));
 
-        let done = status(&summary("playlist", 4, 4, 0, 0, 0), &view, true);
+        let done = status(&summary("playlist", 4, 4, 0, 0, 0), &view);
         assert!(done.starts_with("✅"));
-        assert!(done.ends_with("<i>🐦🐦 Two for joy</i>"));
-        assert!(!status(&summary("playlist", 4, 4, 0, 0, 0), &view, false).contains("joy"));
+        assert!(done.ends_with("4 of 4 in your library"));
     }
 
     #[test]
-    fn single_songs_say_silver_or_gold() {
-        let mut view = StatusView {
+    fn single_songs_say_added() {
+        let view = StatusView {
             song: Some("Daft Punk – One More Time".into()),
             newly_filed: 1,
-            lossless: false,
         };
-        let text = status(&summary("track", 1, 1, 0, 0, 0), &view, true);
+        let text = status(&summary("track", 1, 1, 0, 0, 0), &view);
         assert!(text.contains("<b>Daft Punk – One More Time</b>"));
         assert!(text.contains("Added to your library"));
-        assert!(text.ends_with("Five for silver</i>"));
-        view.lossless = true;
-        assert!(
-            status(&summary("upload", 1, 1, 0, 0, 0), &view, true).ends_with("Six for gold</i>")
-        );
     }
 
     #[test]
@@ -270,15 +221,14 @@ mod tests {
             song: Some("A – B".into()),
             ..StatusView::default()
         };
-        let owned = status(&summary("track", 1, 1, 0, 0, 0), &view, true);
+        let owned = status(&summary("track", 1, 1, 0, 0, 0), &view);
         assert!(owned.contains("Already in your library"));
         assert!(!owned.contains("<i>"));
-        let failed = status(&summary("track", 1, 0, 0, 0, 1), &view, true);
+        let failed = status(&summary("track", 1, 0, 0, 0, 1), &view);
         assert!(failed.starts_with("⚠️"));
-        assert!(failed.ends_with("🐦 One for sorrow</i>"));
         let waiting = summary("track", 1, 0, 0, 1, 0);
         assert!(!is_final(&waiting));
-        assert!(status(&waiting, &view, true).contains("Not sure which song"));
+        assert!(status(&waiting, &view).contains("Not sure which song"));
     }
 
     #[test]
@@ -289,10 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn help_contains_the_whole_rhyme() {
+    fn help_shows_owner_commands_to_owners() {
         let text = help(true);
         assert!(text.contains("/guests"));
-        assert!(text.contains("🐦🐦🐦🐦🐦🐦🐦 Seven for a secret never to be told"));
         assert!(!help(false).contains("/guests"));
     }
 }

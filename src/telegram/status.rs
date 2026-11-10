@@ -23,13 +23,12 @@ pub async fn run(context: Arc<Context>) {
 }
 
 async fn refresh(context: &Context) -> Result<()> {
-    let rhyme = context.state.config.read().await.rhyme;
     for open in store::open_telegram_requests(&context.state.pool).await? {
         let Some(summary) = store::request_summary(&context.state.pool, open.id).await? else {
             continue;
         };
         let view = view(context, open.id).await?;
-        let text = texts::status(&summary, &view, rhyme);
+        let text = texts::status(&summary, &view);
         let finished = texts::is_final(&summary);
         if open.status_text.as_deref() == Some(text.as_str()) && !finished {
             continue;
@@ -83,21 +82,8 @@ async fn view(context: &Context, request: i64) -> Result<texts::StatusView> {
             Some(artist) => format!("{artist} – {}", song.title),
             None => song.title.clone(),
         }),
-        lossless: first
-            .and_then(|song| song.library_path.as_deref())
-            .is_some_and(is_lossless_file),
         newly_filed: songs.iter().filter(|song| song.status == "filed").count() as i64,
     })
-}
-
-fn is_lossless_file(path: &str) -> bool {
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|extension| {
-            matches!(extension.as_str(), "flac" | "wav" | "aiff" | "aif" | "alac")
-        })
 }
 
 /// Stop while songs are waiting; Retry and Details when something failed.
@@ -220,7 +206,5 @@ mod tests {
     fn long_labels_are_shortened() {
         assert_eq!(shorten("abc", 5), "abc");
         assert_eq!(shorten("abcdefgh", 5), "abcd…");
-        assert!(is_lossless_file("/m/a.FLAC"));
-        assert!(!is_lossless_file("/m/a.m4a"));
     }
 }

@@ -237,7 +237,7 @@ deleted after filing instead of going to the trash.
 | Client | `api.rs` | Bot API calls with magpie's HTTP client and frankenstein's types; waits on "retry after", ignores "message is not modified"; file download (Telegram allows bots up to 20 MB; bigger files get a clear answer instead). |
 | Bot | `mod.rs` | Long polling (offset kept in `telegram_state`), owners and guests (`telegram_guests`, one-time `telegram_invites`), links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
 | Status | `status.rs` | Every 3 s: redraws each open request's status message when its text changed, closes it when nothing is on the way or waiting for review, and asks about Telegram songs that wait in review (candidate buttons call the same choose/remove handlers as the web page). |
-| Texts | `texts.rs` | Every message the bot sends, the progress bar and the rhyme. |
+| Texts | `texts.rs` | Every message the bot sends, and the progress bar. |
 
 ## 4d. Web page login (`src/http/auth.rs`)
 
