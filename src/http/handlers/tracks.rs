@@ -79,13 +79,11 @@ pub async fn remove_track(
     )
     .await
     .map_err(|error| ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}")))?;
-    sqlx::query(
-        "UPDATE wanted SET status='failed',error='Removed in review',updated_at=? WHERE staging_path=?",
-    )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(source.to_string_lossy().as_ref())
-    .execute(&s.pool)
-    .await?;
+    sqlx::query("UPDATE wanted SET status='removed',error=NULL,updated_at=? WHERE staging_path=?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(source.to_string_lossy().as_ref())
+        .execute(&s.pool)
+        .await?;
 
     let canonical_path = source.to_string_lossy().into_owned();
     let mut transaction = s.pool.begin().await?;

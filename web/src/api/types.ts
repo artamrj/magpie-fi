@@ -48,12 +48,21 @@ export type MusicRequest = {
   kind: "track" | "album" | "playlist" | "upload";
   title?: string;
   status: "reading" | "ready" | "failed";
+  /** Why the link could not be read. */
   error?: string;
   total: number;
   done: number;
   working: number;
   review: number;
   failed: number;
+  /** Removed by the owner in Review. */
+  removed: number;
+  created_at: string;
+  updated_at: string;
+  /** The Review track of the first song waiting for the owner. */
+  track_id?: number | null;
+  /** The first song's error, for a request of one song. */
+  first_error?: string | null;
 };
 /** One song of a request (GET /api/requests/{id}). */
 export type WantedSong = {
@@ -62,6 +71,8 @@ export type WantedSong = {
   artist?: string;
   status: string;
   error?: string;
+  track_id?: number | null;
+  updated_at: string;
 };
 export type Candidate = {
   id: number;

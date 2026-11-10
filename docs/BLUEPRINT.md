@@ -152,8 +152,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 - The web page is designed as a Telegram Mini App and looks the same in a browser: one column
   of Telegram-style grouped lists, colours from Telegram's theme variables (`--tg-theme-*`, with
   Telegram's iOS day and night colours as fallbacks), and three tabs:
-  - **Add**: paste a link (or send one to the bot); every request with its progress; recently
-    added songs.
+  - **Add**: paste a link (or send one to the bot), then a short list like a browser's
+    downloads: what is on the way now, and what settled in the last day (added, needs your
+    pick, failed with the reason and a Retry); older entries behind "Show earlier". A song that
+    needs a pick opens in Review; an album or playlist opens its songs. Sending the same link
+    again retries the existing entry instead of adding a second one; a song removed in Review
+    leaves the list.
   - **Review**: songs grouped by what has to happen to them (needs your pick, issues, ready to
     file), with "Accept N confident matches" and "Check and repair" as the first rows. One song
     opens as its own screen that asks one question: which release (a radio list with only the

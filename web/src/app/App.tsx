@@ -150,6 +150,14 @@ export function App() {
     setOpenId(wide ? following?.id : undefined);
     if (!wide) window.scrollTo({ top: 0 });
   };
+  /** A song opened from another tab (a request's "needs your pick"). */
+  const openFromElsewhere = (trackId: number) => {
+    haptic.tap();
+    setTab("review");
+    setCoverMode(false);
+    setOpenId(trackId);
+    if (!wide) window.scrollTo({ top: 0 });
+  };
   const switchTab = (next: Tab) => {
     haptic.tap();
     setTab(next);
@@ -289,7 +297,7 @@ export function App() {
             </aside>
           </>
         ) : tab === "add" ? (
-          <AddMusic wide feedback={feedback} onReview={() => switchTab("review")} />
+          <AddMusic wide feedback={feedback} onOpenTrack={openFromElsewhere} />
         ) : (
           <Library setup={setup} wide feedback={feedback} />
         )}
@@ -305,7 +313,7 @@ export function App() {
         <main className="screen">{reviewList}</main>
       )
     ) : tab === "add" ? (
-      <AddMusic wide={false} feedback={feedback} onReview={() => switchTab("review")} />
+      <AddMusic wide={false} feedback={feedback} onOpenTrack={openFromElsewhere} />
     ) : (
       <Library setup={setup} wide={false} feedback={feedback} />
     );

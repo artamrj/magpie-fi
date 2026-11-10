@@ -290,6 +290,28 @@ pub async fn known_source(
     Ok(None)
 }
 
+/// The latest request for the same link that is still being read or has songs, so sending
+/// a link twice does not make two entries. A link that could not be read is tried afresh.
+pub async fn find_reusable_request(pool: &SqlitePool, url: &str) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM requests WHERE url=? AND status IN ('reading','ready')
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(url)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Marks a request as asked for again: it moves to the top of the list.
+pub async fn touch_request(pool: &SqlitePool, request_id: i64) -> Result<()> {
+    sqlx::query("UPDATE requests SET updated_at=? WHERE id=?")
+        .bind(now())
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Failed songs of a request go back into the queue.
 pub async fn retry_failed(pool: &SqlitePool, request_id: i64) -> Result<u64> {
     Ok(sqlx::query(
@@ -352,7 +374,11 @@ pub async fn attach_telegram(
     user_message_id: i32,
     status_message_id: i32,
 ) -> Result<()> {
-    sqlx::query("UPDATE requests SET chat_id=?,user_message_id=?,status_message_id=? WHERE id=?")
+    // A new status message starts from scratch, also for a request asked for again.
+    sqlx::query(
+        "UPDATE requests SET chat_id=?,user_message_id=?,status_message_id=?,status_text=NULL,closed=0
+         WHERE id=?",
+    )
         .bind(chat_id)
         .bind(user_message_id)
         .bind(status_message_id)
@@ -552,6 +578,14 @@ pub struct RequestSummary {
     pub working: i64,
     pub review: i64,
     pub failed: i64,
+    /// Removed by the owner in Review.
+    pub removed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The Review track of the first song that waits for the owner, so the page can open it.
+    pub track_id: Option<i64>,
+    /// The first song's error, for a request of one song.
+    pub first_error: Option<String>,
 }
 
 /// "Artist – Title" (or just the title) of a request's first song.
@@ -569,13 +603,20 @@ fn summary_sql(extra: &str, filter: &str) -> String {
            coalesce(sum(w.status IN ('pending','downloading')
              OR (w.status='identifying' AND coalesce(t.stage,'') NOT IN ('review','failed'))),0) AS working,
            coalesce(sum(w.status='identifying' AND t.stage IN ('review','failed')),0) AS review,
-           coalesce(sum(w.status='failed'),0) AS failed
+           coalesce(sum(w.status='failed'),0) AS failed,
+           coalesce(sum(w.status='removed'),0) AS removed,
+           r.created_at,r.updated_at,
+           (SELECT t2.id FROM wanted f JOIN tracks t2 ON t2.path=f.staging_path
+             WHERE f.request_id=r.id AND f.status='identifying' AND t2.stage IN ('review','failed')
+             ORDER BY f.position LIMIT 1) AS track_id,
+           (SELECT f.error FROM wanted f WHERE f.request_id=r.id AND f.error IS NOT NULL
+             ORDER BY f.position LIMIT 1) AS first_error
            {extra}
          FROM requests r
          LEFT JOIN wanted w ON w.request_id=r.id
          LEFT JOIN tracks t ON t.path=w.staging_path AND w.status='identifying'
          WHERE {filter}
-         GROUP BY r.id ORDER BY r.id DESC"
+         GROUP BY r.id ORDER BY r.updated_at DESC, r.id DESC"
     )
 }
 
@@ -594,6 +635,9 @@ pub struct WantedView {
     pub artist: Option<String>,
     pub status: String,
     pub error: Option<String>,
+    /// The Review track, while the song waits for the owner.
+    pub track_id: Option<i64>,
+    pub updated_at: String,
 }
 
 pub async fn request_songs(pool: &SqlitePool, request_id: i64) -> Result<Vec<WantedView>> {
@@ -602,7 +646,9 @@ pub async fn request_songs(pool: &SqlitePool, request_id: i64) -> Result<Vec<Wan
            CASE WHEN w.status='identifying' AND t.stage='review' THEN 'review'
                 WHEN w.status='identifying' AND t.stage='failed' THEN 'review'
                 ELSE w.status END AS status,
-           coalesce(w.error, CASE WHEN w.status='identifying' THEN t.stage_message END) AS error
+           coalesce(w.error, CASE WHEN w.status='identifying' THEN t.stage_message END) AS error,
+           CASE WHEN w.status='identifying' AND t.stage IN ('review','failed') THEN t.id END AS track_id,
+           w.updated_at
          FROM wanted w LEFT JOIN tracks t ON t.path=w.staging_path
          WHERE w.request_id=? ORDER BY w.position",
     )
@@ -769,6 +815,68 @@ mod tests {
         assert_eq!((open.summary.total, open.summary.done), (2, 1));
         assert_eq!(open.newly_filed, 0);
         assert_eq!(open.status_message_id, 3);
+    }
+
+    #[tokio::test]
+    async fn a_link_sent_again_reuses_its_request_unless_reading_failed() {
+        let (_directory, pool) = pool().await;
+        let first = create_request(&pool, "https://x/track/1", Scope::Track, "web", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            find_reusable_request(&pool, "https://x/track/1")
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            find_reusable_request(&pool, "https://x/track/2")
+                .await
+                .unwrap(),
+            None
+        );
+        request_failed(&pool, first, "unreadable").await.unwrap();
+        assert_eq!(
+            find_reusable_request(&pool, "https://x/track/1")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_songs_are_not_failed_and_are_not_retried() {
+        let (_directory, pool) = pool().await;
+        let request = create_request(&pool, "https://x/album/1", Scope::Album, "web", None)
+            .await
+            .unwrap();
+        save_collection(
+            &pool,
+            request,
+            "https://x/album/1",
+            Scope::Album,
+            &collection(&["A", "B"]),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE wanted SET status='removed' WHERE title='A'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE wanted SET status='failed',error='boom' WHERE title='B'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let summary = list_requests(&pool, 10).await.unwrap().remove(0);
+        assert_eq!((summary.removed, summary.failed), (1, 1));
+        assert_eq!(summary.first_error.as_deref(), Some("boom"));
+        assert_eq!(retry_failed(&pool, request).await.unwrap(), 1);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM wanted ORDER BY position")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(statuses, vec!["removed", "pending"]);
     }
 
     #[tokio::test]

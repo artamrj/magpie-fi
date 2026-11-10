@@ -25,9 +25,20 @@ pub async fn create_request(
             "magpie-fi can read Spotify, Apple Music, Deezer, YouTube, YouTube Music and Shazam links",
         ));
     };
+    // The same link again: the existing entry is tried again instead of a second one.
+    if let Some(id) = store::find_reusable_request(&s.pool, &link.url).await? {
+        let queued = store::retry_failed(&s.pool, id).await?;
+        store::touch_request(&s.pool, id).await?;
+        if queued > 0 {
+            s.notify_acquire();
+        }
+        return Ok(Json(
+            serde_json::json!({"id": id, "again": true, "queued": queued}),
+        ));
+    }
     let id = store::create_request(&s.pool, &link.url, link.scope, "web", None).await?;
     tokio::spawn(worker::read_request(s.clone(), id, link));
-    Ok(Json(serde_json::json!({"id": id})))
+    Ok(Json(serde_json::json!({"id": id, "again": false})))
 }
 
 /// `GET /api/requests` — the latest requests with their progress.

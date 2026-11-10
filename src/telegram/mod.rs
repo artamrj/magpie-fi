@@ -229,6 +229,16 @@ async fn on_message(context: &Arc<Context>, message: &Message) -> Result<()> {
             .await;
             continue;
         };
+        // The same link again: its failed songs are tried again under a new status message.
+        if let Some(request) = store::find_reusable_request(&context.state.pool, &link.url).await? {
+            let queued = store::retry_failed(&context.state.pool, request).await?;
+            store::touch_request(&context.state.pool, request).await?;
+            if queued > 0 {
+                context.state.notify_acquire();
+            }
+            attach_status_message(context, request, message).await?;
+            continue;
+        }
         let request = store::create_request(
             &context.state.pool,
             &link.url,

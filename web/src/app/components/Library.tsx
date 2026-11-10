@@ -101,6 +101,24 @@ export function Library({
         />
       </label>
 
+      {(recent.data?.length ?? 0) > 0 && (
+        <Section title="Added recently">
+          {recent.data!.slice(0, 6).map((song, index) => (
+            <Cell
+              key={`${song.added_at}-${index}`}
+              lead={
+                <span className="artwork artwork-small">
+                  <Icon name="music" size={18} />
+                </span>
+              }
+              title={song.title ?? "Unknown title"}
+              subtitle={[song.artist, song.album].filter(Boolean).join(" · ")}
+              trailing={<span>{addedWhen(song.added_at)}</span>}
+            />
+          ))}
+        </Section>
+      )}
+
       {artists.isPending ? (
         <section className="section">
           <ListSkeleton rows={4} />
@@ -427,4 +445,15 @@ function ArtistActions({
       {busy && <Cell title="Working…" lead={<Spinner />} />}
     </Section>
   );
+}
+
+function addedWhen(iso: string) {
+  const date = new Date(iso);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString())
+    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }

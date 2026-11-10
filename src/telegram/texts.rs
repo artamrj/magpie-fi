@@ -143,6 +143,13 @@ pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
             "Failed".to_owned()
         });
     }
+    if summary.removed > 0 {
+        details.push(if summary.total > 1 {
+            format!("{} removed", summary.removed)
+        } else {
+            "Removed in Review".to_owned()
+        });
+    }
     if !details.is_empty() {
         text.push_str(&details.join(" · "));
         text.push('\n');
