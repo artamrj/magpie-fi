@@ -227,6 +227,9 @@ export function SongScreen({
           ? `Song ${position.index} of ${position.total}`
           : "Song";
 
+  // On a wide screen the release list and "what changes" sit side by side.
+  const choosing = review && !duplicate && !coverNeeded && track.candidates.length > 0;
+
   return (
     <>
       <PageTitle title={title} onBack={onBack} />
@@ -248,67 +251,76 @@ export function SongScreen({
         <>
           <Explanation track={track} duplicate={duplicate} coverNeeded={coverNeeded} />
 
-          {review && !duplicate && !coverNeeded && track.candidates.length > 0 && (
-            <Section title="Which release?">
-              {track.candidates.slice(0, 5).map((candidate, index) => (
-                <ReleaseOption
-                  key={candidate.id}
-                  track={track}
-                  candidate={candidate}
-                  rank={index + 1}
-                  picked={candidate.id === pickedId}
-                  onPick={() => {
-                    haptic.tap();
-                    setPickedId(candidate.id);
-                  }}
+          <div className={choosing ? "song-columns" : undefined}>
+            {choosing && (
+              <Section title="Which release?" className="song-releases">
+                {track.candidates.slice(0, 5).map((candidate, index) => (
+                  <ReleaseOption
+                    key={candidate.id}
+                    track={track}
+                    candidate={candidate}
+                    rank={index + 1}
+                    picked={candidate.id === pickedId}
+                    onPick={() => {
+                      haptic.tap();
+                      setPickedId(candidate.id);
+                    }}
+                  />
+                ))}
+              </Section>
+            )}
+
+            <div className="song-side">
+              {shown && !duplicate && <Changes track={track} candidate={shown} />}
+
+              <Section title="More">
+                {!problem && (
+                  <Cell
+                    tone="link"
+                    lead={<Icon name="edit" />}
+                    title="Edit the tags myself"
+                    chevron
+                    onClick={() => setEditing(true)}
+                  />
+                )}
+                {chosen && !coverNeeded && (
+                  <Cell
+                    tone="link"
+                    lead={<Icon name="image" />}
+                    title="Choose a different cover"
+                    chevron
+                    onClick={onCover}
+                  />
+                )}
+                {ready && (
+                  <Cell
+                    tone="link"
+                    lead={<Icon name="refresh" />}
+                    title="Put it back in Review"
+                    subtitle="Undo the match and choose again"
+                    disabled={busy === "undo"}
+                    onClick={() => void undo()}
+                  />
+                )}
+                {review && track.candidates.length > 0 && !coverNeeded && (
+                  <Cell
+                    tone="link"
+                    lead={<Icon name="skip" />}
+                    title="Skip for now"
+                    onClick={onNext}
+                  />
+                )}
+                {track.error && <Cell title="Technical details" subtitle={track.error} />}
+                <Cell
+                  tone="danger"
+                  lead={<Icon name="trash" />}
+                  title="Remove this file"
+                  disabled={busy === "remove"}
+                  onClick={() => void remove()}
                 />
-              ))}
-            </Section>
-          )}
-
-          {shown && !duplicate && <Changes track={track} candidate={shown} />}
-
-          <Section title="More">
-            {!problem && (
-              <Cell
-                tone="link"
-                lead={<Icon name="edit" />}
-                title="Edit the tags myself"
-                chevron
-                onClick={() => setEditing(true)}
-              />
-            )}
-            {chosen && !coverNeeded && (
-              <Cell
-                tone="link"
-                lead={<Icon name="image" />}
-                title="Choose a different cover"
-                chevron
-                onClick={onCover}
-              />
-            )}
-            {ready && (
-              <Cell
-                tone="link"
-                lead={<Icon name="refresh" />}
-                title="Put it back in Review"
-                subtitle="Undo the match and choose again"
-                disabled={busy === "undo"}
-                onClick={() => void undo()}
-              />
-            )}
-            {review && track.candidates.length > 0 && !coverNeeded && (
-              <Cell tone="link" lead={<Icon name="skip" />} title="Skip for now" onClick={onNext} />
-            )}
-            {track.error && <Cell title="Technical details" subtitle={track.error} />}
-            <Cell
-              tone="danger"
-              lead={<Icon name="trash" />}
-              title="Remove this file"
-              disabled={busy === "remove"}
-              onClick={() => void remove()}
-            />
-          </Section>
+              </Section>
+            </div>
+          </div>
         </>
       )}
 
