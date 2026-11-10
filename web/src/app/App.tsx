@@ -9,7 +9,7 @@ import { EmptyState } from "./components/EmptyStates";
 import { Library } from "./components/Library";
 import { ReviewList, type Feedback } from "./components/ReviewList";
 import { SongScreen } from "./components/SongScreen";
-import { haptic, startView, telegram, useTelegramBackButton } from "./telegram";
+import { haptic, startTrack, startView, telegram, useTelegramBackButton } from "./telegram";
 import { busyPhases, friendlyError, isProblem, isReview, preferredTrack } from "./trackUtils";
 
 const emptySetup: Setup = {
@@ -66,7 +66,8 @@ export function App() {
   const [tab, setTab] = useState<Tab>(
     startView === "review" ? "review" : tracks.length ? "review" : "add",
   );
-  const [openId, setOpenId] = useState<number>();
+  // A bot question links straight to its song; the song may already be decided or gone.
+  const [openId, setOpenId] = useState<number | undefined>(startTrack);
   const [coverMode, setCoverMode] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [startDecided, setStartDecided] = useState(startView === "review");
@@ -119,6 +120,12 @@ export function App() {
     [tracks],
   );
   const open = tracks.find((track) => track.id === openId);
+  useEffect(() => {
+    if (openId !== undefined && !tracksQuery.isPending && !open) {
+      setOpenId(undefined);
+      if (openId === startTrack) push({ message: "That song is already decided or gone." });
+    }
+  }, [openId, open, tracksQuery.isPending, push]);
   const selected = open ?? (wide && tab === "review" ? preferredTrack(tracks) : undefined);
 
   const goBack = useCallback(() => {

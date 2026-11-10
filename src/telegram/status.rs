@@ -85,33 +85,11 @@ fn keyboard(summary: &store::RequestSummary, finished: bool) -> Option<Value> {
     Some(json!({"inline_keyboard": if row.is_empty() { vec![] } else { vec![row] }}))
 }
 
-/// "Which song is this?" with up to three candidates, for songs sent from
-/// Telegram that wait in review.
+/// "Which song is this?" for songs sent from Telegram that wait in review.
+/// With a Mini App the question has one button that opens the app on that song;
+/// without one (no HTTPS address) up to three candidates are offered in chat.
 async fn ask_reviews(context: &Context) -> Result<()> {
     for question in store::unasked_reviews(&context.state.pool).await? {
-        let candidates: Vec<Choice> = sqlx::query_as(
-            "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
-             ORDER BY score DESC LIMIT 3",
-        )
-        .bind(question.track_id)
-        .fetch_all(&context.state.pool)
-        .await?;
-        let mut rows: Vec<Vec<Value>> = candidates
-            .iter()
-            .map(|choice| {
-                vec![json!({
-                    "text": shorten(&choice.label(), 60),
-                    "callback_data": format!("pick:{}:{}", question.track_id, choice.id),
-                })]
-            })
-            .collect();
-        rows.push(vec![json!({
-            "text": "🗑 None of these",
-            "callback_data": format!("drop:{}", question.track_id),
-        })]);
-        if let Some(url) = super::mini_app_url(&context.state.config.public_url, "review") {
-            rows.push(vec![super::mini_app_button("📱 Open review", &url)]);
-        }
         let song = match &question.artist {
             Some(artist) => format!("{artist} – {}", question.title),
             None => question.title.clone(),
@@ -123,11 +101,14 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         if let Some(reason) = question.reason.as_deref() {
             text.push_str(&format!("\n<i>{}</i>", texts::escape(reason)));
         }
-        text.push_str(if candidates.is_empty() {
-            "\n\nI found nothing that fits. Open Review on the web page to type it in."
-        } else {
-            "\n\nIs it one of these?"
-        });
+        let rows =
+            match super::mini_app_track_url(&context.state.config.public_url, question.track_id) {
+                Some(url) => {
+                    text.push_str("\n\nChoose the right one in the app.");
+                    vec![vec![super::mini_app_button("🎵 Choose in the app", &url)]]
+                }
+                None => chat_choices(context, &question, &mut text).await?,
+            };
         let sent = send_with(
             context,
             question.chat_id,
@@ -141,6 +122,40 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         store::set_review_message(&context.state.pool, question.wanted_id, message).await?;
     }
     Ok(())
+}
+
+/// Candidate buttons for chats without a Mini App.
+async fn chat_choices(
+    context: &Context,
+    question: &store::ReviewQuestion,
+    text: &mut String,
+) -> Result<Vec<Vec<Value>>> {
+    let candidates: Vec<Choice> = sqlx::query_as(
+        "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
+         ORDER BY score DESC LIMIT 3",
+    )
+    .bind(question.track_id)
+    .fetch_all(&context.state.pool)
+    .await?;
+    let mut rows: Vec<Vec<Value>> = candidates
+        .iter()
+        .map(|choice| {
+            vec![json!({
+                "text": shorten(&choice.label(), 60),
+                "callback_data": format!("pick:{}:{}", question.track_id, choice.id),
+            })]
+        })
+        .collect();
+    rows.push(vec![json!({
+        "text": "🗑 None of these",
+        "callback_data": format!("drop:{}", question.track_id),
+    })]);
+    text.push_str(if candidates.is_empty() {
+        "\n\nI found nothing that fits. Open Review on the web page to type it in."
+    } else {
+        "\n\nIs it one of these?"
+    });
+    Ok(rows)
 }
 
 /// A candidate offered as an answer button.

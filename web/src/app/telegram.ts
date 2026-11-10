@@ -98,8 +98,10 @@ export const haptic = {
   error: () => telegram?.HapticFeedback?.notificationOccurred("error"),
 };
 
-/** The view a bot link asks to open first (`?view=review`). */
-export const startView = new URLSearchParams(window.location.search).get("view");
+/** The view a bot link asks to open first (`?view=review`), and the song it points at (`&track=12`). */
+const startParams = new URLSearchParams(window.location.search);
+export const startView = startParams.get("view");
+export const startTrack = Number(startParams.get("track")) || undefined;
 
 /** What a bottom button does. `busy` shows a spinner; `disabled` greys it out. */
 export type ButtonAction = {

@@ -868,6 +868,11 @@ pub fn mini_app_button(text: &str, url: &str) -> Value {
     json!({"text": text, "web_app": {"url": url}})
 }
 
+/// The Mini App opened straight on one song's screen in Review.
+pub fn mini_app_track_url(public_url: &Option<String>, track_id: i64) -> Option<String> {
+    mini_app_url(public_url, "review").map(|url| format!("{url}&track={track_id}"))
+}
+
 /// The web page as a Telegram Mini App. Telegram only opens HTTPS addresses.
 pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
     let url = public_url
@@ -1137,6 +1142,19 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("https://music.example/")
+        );
+    }
+
+    #[test]
+    fn a_review_question_links_to_its_song_in_the_app() {
+        let public = Some("https://music.example".to_owned());
+        assert_eq!(
+            mini_app_track_url(&public, 12).as_deref(),
+            Some("https://music.example/?view=review&track=12")
+        );
+        assert_eq!(
+            mini_app_track_url(&Some("http://nas:7331".to_owned()), 12),
+            None
         );
     }
 

@@ -167,7 +167,9 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
   bot's menu button or "📱 Open review" (`?view=review`).
 - The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
-  Details buttons; "Which song is this?" questions with up to three candidates; `/start`,
+  Details buttons; "Not sure which song this is" questions with one button that opens the Mini
+  App on that song (up to three candidate buttons in chat only when there is no HTTPS address);
+  `/start`,
   `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`.
 
 ### 3.5 The image and deployment
