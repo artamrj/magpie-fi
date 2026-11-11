@@ -264,6 +264,18 @@ pub async fn finished_download(
     .await?)
 }
 
+/// The link a downloaded file was asked for with, while it is being identified.
+pub async fn requested_link(pool: &SqlitePool, staging_path: &Path) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT source_url FROM wanted
+         WHERE staging_path=? AND status='identifying' AND source_url IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(staging_path.to_string_lossy().as_ref())
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// A library file that came from this YouTube video or this source link before.
 pub async fn known_source(
     pool: &SqlitePool,
@@ -751,6 +763,18 @@ mod tests {
         mark_in_library(&pool, b.id, library_b.to_str().unwrap())
             .await
             .unwrap();
+
+        // While it is being identified, the scan can ask which link it came from.
+        assert_eq!(requested_link(&pool, &staging).await.unwrap(), None);
+        sqlx::query("UPDATE wanted SET source_url='https://x/song/1' WHERE id=?")
+            .bind(a.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            requested_link(&pool, &staging).await.unwrap().as_deref(),
+            Some("https://x/song/1")
+        );
 
         let library_a = directory.path().join("A.m4a");
         tokio::fs::write(&library_a, b"a").await.unwrap();

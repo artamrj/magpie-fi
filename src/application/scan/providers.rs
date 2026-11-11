@@ -49,6 +49,12 @@ pub(crate) async fn identify(
     }
     out.extend(query_musicbrainz_text(state, limits, current, filename).await);
     if !provider_disabled(limits, "itunes").await {
+        match query_requested_song(state, path, current, filename).await {
+            Ok(candidate) => out.extend(candidate),
+            Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
+        }
+    }
+    if !provider_disabled(limits, "itunes").await {
         match query_itunes(state, current, filename).await {
             Ok(candidates) => out.extend(candidates),
             Err(error) => handle_provider_error(limits, filename, "itunes", error).await,
@@ -420,6 +426,47 @@ pub(crate) async fn query_youtube(
             Vec::new()
         }
     }
+}
+
+/// The Apple Music number in the link a download was asked for with: an Apple
+/// song link, or a Shazam `/song/<n>/` link (Shazam uses Apple's numbers).
+pub(crate) fn requested_apple_song(url: &str) -> Option<(String, Option<String>)> {
+    use crate::acquire::links::{Scope, Service, classify};
+    let link = classify(url).filter(|link| link.scope == Scope::Track)?;
+    let numbered = !link.id.is_empty() && link.id.chars().all(|c| c.is_ascii_digit());
+    match link.service {
+        Service::Apple if numbered => Some((link.id, link.country)),
+        // Shazam's older /track/ numbers are its own, not Apple's.
+        Service::Shazam if numbered && link.url.contains("/song/") => Some((link.id, None)),
+        _ => None,
+    }
+}
+
+/// The song someone linked, asked for by its number. Apple's search leaves
+/// some releases out ("Donyaye Movazi" by Tqvis & Ferap is found by number
+/// only), and without this the song that was asked for is missing from the
+/// matches. It is scored against the file like any other match.
+pub(crate) async fn query_requested_song(
+    state: &Arc<AppState>,
+    path: &Path,
+    current: &audio::AudioInfo,
+    filename: &str,
+) -> Result<Option<infra_providers::Candidate>> {
+    let Some(url) = crate::acquire::store::requested_link(&state.pool, path).await? else {
+        return Ok(None);
+    };
+    let Some((id, country)) = requested_apple_song(&url) else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let mut candidate =
+        infra_providers::itunes::lookup_song(&state.pool, &state.client, &id, country.as_deref())
+            .await?;
+    if let Some(candidate) = &mut candidate {
+        score_text_candidate(candidate, current, "itunes_requested_link")?;
+    }
+    log_provider_count(filename, "itunes link", candidate.iter().count(), started);
+    Ok(candidate)
 }
 
 pub(crate) async fn query_itunes(
