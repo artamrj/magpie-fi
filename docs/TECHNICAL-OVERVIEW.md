@@ -401,6 +401,12 @@ cheap and free ones first:
 1. **AcoustID** (fingerprint, needs `MAGPIE_ACOUSTID_KEY`) → **MusicBrainz** recordings.
 2. **YouTube Data API**, only if the filename contains a video ID (needs a key).
 3. **MusicBrainz** text search.
+   - **The linked song itself**: when the file was downloaded for an Apple Music song link or a
+     Shazam `/song/<n>/` link, that song is asked from the iTunes Lookup API by its number
+     (`itunes::lookup_song`) and joins the matches. Apple's search leaves some releases out
+     ("Donyaye Movazi" by Tqvis & Ferap is found by number only), so without this Review showed
+     only same-named songs by other singers. It is scored against the file like any other
+     match; the approval rules are unchanged.
 4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack** (an upload site),
    **Navahang** — free
    catalogs, good for Persian and international music. Radio Javan's search also returns

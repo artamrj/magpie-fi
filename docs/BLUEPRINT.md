@@ -161,7 +161,8 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     pick, failed with the reason and a Retry); older entries behind "Show earlier". A song that
     needs a pick opens in Review; an album or playlist opens its songs. Sending the same link
     again retries the existing entry instead of adding a second one; a song removed in Review
-    leaves the list.
+    leaves the list, and sending its link again fetches it again (a removed song inside an
+    album or playlist that still has other songs stays removed).
   - **Review**: songs grouped by what has to happen to them (needs your pick, issues, ready to
     file), with "Accept N confident matches" and "Check and repair" as the first rows. One song
     opens as its own screen that asks one question: which release (a radio list with only the
@@ -171,7 +172,8 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   - **Artists**: song and artist counts, and the artists (rename, join, split a duet, make an
     album that Navidrome shows twice one album, from a bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
     log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar
-    instead, one short line per fact with the details on hover.
+    instead, in rows like the sidebar nav: "Ready" with the song count, then one row only for
+    each problem (bot off, sources missing, no yt-dlp), with a short explanation on hover.
   - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
     wide screen), a search over titles, artists, albums and paths, and one song's tags, cover,
     sound and path with a player. The tags (title, artist, album, album artist, track, disc,
@@ -225,8 +227,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   optional `cookies.txt`.
 - The entrypoint creates magpie-fi's folders, fixes their owner to `PUID:PGID` (never your existing
   music files) and drops to that user.
-- Releases: a `v*` tag builds and pushes the image (Trivy scan included). Dependabot updates
-  Cargo, npm, GitHub Actions and Docker base images monthly.
+- Releases: `scripts/release.sh X.Y.Z` bumps the version everywhere, writes `CHANGELOG.md` from
+  the commit subjects (git-cliff, `cliff.toml`), runs the CI checks, commits and tags locally. A
+  pushed `v*` tag builds and pushes the image (Trivy scan included) and makes the GitHub release
+  with that version's CHANGELOG section as its notes. The Docker build cache lives in the registry
+  (`magpie-fi:buildcache-amd64` / `-arm64`); the Debian update layer is refreshed weekly.
+  Dependabot updates Cargo, npm, GitHub Actions and Docker base images monthly.
 
 ---
 

@@ -180,3 +180,34 @@ export function Icon({
     </svg>
   );
 }
+
+/** The magpie-fi mark: a magpie on its nest, with the song it took. Same drawing as
+ * public/favicon.svg. The wing and eye are cut-outs painted in the tile colour. */
+export function BrandMark({ size = 22 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" fill="currentColor" aria-hidden="true">
+      <path d="M12.5 44.5 31 27.5" stroke="currentColor" strokeWidth="5.4" strokeLinecap="round" />
+      <path d="M21.5 37.4 30 25c3-3 4-7 6.5-10.1 1.5-1.9 3.5-2.9 5.7-2.7 2.8.1 4.8 1.3 5.7 2.6l5.2 1.1-5.2 1.9c-1.9 1.2-2.5 3.2-2.6 5.3-.3 3.9-1.8 6.4-3.1 8.1-2.2 2.8-4.2 4.6-6.5 5.3z" />
+      <path
+        d="M28 37.5 33.6 46.3M32 37.3 37.2 46.6"
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+      />
+      <path
+        d="M20 43.6C24.5 48.8 30.5 51.5 37.5 51.5 45 51.5 50.8 47.8 54 42.2"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="4.4"
+        strokeLinecap="round"
+      />
+      <ellipse cx="44.6" cy="40.4" rx="3.2" ry="2.7" transform="rotate(-20 44.6 40.4)" />
+      <path d="M46.7 40V30.4c2.4.9 4.6 2 5.9 3.2.5.7-.1 1.7-1 1.4L48.7 34v6z" />
+      <path
+        fill="var(--brand-cut, var(--button))"
+        d="M22.6 34.6c5.2-4.4 11.5-9.1 18.5-11 .4 1.4-.1 2.4-.2 3.5-1.4 3.4-2.9 5.4-4.4 6.5-2.5 1.4-5.5 1.6-8.2 1.5z"
+      />
+      <circle cx="43.4" cy="16.3" r="1.5" fill="var(--brand-cut, var(--button))" />
+    </svg>
+  );
+}

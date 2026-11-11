@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys, useSetupQuery, useStatusQuery, useTracksQuery } from "../api/queries";
 import type { Setup } from "../api/types";
-import { Icon, type IconName } from "./Icons";
+import { BrandMark, Icon, type IconName } from "./Icons";
 import { AddMusic } from "./components/AddMusic";
 import { CoverScreen } from "./components/CoverScreen";
 import { EmptyState } from "./components/EmptyStates";
@@ -254,7 +254,7 @@ export function App() {
         <aside className="sidebar">
           <div className="brand">
             <i>
-              <Icon name="music" size={16} />
+              <BrandMark size={24} />
             </i>
             magpie-fi
           </div>

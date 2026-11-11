@@ -27,7 +27,7 @@ pub async fn create_request(
     };
     // The same link again: the existing entry is tried again instead of a second one.
     if let Some(id) = store::find_reusable_request(&s.pool, &link.url).await? {
-        let queued = store::retry_failed(&s.pool, id).await?;
+        let queued = store::ask_again(&s.pool, id).await?;
         store::touch_request(&s.pool, id).await?;
         if queued > 0 {
             s.notify_acquire();

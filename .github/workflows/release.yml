@@ -62,6 +62,7 @@ jobs:
           {
             echo "value=${RELEASE_TAG#v}"
             echo "sha=$(git rev-parse HEAD)"
+            echo "week=$(date -u +%G-W%V)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
@@ -85,8 +86,12 @@ jobs:
             VERSION=${{ steps.version.outputs.value }}
             VCS_REF=${{ steps.version.outputs.sha }}
             SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          cache-from: type=gha,scope=release-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=release-${{ matrix.suffix }}
+            APT_REFRESH=${{ steps.version.outputs.week }}
+          # The build cache lives in the registry next to the image. GitHub's
+          # own cache is capped at 10 GB and the test workflow's Rust caches
+          # kept pushing these layers out, so every release built from zero.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.suffix }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.suffix }},mode=max,image-manifest=true,oci-mediatypes=true
           provenance: mode=max
           sbom: true
 
@@ -166,10 +171,31 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.value }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+          # The notes are this version's section of CHANGELOG.md, which
+          # scripts/release.sh writes from the commit subjects.
+          awk -v v="$VERSION" '
+            /^## / { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            found
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "**Install:** \`docker pull $IMAGE:$VERSION\` (or set \`MAGPIE_TAG=$VERSION\` in \`.env\`)"
+          } >> notes.md
+          if grep -q '^- ' notes.md; then
+            notes=(--notes-file notes.md)
+          else
+            # A tag pushed without scripts/release.sh: fall back to GitHub's list.
+            notes=(--generate-notes)
+          fi
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
               --target "$RELEASE_SHA" \
-              --generate-notes \
-              --title "$RELEASE_TAG"
+              --title "magpie-fi $VERSION" \
+              "${notes[@]}"
+          elif [[ "${notes[0]}" == --notes-file ]]; then
+            # A re-run refreshes the notes instead of leaving old ones.
+            gh release edit "$RELEASE_TAG" --title "magpie-fi $VERSION" --notes-file notes.md
+          fi

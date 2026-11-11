@@ -1023,6 +1023,75 @@ mod tests {
     }
 
     #[test]
+    fn the_apple_number_is_read_from_the_link_a_download_was_asked_for_with() {
+        use super::providers::requested_apple_song;
+        assert_eq!(
+            requested_apple_song(
+                "https://music.apple.com/us/album/donyaye-movazi/1845811122?i=1845811123&uo=4"
+            ),
+            Some(("1845811123".into(), Some("us".into())))
+        );
+        assert_eq!(
+            requested_apple_song("https://www.shazam.com/song/1845811123/donyaye-movazi"),
+            Some(("1845811123".into(), None))
+        );
+        // A whole album, Shazam's own older numbers and other services name no Apple song.
+        for url in [
+            "https://music.apple.com/us/album/donyaye-movazi-single/1845811122",
+            "https://www.shazam.com/track/54321/some-song",
+            "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC",
+        ] {
+            assert_eq!(requested_apple_song(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_linked_song_is_chosen_over_same_named_songs_by_other_singers() {
+        // Apple's search for "Donyaye Movazi" lists only other singers' songs;
+        // the linked one comes from the lookup by number.
+        let info = audio::AudioInfo {
+            title: Some("Donyaye Movazi".into()),
+            artist: Some("Tqvis & Ferap".into()),
+            album: Some("Donyaye Movazi - Single".into()),
+            duration: 201.0,
+            ..Default::default()
+        };
+        let apple = |artist: &str, seconds: f64| infra_providers::Candidate {
+            provider: "itunes".into(),
+            title: "Donyaye Movazi".into(),
+            artist: artist.into(),
+            album: Some("Donyaye Movazi - Single".into()),
+            duration_delta: Some(seconds),
+            ..Default::default()
+        };
+        let mut candidates = vec![
+            apple("Maria", 199.871),
+            apple("Hamed Monavari", 217.8),
+            apple("Tqvis & Ferap", 201.29),
+        ];
+        score_text_candidate(&mut candidates[0], &info, "itunes_catalog_search").unwrap();
+        score_text_candidate(&mut candidates[1], &info, "itunes_catalog_search").unwrap();
+        score_text_candidate(&mut candidates[2], &info, "itunes_requested_link").unwrap();
+        apply_source_agreement(&mut candidates).unwrap();
+        dedupe_candidates(&mut candidates);
+        sort_candidates_for_decision(&mut candidates);
+
+        assert_eq!(candidates[0].artist, "Tqvis & Ferap");
+        let decision = crate::application::smart_approval::rank(
+            crate::application::smart_approval::TrackEvidence {
+                filename: "w12.opus",
+                title: info.title.as_deref(),
+                artist: info.artist.as_deref(),
+                album: info.album.as_deref(),
+                isrc: None,
+            },
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(candidates[decision.candidate_index].artist, "Tqvis & Ferap");
+    }
+
+    #[test]
     fn genius_is_reserved_for_incomplete_or_weak_catalog_results() {
         let complete = infra_providers::Candidate {
             score: 94.0,

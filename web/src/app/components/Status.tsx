@@ -14,6 +14,10 @@ type Fact = {
   detail: string;
   /** A few words, for the sidebar. */
   short: string;
+  /** Something the owner should fix; only these show in the sidebar. */
+  problem?: boolean;
+  /** One short sentence on what is wrong, for the sidebar's hover bubble. */
+  tip?: string;
 };
 
 /** The server's state in plain words, shared by the page list and the sidebar. */
@@ -36,7 +40,9 @@ function facts(setup: Setup): Fact[] {
       detail: bot.configured
         ? `${owners} · ${guests} · files up to 20 MB`
         : "Set MAGPIE_TELEGRAM_BOT_TOKEN and MAGPIE_TELEGRAM_OWNERS",
-      short: bot.configured ? `Bot on · ${owners}` : "Bot off",
+      short: bot.configured ? `Bot on · ${owners}` : "Bot is off",
+      problem: !bot.configured,
+      tip: "Songs can't be sent from Telegram. Set the bot token and owners in .env.",
     },
     {
       icon: missing.length ? "alert" : "check",
@@ -46,6 +52,8 @@ function facts(setup: Setup): Fact[] {
         ? `Missing: ${missing.join(", ")}`
         : "Catalogs, fingerprinting and tools are all available",
       short: `${sourcesReady} of ${sourcesTotal} sources`,
+      problem: missing.length > 0,
+      tip: `Not available: ${missing.join(", ")}.`,
     },
     {
       icon: "folder",
@@ -63,7 +71,9 @@ function facts(setup: Setup): Fact[] {
         setup.lyrics ? "lyrics on" : "lyrics off",
         setup.rsgain ? "album loudness" : "track loudness only",
       ].join(" · "),
-      short: setup.ytdlp ? `${format} · lyrics ${setup.lyrics ? "on" : "off"}` : "yt-dlp missing",
+      short: setup.ytdlp ? `${format} · lyrics ${setup.lyrics ? "on" : "off"}` : "No yt-dlp",
+      problem: !setup.ytdlp,
+      tip: "Links can't be downloaded until yt-dlp is installed.",
     },
   ];
 }
@@ -111,37 +121,40 @@ export function StatusSection({ setup }: { setup: Setup }) {
   );
 }
 
-/** The same facts in one line each, at the foot of the sidebar. Hover a line for the details. */
+/**
+ * The sidebar foot, built from the same rows as the sidebar nav: what the server is doing,
+ * then one row for each thing that needs fixing. Hover a problem for the details; the full
+ * list stays on the Status section.
+ */
 export function SidebarStatus({ setup, activity }: { setup: Setup; activity?: string }) {
   const canLogOut = useCanLogOut();
+  const problems = facts(setup).filter((fact) => fact.problem);
   return (
     <div className="side-status" aria-label="Status">
-      <div className="side-status-head">
-        <i className={activity ? "busy" : ""} />
-        <span>{activity || "Watching the inbox"}</span>
+      <div className="side-status-row">
+        <span className="side-status-dot">
+          <i className={activity ? "busy" : ""} />
+        </span>
+        <span>{activity || "Ready"}</span>
         <small>{setup.library_songs.toLocaleString()} songs</small>
       </div>
-      <ul>
-        {facts(setup).map((fact) => (
-          <li key={fact.title} title={`${fact.title}\n${fact.detail}`}>
-            <Icon
-              name={fact.icon}
-              size={14}
-              style={fact.tone ? { color: toneColor[fact.tone] } : undefined}
-            />
-            <span>{fact.short}</span>
-          </li>
-        ))}
-      </ul>
-      <div className="side-status-foot">
-        <span title="Settings live in the server’s .env file (MAGPIE_…)">Settings: .env</span>
-        {canLogOut && (
-          <button type="button" onClick={() => void logOut()}>
-            <Icon name="logout" size={13} />
-            Log out
-          </button>
-        )}
-      </div>
+      {problems.map((fact) => (
+        <div
+          key={fact.title}
+          className="side-status-row warn"
+          tabIndex={0}
+          data-tip={fact.tip ?? fact.detail}
+        >
+          <Icon name="alert" size={20} />
+          <span>{fact.short}</span>
+        </div>
+      ))}
+      {canLogOut && (
+        <button type="button" className="side-status-row" onClick={() => void logOut()}>
+          <Icon name="logout" size={20} />
+          <span>Log out</span>
+        </button>
+      )}
     </div>
   );
 }

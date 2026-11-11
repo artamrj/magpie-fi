@@ -1345,6 +1345,9 @@ button.tree-row.selected:hover {
     height: 100vh;
   }
   .wide .sidebar {
+    /* Above the list pane, so the status bubbles can open over it. */
+    position: relative;
+    z-index: 2;
     border-right: 0.5px solid var(--sep);
     padding: 18px 12px;
     display: flex;
@@ -1385,95 +1388,113 @@ button.tree-row.selected:hover {
   .wide .sidebar nav .badge {
     margin-left: auto;
   }
-  /* Server status at the foot of the sidebar: one short line per fact, details on hover. */
+  /* Server status at the foot of the sidebar: the same rows as the nav above it. */
   .side-status {
     margin-top: auto;
-    background: var(--section);
-    border-radius: 12px;
-    padding: 10px 12px 8px;
-    font-size: 12px;
-    line-height: 1.35;
-    color: var(--sub);
-  }
-  .side-status-head {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: center;
-    column-gap: 7px;
-    padding-bottom: 8px;
-    border-bottom: 0.5px solid var(--sep);
+    gap: 4px;
   }
-  .side-status-head i {
-    width: 7px;
-    height: 7px;
+  .side-status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 9px 10px;
+    border-radius: 9px;
+    font-size: 15px;
+    font-weight: 500;
+    min-width: 0;
+    cursor: default;
+  }
+  .side-status-row span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* The song count sits where the nav shows its badge. */
+  .side-status-row small {
+    margin-left: auto;
+    flex: none;
+    color: var(--hint);
+    font-size: 13px;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+  }
+  .side-status-row svg {
+    flex: none;
+  }
+  /* The filled-looking triangle reads heavier than the nav's outline icons, so it is drawn
+     a little smaller inside the same 20px slot to keep the column even. */
+  .side-status-row.warn svg {
+    color: var(--warn);
+    width: 17px;
+    height: 17px;
+    margin: 0 1.5px;
+  }
+  button.side-status-row {
+    cursor: pointer;
+  }
+  button.side-status-row:hover {
+    background: var(--fill);
+  }
+  /* A small bubble beside a problem row that says in a few words what is wrong. */
+  .side-status-row[data-tip] {
+    position: relative;
+  }
+  .side-status-row[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    z-index: 20;
+    width: max-content;
+    max-width: 260px;
+    padding: 8px 11px;
+    border-radius: 10px;
+    background: var(--section);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 400;
+    line-height: 1.35;
+    white-space: normal;
+    box-shadow:
+      0 0 0 0.5px var(--sep),
+      0 6px 20px rgb(0 0 0 / 14%);
+    opacity: 0;
+    transform: translate(-4px, -50%);
+    transition:
+      opacity 0.15s ease,
+      transform 0.15s ease;
+    pointer-events: none;
+  }
+  .side-status-row[data-tip]:hover,
+  .side-status-row[data-tip]:focus-visible {
+    background: var(--fill);
+  }
+  .side-status-row[data-tip]:hover::after,
+  .side-status-row[data-tip]:focus-visible::after {
+    opacity: 1;
+    transform: translate(0, -50%);
+  }
+  /* A 20px box like the nav icons, holding a small status dot. */
+  .side-status-dot {
+    flex: none;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+  }
+  .side-status-dot i {
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: var(--good);
     box-shadow: 0 0 0 3px var(--good-soft);
   }
-  .side-status-head i.busy {
+  .side-status-dot i.busy {
     background: var(--accent);
     box-shadow: 0 0 0 3px var(--info-soft);
     animation: pulse 1.4s ease-in-out infinite;
-  }
-  .side-status-head span {
-    color: var(--text);
-    font-weight: 600;
-    font-size: 12.5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .side-status-head small {
-    grid-column: 2;
-    color: var(--hint);
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-  }
-  .side-status ul {
-    list-style: none;
-    margin: 0;
-    padding: 6px 0;
-    display: grid;
-    gap: 1px;
-  }
-  .side-status li {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    padding: 3px 0;
-    min-width: 0;
-    cursor: default;
-  }
-  .side-status li svg {
-    flex: none;
-    color: var(--hint);
-  }
-  .side-status li span {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .side-status-foot {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding-top: 7px;
-    border-top: 0.5px solid var(--sep);
-    color: var(--hint);
-    font-size: 11.5px;
-  }
-  .side-status-foot button {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--link);
-    font-size: 11.5px;
-    font-weight: 500;
-    padding: 2px 0;
-  }
-  .side-status-foot button:hover {
-    text-decoration: underline;
   }
   .wide .pane,
   .wide .detail {

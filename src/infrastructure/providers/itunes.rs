@@ -58,6 +58,52 @@ pub async fn search(
     Ok(out)
 }
 
+/// The one song behind an Apple Music number (a song link, or a Shazam link:
+/// Shazam uses the same numbers). Apple's search leaves some releases out, so
+/// a song someone linked is asked for by its number instead.
+pub async fn lookup_song(
+    pool: &SqlitePool,
+    client: &Client,
+    id: &str,
+    country: Option<&str>,
+) -> Result<Option<Candidate>> {
+    if id.is_empty() || !id.chars().all(|character| character.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let country = country
+        .filter(|code| code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()))
+        .unwrap_or("us")
+        .to_ascii_lowercase();
+    let raw = cached(
+        pool,
+        "itunes",
+        &format!("lookup:{country}:{id}"),
+        Duration::days(7),
+        || async {
+            wait_turn().await;
+            request_json(client.get("https://itunes.apple.com/lookup").query(&[
+                ("id", id),
+                ("entity", "song"),
+                ("country", country.as_str()),
+            ]))
+            .await
+        },
+    )
+    .await?;
+    Ok(parse_lookup(&raw, id))
+}
+
+/// A lookup of an album number lists every song on it; only the song with
+/// exactly this number is the one that was linked.
+fn parse_lookup(raw: &Value, id: &str) -> Option<Candidate> {
+    raw["results"]
+        .as_array()?
+        .iter()
+        .filter(|item| item["wrapperType"] == "track" && item["kind"] == "song")
+        .find(|item| item["trackId"].as_i64().map(|n| n.to_string()).as_deref() == Some(id))
+        .and_then(parse_result)
+}
+
 /// Album covers found by the album's name and artist (`entity=album`), for a
 /// song whose own search returned no usable cover. The caller checks that the
 /// album and artist match the chosen release.
@@ -220,6 +266,37 @@ mod tests {
         // Apple IDs are not MusicBrainz IDs.
         assert!(candidate.recording_id.is_none() && candidate.release_id.is_none());
         assert!(candidate.raw_json.contains("\"trackId\":1"));
+    }
+
+    #[test]
+    fn a_lookup_gives_only_the_song_with_the_linked_number() {
+        let raw = serde_json::json!({"results": [
+            {"wrapperType": "collection", "collectionId": 1845811122,
+             "collectionName": "Donyaye Movazi - Single", "artistName": "Tqvis & Ferap"},
+            {"wrapperType": "track", "kind": "song", "trackId": 1845811123,
+             "trackName": "Donyaye Movazi", "artistName": "Tqvis & Ferap",
+             "collectionName": "Donyaye Movazi - Single", "trackTimeMillis": 201290,
+             "trackNumber": 1, "trackCount": 1}
+        ]});
+        let song = parse_lookup(&raw, "1845811123").unwrap();
+        assert_eq!(song.artist, "Tqvis & Ferap");
+        assert_eq!(song.duration_delta, Some(201.29));
+        // The album's own number is not a song.
+        assert!(parse_lookup(&raw, "1845811122").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lookup_refuses_anything_but_a_number_without_asking_apple() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = crate::infrastructure::db::connect(
+            directory.path().join("itunes.sqlite").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let song = lookup_song(&pool, &Client::new(), "12&term=x", None)
+            .await
+            .unwrap();
+        assert!(song.is_none());
     }
 
     #[test]

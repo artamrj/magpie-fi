@@ -264,6 +264,18 @@ pub async fn finished_download(
     .await?)
 }
 
+/// The link a downloaded file was asked for with, while it is being identified.
+pub async fn requested_link(pool: &SqlitePool, staging_path: &Path) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT source_url FROM wanted
+         WHERE staging_path=? AND status='identifying' AND source_url IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(staging_path.to_string_lossy().as_ref())
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// A library file that came from this YouTube video or this source link before.
 pub async fn known_source(
     pool: &SqlitePool,
@@ -317,6 +329,25 @@ pub async fn retry_failed(pool: &SqlitePool, request_id: i64) -> Result<u64> {
     Ok(sqlx::query(
         "UPDATE wanted SET status='pending',attempts=0,not_before=NULL,error=NULL,updated_at=?
          WHERE request_id=? AND status='failed'",
+    )
+    .bind(now())
+    .bind(request_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// The same link was sent again: its failed songs go back into the queue, and so does a
+/// link whose every song was removed in Review, because sending it again is asking for it
+/// again. A removed song inside an album or playlist that still has other songs stays
+/// removed, so sending the playlist again does not bring back what the owner threw out.
+pub async fn ask_again(pool: &SqlitePool, request_id: i64) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE wanted SET status='pending',attempts=0,not_before=NULL,error=NULL,
+           review_message_id=NULL,review_card=0,updated_at=?
+         WHERE request_id=? AND (status='failed' OR (status='removed' AND NOT EXISTS
+           (SELECT 1 FROM wanted other
+             WHERE other.request_id=wanted.request_id AND other.status!='removed')))",
     )
     .bind(now())
     .bind(request_id)
@@ -900,6 +931,18 @@ mod tests {
             .await
             .unwrap();
 
+        // While it is being identified, the scan can ask which link it came from.
+        assert_eq!(requested_link(&pool, &staging).await.unwrap(), None);
+        sqlx::query("UPDATE wanted SET source_url='https://x/song/1' WHERE id=?")
+            .bind(a.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            requested_link(&pool, &staging).await.unwrap().as_deref(),
+            Some("https://x/song/1")
+        );
+
         let library_a = directory.path().join("A.m4a");
         tokio::fs::write(&library_a, b"a").await.unwrap();
         let requests = finished_download(&pool, &staging, &library_a, "filed")
@@ -1021,6 +1064,65 @@ mod tests {
         assert_eq!(retry_failed(&pool, request).await.unwrap(), 1);
         let statuses: Vec<String> =
             sqlx::query_scalar("SELECT status FROM wanted ORDER BY position")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(statuses, vec!["removed", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn a_removed_song_comes_back_when_its_link_is_sent_again() {
+        let (_directory, pool) = pool().await;
+        let single = create_request(&pool, "https://x/track/1", Scope::Track, "web", None)
+            .await
+            .unwrap();
+        save_collection(
+            &pool,
+            single,
+            "https://x/track/1",
+            Scope::Track,
+            &collection(&["A"]),
+        )
+        .await
+        .unwrap();
+        let album = create_request(&pool, "https://x/album/1", Scope::Album, "web", None)
+            .await
+            .unwrap();
+        save_collection(
+            &pool,
+            album,
+            "https://x/album/1",
+            Scope::Album,
+            &collection(&["B", "C"]),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE wanted SET status='removed',review_message_id=7 WHERE title IN ('A','B')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE wanted SET status='failed',error='boom' WHERE title='C'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The only song of the link was removed: asking again fetches it again, and the
+        // bot may ask about it again.
+        assert_eq!(ask_again(&pool, single).await.unwrap(), 1);
+        let (status, asked): (String, Option<i64>) =
+            sqlx::query_as("SELECT status,review_message_id FROM wanted WHERE title='A'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), asked), ("pending", None));
+
+        // In an album with other songs, only the failed one is tried again.
+        assert_eq!(ask_again(&pool, album).await.unwrap(), 1);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM wanted WHERE request_id=? ORDER BY position")
+                .bind(album)
                 .fetch_all(&pool)
                 .await
                 .unwrap();
