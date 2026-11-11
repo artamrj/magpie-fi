@@ -59,16 +59,19 @@ there, while Premium-only episodes are refused); not Lidarr (no "monitor every a
 2. **Your files are sacred.** Nothing is overwritten (atomic, no-clobber publish). Originals go to
    a trash with retention, never straight to `rm`. Existing library files are indexed, not moved
    or renamed. Their tags change only when you ask: a fix on the Artists page, or a field you
-   edit on the Files tab, written on a copy that replaces the song in one rename. Only magpie-fi
-   writes into `library/`.
+   edit on the Files tab, written on a copy that replaces the song in one rename, after the copy
+   was checked to still be the whole song. Only magpie-fi writes into `library/`.
 3. **Sure → file, unsure → ask.** A song is filed automatically only when the evidence is strong
    (audio recognition or several agreeing sources, matching length, matching version). Everything
    else waits for you. A wrong guess never goes silently into the library.
 4. **One pipeline for every input.** A link, a Telegram file and a dropped file all end up as a
    file in the inbox or in `.magpie-fi/staging/` and go through the same identification and filing.
 5. **One copy per recording.** Duplicates are found by proof (same bytes, same fingerprint, same
-   ISRC or MusicBrainz ID with matching length), never by title alone. A lossless copy replaces a
-   lossy one; anything else that is already there goes to the trash.
+   ISRC or MusicBrainz ID with matching length), never by title alone. When the audio itself is
+   the proof (same bytes, same or similar-sounding fingerprint), a lossless copy replaces a lossy
+   one and anything else that is already there goes to the trash. An ISRC or MusicBrainz ID
+   comes from the chosen match, which can be wrong, so on that alone nothing is trashed or
+   replaced: the song waits in Review as a possible duplicate.
 6. **No Navidrome API.** magpie-fi only writes files (songs with tags, cover and lyrics inside,
    and `.m3u8` playlists).
    Navidrome's file watcher picks them up. No Navidrome credentials, no coupling to its versions.
@@ -139,7 +142,7 @@ were kept on purpose (§8).
 
 | Loop | When | What |
 |---|---|---|
-| Inbox cycle | every `MAGPIE_INBOX_CHECK_SECONDS` (60), or on "Check inbox now" | identify new files, then file everything Ready |
+| Inbox cycle | every `MAGPIE_INBOX_CHECK_SECONDS` (60), or on "Check inbox now" | identify new files (200 per cycle; the next cycle follows at once while more wait), then file everything Ready |
 | Library index | at start, then every 6 hours | index files added by hand, forget deleted ones |
 | Download worker | continuously | works through `wanted`, `MAGPIE_MAX_PARALLEL_DOWNLOADS` at a time |
 | Telegram bot | continuously (long polling) | commands, links, files, buttons; status messages every 3 s |
@@ -242,7 +245,8 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   the best one is supported (recognised by audio, the file's own ISRC with the same length,
   confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
   within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
-  the audio's length. Other releases of the same recording (the single and the album, a store
+  the audio's length. A match from a source that gives no length is not chosen when the sources
+  that do give one are all more than 15 s off. Other releases of the same recording (the single and the album, a store
   that lists fewer singers with the same length, a Persian title in another Latin spelling
   with the same length) are not rivals. Review says in plain words what is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;

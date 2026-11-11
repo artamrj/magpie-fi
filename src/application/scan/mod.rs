@@ -61,6 +61,11 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     }
     let settle = Duration::from_secs(cfg.inbox_settle_seconds);
     let pending = automatic_pending_files(&state.pool, files, downloads, settle).await?;
+    // Found files have their real path, so staging is compared by its real path.
+    let staging = tokio::fs::canonicalize(&cfg.staging_dir)
+        .await
+        .unwrap_or_else(|_| cfg.staging_dir.clone());
+    let (pending, more_waiting) = next_batch(pending, &staging);
     if pending.is_empty() {
         state
             .finish_workflow(WorkflowPhase::Idle, "Inbox: nothing new")
@@ -79,7 +84,22 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
         return Ok(0);
     }
     remember_scanned_files(&state.pool, &snapshot_files).await?;
+    if more_waiting {
+        // The next batch starts right after this one is filed, without
+        // waiting for the next inbox check.
+        state.notify_automation_scheduler();
+    }
     Ok(snapshot_files.len())
+}
+
+/// The files of one inbox check: magpie-fi's own downloads first (someone is
+/// waiting for those), then inbox files in path order, so the songs of one
+/// album folder stay together. Also says whether more files are left.
+fn next_batch(mut pending: Vec<PathBuf>, staging: &Path) -> (Vec<PathBuf>, bool) {
+    pending.sort_by_cached_key(|path| (!path.starts_with(staging), path.clone()));
+    let more_waiting = pending.len() > crate::config::INBOX_BATCH;
+    pending.truncate(crate::config::INBOX_BATCH);
+    (pending, more_waiting)
 }
 
 pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()> {
@@ -392,7 +412,41 @@ async fn run_files(
                 let Some(job) = job else {
                     break;
                 };
-                process_file(&state, &limits, job, total).await;
+                let paths = job
+                    .members
+                    .iter()
+                    .map(|member| member.path.clone())
+                    .collect::<Vec<_>>();
+                // On its own task: a song that makes the identifier panic is
+                // marked failed and shown in Issues, and this worker carries
+                // on with the next song. (When every worker died, the scan
+                // used to wait forever with the workflow slot taken.)
+                let work = AbortOnDrop(tokio::spawn({
+                    let (state, limits) = (state.clone(), limits.clone());
+                    async move { process_file(&state, &limits, job, total).await }
+                }));
+                if let Err(error) = work.finished().await {
+                    tracing::error!(files = ?paths, "identifying a song stopped unexpectedly: {error}");
+                    for path in &paths {
+                        let _ = persist_failed(
+                            &state.pool,
+                            path,
+                            "magpie-fi could not read this file (an unexpected error). \
+                             The other songs were not affected.",
+                        )
+                        .await;
+                    }
+                }
+                // Remembered song by song: after a restart or "Stop" only the
+                // songs that were not finished are identified again, and the
+                // matches already chosen in Review stay chosen. A stopped
+                // song is not finished.
+                if state.workflow_cancelled().await {
+                    break;
+                }
+                if let Err(error) = remember_scanned_files(&state.pool, &paths).await {
+                    tracing::warn!(%error, "could not remember a scanned file");
+                }
             }
         });
     }
@@ -423,6 +477,22 @@ async fn run_files(
             .await;
     }
     Ok(cancelled)
+}
+
+/// A task that stops when its owner is stopped ("Stop" aborts the scan
+/// workers, and the song they are working on must stop with them).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    async fn finished(mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn prepare_input_jobs(
@@ -661,6 +731,28 @@ mod tests {
         assert!(provider_disabled(&limits, "spotify").await);
     }
 
+    #[tokio::test]
+    async fn a_source_that_says_slow_down_in_other_words_is_paused_too() {
+        for (source, answer) in [
+            ("itunes", "HTTP status client error (403 Forbidden) for url"),
+            ("deezer", "Deezer error 4: Quota limit exceeded"),
+            (
+                "genius",
+                "HTTP status server error (503 Service Unavailable)",
+            ),
+            ("shazam", "SongRec: rate limit reached"),
+        ] {
+            let limits = limits();
+            handle_provider_error(&limits, "a.mp3", source, anyhow::anyhow!(answer)).await;
+            assert!(provider_disabled(&limits, source).await, "{source}");
+        }
+        // Any other failure is only logged: the next song asks again.
+        let limits = limits();
+        let other = anyhow::anyhow!("error decoding response body");
+        handle_provider_error(&limits, "a.mp3", "itunes", other).await;
+        assert!(!provider_disabled(&limits, "itunes").await);
+    }
+
     #[test]
     fn discovery_skips_hidden_and_nas_folders() {
         let directory = tempfile::tempdir().unwrap();
@@ -685,6 +777,26 @@ mod tests {
             .canonicalize()
             .unwrap();
         assert_eq!(files, vec![expected]);
+    }
+
+    #[test]
+    fn a_big_inbox_is_taken_in_batches_with_downloads_first() {
+        let staging = Path::new("/music/.magpie-fi/staging");
+        let mut pending = (0..crate::config::INBOX_BATCH + 5)
+            .map(|number| PathBuf::from(format!("/music/inbox/Album/{number:04}.mp3")))
+            .collect::<Vec<_>>();
+        pending.push(staging.join("download.m4a"));
+
+        let (batch, more_waiting) = next_batch(pending, staging);
+
+        assert!(more_waiting);
+        assert_eq!(batch.len(), crate::config::INBOX_BATCH);
+        assert_eq!(batch[0], staging.join("download.m4a"));
+        assert_eq!(batch[1], PathBuf::from("/music/inbox/Album/0000.mp3"));
+
+        let (batch, more_waiting) = next_batch(vec![PathBuf::from("/music/inbox/a.mp3")], staging);
+        assert_eq!(batch.len(), 1);
+        assert!(!more_waiting);
     }
 
     #[tokio::test]

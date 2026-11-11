@@ -86,6 +86,60 @@ impl AppState {
         };
     }
 
+    /// Runs `work` in the workflow slot and frees the slot when it ends.
+    /// `None` when another workflow holds the slot.
+    ///
+    /// The work runs on its own task. The page gives up on a request after
+    /// 30 s and a browser tab can close at any time; the request is then
+    /// dropped, but the work still finishes (an artist is never left half
+    /// renamed) and the slot is freed. It is freed after a panic as well, so
+    /// one bad song cannot block every later scan and filing until a restart.
+    pub async fn run_in_workflow<T, F>(
+        self: &Arc<Self>,
+        phase: WorkflowPhase,
+        message: impl Into<String>,
+        work: F,
+    ) -> Option<Result<T, tokio::task::JoinError>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if !self.try_claim_workflow(phase, message).await {
+            return None;
+        }
+        let state = self.clone();
+        let finished = tokio::spawn(async move {
+            let outcome = tokio::spawn(work).await;
+            state.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+            outcome
+        });
+        Some(finished.await.and_then(|outcome| outcome))
+    }
+
+    /// Runs work that already holds the workflow slot on its own task. When
+    /// the work panics, the panic stays inside that task: the slot is given
+    /// back with a "failed" status the page shows, and `None` is returned.
+    /// Without this, one song that trips a bug would block every later scan
+    /// and filing until a restart.
+    pub async fn guard_workflow<T, F>(self: &Arc<Self>, what: &'static str, work: F) -> Option<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::spawn(work).await {
+            Ok(done) => Some(done),
+            Err(error) => {
+                tracing::error!("{what} stopped unexpectedly: {error}");
+                self.reset_workflow(
+                    WorkflowPhase::Failed,
+                    format!("{what} stopped unexpectedly. It will be tried again."),
+                )
+                .await;
+                None
+            }
+        }
+    }
+
     pub async fn cancel_workflow(&self) {
         self.workflow.write().await.cancelled = true;
     }
@@ -182,5 +236,83 @@ mod tests {
         );
         assert!(!state.try_claim_workflow(WorkflowPhase::Scan, "Third").await);
         assert_eq!(state.workflow.read().await.phase, WorkflowPhase::Scan);
+    }
+
+    async fn test_state(name: &str) -> (tempfile::TempDir, Arc<AppState>) {
+        let directory = tempfile::tempdir().unwrap();
+        let pool =
+            crate::infrastructure::db::connect(directory.path().join(name).to_str().unwrap())
+                .await
+                .unwrap();
+        (directory, Arc::new(AppState::new(Config::default(), pool)))
+    }
+
+    #[tokio::test]
+    async fn work_finishes_and_frees_the_slot_when_the_request_is_dropped() {
+        let (_directory, state) = test_state("dropped-request.sqlite").await;
+        let (started, wait_for_start) = tokio::sync::oneshot::channel::<()>();
+        let (let_finish, finish) = tokio::sync::oneshot::channel::<()>();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let request = tokio::spawn({
+            let (state, done) = (state.clone(), done.clone());
+            async move {
+                state
+                    .run_in_workflow(WorkflowPhase::Apply, "Renaming", async move {
+                        started.send(()).unwrap();
+                        finish.await.unwrap();
+                        done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .await
+            }
+        });
+        wait_for_start.await.unwrap();
+        // The browser gave up: the request is dropped in the middle of the work.
+        request.abort();
+        let _ = request.await;
+        assert!(state.workflow_running().await);
+
+        let_finish.send(()).unwrap();
+        for _ in 0..200 {
+            if !state.workflow_running().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!state.workflow_running().await);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_work_frees_the_slot() {
+        let (_directory, state) = test_state("panic.sqlite").await;
+        let outcome = state
+            .run_in_workflow(WorkflowPhase::Apply, "Saving", async {
+                panic!("a song nobody expected");
+            })
+            .await;
+        assert!(matches!(outcome, Some(Err(_))));
+        assert!(!state.workflow_running().await);
+
+        assert!(state.try_claim_workflow(WorkflowPhase::Scan, "Scan").await);
+        let guarded: Option<()> = state
+            .guard_workflow("The inbox check", async {
+                panic!("a song nobody expected");
+            })
+            .await;
+        assert!(guarded.is_none());
+        assert!(!state.workflow_running().await);
+        assert_eq!(state.workflow.read().await.phase, WorkflowPhase::Failed);
+        assert_eq!(
+            state.guard_workflow("The inbox check", async { 7 }).await,
+            Some(7)
+        );
+
+        // And the slot is refused, not queued, while something else runs.
+        assert!(state.try_claim_workflow(WorkflowPhase::Scan, "Scan").await);
+        let refused = state
+            .run_in_workflow(WorkflowPhase::Apply, "Saving", async {})
+            .await;
+        assert!(refused.is_none());
     }
 }

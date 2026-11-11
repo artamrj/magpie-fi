@@ -42,25 +42,26 @@ pub async fn change_artist(
     Path(id): Path<i64>,
     Json(change): Json<ArtistChange>,
 ) -> ApiResult<Json<Changed>> {
-    if !s
-        .try_claim_workflow(WorkflowPhase::Apply, "Updating an artist in the library")
-        .await
-    {
-        return Err(ApiError::conflict(
-            "Wait for the current scan or write operation to finish",
-        ));
-    }
-    let result = match change {
-        ArtistChange::Rename { name } => artist_changes::rename(&s, id, &name).await,
-        ArtistChange::Merge { into } => artist_changes::merge(&s, id, into).await,
-        ArtistChange::Split { parts } => artist_changes::split(&s, id, &parts).await,
-        ArtistChange::OneArtist => artist_changes::mark_one_artist(&s.pool, id)
-            .await
-            .map(|()| Changed::default()),
-        ArtistChange::JoinAlbum { key } => album_changes::join(&s, id, &key).await,
+    let state = s.clone();
+    let work = async move {
+        let s = state;
+        match change {
+            ArtistChange::Rename { name } => artist_changes::rename(&s, id, &name).await,
+            ArtistChange::Merge { into } => artist_changes::merge(&s, id, into).await,
+            ArtistChange::Split { parts } => artist_changes::split(&s, id, &parts).await,
+            ArtistChange::OneArtist => artist_changes::mark_one_artist(&s.pool, id)
+                .await
+                .map(|()| Changed::default()),
+            ArtistChange::JoinAlbum { key } => album_changes::join(&s, id, &key).await,
+        }
     };
-    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-    result
-        .map(Json)
-        .map_err(|error| ApiError::validation(format!("{error:#}")))
+    in_workflow(
+        &s,
+        WorkflowPhase::Apply,
+        "Updating an artist in the library",
+        work,
+    )
+    .await?
+    .map(Json)
+    .map_err(|error| ApiError::validation(format!("{error:#}")))
 }

@@ -460,7 +460,17 @@ async fn rename_folder(state: &Arc<AppState>, from: &Path, to: &Path) -> Result<
         .to_string_lossy();
     let temporary = from.with_file_name(format!(".{name}.magpie-fi-rename"));
     tokio::fs::rename(from, &temporary).await?;
-    tokio::fs::rename(&temporary, to).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, to).await {
+        // Back to its old name: a hidden folder would vanish from the library.
+        tokio::fs::rename(&temporary, from).await.with_context(|| {
+            format!(
+                "the artist folder is left as {} and must be renamed back by hand",
+                temporary.display()
+            )
+        })?;
+        return Err(error)
+            .with_context(|| format!("could not rename {} to {}", from.display(), to.display()));
+    }
     for song in &songs {
         let Ok(rest) = song.strip_prefix(from) else {
             continue;
@@ -511,13 +521,25 @@ pub(crate) async fn move_song(
     tokio::fs::rename(from, to)
         .await
         .with_context(|| format!("could not move {} to {}", from.display(), to.display()))?;
+    let trash = &state.config.trash_dir;
     for sidecar in lyrics::sidecars(from) {
-        if let Some(extension) = sidecar.extension() {
-            let _ = tokio::fs::rename(&sidecar, to.with_extension(extension)).await;
+        let Some(extension) = sidecar.extension() else {
+            continue;
+        };
+        let target = to.with_extension(extension);
+        // A rename would silently replace lyrics that are already there
+        // (another format of the same song), so those are kept and this
+        // file goes to the trash.
+        if tokio::fs::try_exists(&target).await.unwrap_or(true) {
+            if let Err(error) = library::move_to_trash(trash, root, &sidecar).await {
+                tracing::warn!(%error, file = %sidecar.display(), "could not move a lyrics file to the trash");
+            }
+        } else {
+            let _ = tokio::fs::rename(&sidecar, &target).await;
         }
     }
     if let (Some(old_album), Some(new_album)) = (from.parent(), to.parent()) {
-        move_lonely_covers(old_album, new_album).await;
+        move_lonely_covers(trash, root, old_album, new_album).await;
     }
     sqlx::query("UPDATE library_items SET path=? WHERE path=?")
         .bind(to.to_string_lossy().as_ref())
@@ -530,7 +552,8 @@ pub(crate) async fn move_song(
 }
 
 /// When only cover images are left in the old album folder, they follow.
-async fn move_lonely_covers(old_album: &Path, new_album: &Path) {
+/// A cover the new folder already has is kept; the old one goes to the trash.
+async fn move_lonely_covers(trash: &Path, root: &Path, old_album: &Path, new_album: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(old_album).await else {
         return;
     };
@@ -546,10 +569,17 @@ async fn move_lonely_covers(old_album: &Path, new_album: &Path) {
     for cover in covers {
         if let Some(name) = cover.file_name() {
             let target = new_album.join(name);
-            if tokio::fs::try_exists(&target).await.unwrap_or(true) {
-                let _ = tokio::fs::remove_file(&cover).await;
-            } else {
-                let _ = tokio::fs::rename(&cover, &target).await;
+            match tokio::fs::try_exists(&target).await {
+                Ok(true) => {
+                    if let Err(error) = library::move_to_trash(trash, root, &cover).await {
+                        tracing::warn!(%error, file = %cover.display(), "could not move a cover to the trash");
+                    }
+                }
+                Ok(false) => {
+                    let _ = tokio::fs::rename(&cover, &target).await;
+                }
+                // Unknown: leave the cover where it is.
+                Err(_) => {}
             }
         }
     }
@@ -569,6 +599,78 @@ mod tests {
                 .await
                 .unwrap();
         Arc::new(AppState::new(config, pool))
+    }
+
+    #[tokio::test]
+    async fn moving_a_song_never_overwrites_lyrics_or_deletes_a_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path()).await;
+        let root = PathBuf::from(&state.config.output_dir);
+        let old_album = root.join("Old/Album");
+        let new_album = root.join("New/Album");
+        std::fs::create_dir_all(&old_album).unwrap();
+        std::fs::create_dir_all(&new_album).unwrap();
+        // The new folder already has the song in another format, its lyrics and a cover.
+        std::fs::write(new_album.join("01 - Song.flac"), b"flac").unwrap();
+        std::fs::write(new_album.join("01 - Song.lrc"), b"lyrics that were there").unwrap();
+        std::fs::write(new_album.join("cover.jpg"), b"cover that was there").unwrap();
+        let from = old_album.join("01 - Song.mp3");
+        std::fs::write(&from, b"mp3").unwrap();
+        std::fs::write(old_album.join("01 - Song.lrc"), b"lyrics that move").unwrap();
+        std::fs::write(old_album.join("cover.jpg"), b"cover that moves").unwrap();
+
+        let to = new_album.join("01 - Song.mp3");
+        move_song(&state, &root, &from, &to).await.unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"mp3");
+        assert_eq!(
+            std::fs::read(new_album.join("01 - Song.lrc")).unwrap(),
+            b"lyrics that were there"
+        );
+        assert_eq!(
+            std::fs::read(new_album.join("cover.jpg")).unwrap(),
+            b"cover that was there"
+        );
+        // What could not move is in the trash, not gone.
+        let trashed = crate::application::files::audio_files(&state.config.trash_dir).0;
+        assert!(trashed.is_empty());
+        let mut kept = Vec::new();
+        for entry in walkdir::WalkDir::new(&state.config.trash_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            kept.push(std::fs::read(entry.path()).unwrap());
+        }
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![b"cover that moves".to_vec(), b"lyrics that move".to_vec()]
+        );
+        assert!(!old_album.exists(), "the empty old folder is removed");
+    }
+
+    #[tokio::test]
+    async fn a_folder_rename_that_fails_puts_the_folder_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path()).await;
+        let root = PathBuf::from(&state.config.output_dir);
+        let from = root.join("Artist");
+        std::fs::create_dir_all(from.join("Album")).unwrap();
+        std::fs::write(from.join("Album/01 - Song.mp3"), b"mp3").unwrap();
+        // The new name is taken by a folder with songs: the rename cannot happen.
+        let to = root.join("Taken");
+        std::fs::create_dir_all(to.join("Album")).unwrap();
+        std::fs::write(to.join("Album/other.mp3"), b"other").unwrap();
+
+        assert!(rename_folder(&state, &from, &to).await.is_err());
+
+        assert_eq!(
+            std::fs::read(from.join("Album/01 - Song.mp3")).unwrap(),
+            b"mp3"
+        );
+        assert_eq!(std::fs::read(to.join("Album/other.mp3")).unwrap(), b"other");
+        assert!(!root.join(".Artist.magpie-fi-rename").exists());
     }
 
     /// A filed song by `artist`, with its index row.

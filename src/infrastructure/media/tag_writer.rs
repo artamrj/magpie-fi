@@ -572,7 +572,7 @@ pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
             let updated = if match_key(&display) == old_key {
                 joined.clone()
             } else if display.contains(old) {
-                display.replace(old, &joined)
+                replace_whole_name(&display, old, &joined)
             } else {
                 display.clone()
             };
@@ -954,6 +954,8 @@ pub fn write_resilient(
     }
 }
 
+const TAG_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
     let extension = detected_container_extension(path).unwrap_or_else(|| {
         path.extension()
@@ -971,7 +973,8 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
         extension
     ));
     let _ = std::fs::remove_file(&repaired);
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -993,14 +996,31 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
             "-1",
             "-y",
         ])
-        .arg(&repaired)
-        .output()
-        .context("could not start FFmpeg for lossless tag cleanup")?;
+        .arg(&repaired);
+    let output = crate::infrastructure::process::run_blocking(command, TAG_CLEANUP_TIMEOUT)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&repaired);
+        })
+        .context("lossless tag cleanup did not finish")?;
     if !output.status.success() || !repaired.is_file() {
         let _ = std::fs::remove_file(&repaired);
         bail!(
             "FFmpeg could not remove malformed metadata: {}",
             String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // Damaged parts are skipped while copying. A copy that came out shorter
+    // must not be filed as the whole song.
+    if let (Ok(before), Ok(after)) = (
+        crate::domain::audio::read(path),
+        crate::domain::audio::read(&repaired),
+    ) && before.duration - after.duration > 1.0
+    {
+        let _ = std::fs::remove_file(&repaired);
+        bail!(
+            "the tags of this file are damaged and removing them would cut the song from {:.0} s to {:.0} s",
+            before.duration,
+            after.duration
         );
     }
     std::fs::rename(&repaired, path).with_context(|| {
@@ -1013,7 +1033,8 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
 }
 
 fn detected_container_extension(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("ffprobe")
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -1022,9 +1043,10 @@ fn detected_container_extension(path: &Path) -> Option<String> {
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let output =
+        crate::infrastructure::process::run_blocking(command, std::time::Duration::from_secs(60))
+            .ok()?;
     let format = String::from_utf8_lossy(&output.stdout);
     let names = format.trim().split(',').collect::<Vec<_>>();
     if names
@@ -1301,9 +1323,47 @@ fn optional(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
     }
 }
 
+/// Replaces `old` in a display artist ("A & B feat. C") only where it stands
+/// as a whole name. Renaming "Ebi" must not touch "Debi Nova".
+fn replace_whole_name(display: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return display.to_owned();
+    }
+    let mut out = String::with_capacity(display.len());
+    let mut rest = display;
+    let mut before: Option<char> = None;
+    while let Some(index) = rest.find(old) {
+        let after = rest[index + old.len()..].chars().next();
+        let previous = rest[..index].chars().next_back().or(before);
+        let whole = !previous.is_some_and(char::is_alphanumeric)
+            && !after.is_some_and(char::is_alphanumeric);
+        out.push_str(&rest[..index]);
+        out.push_str(if whole { new } else { old });
+        before = old.chars().next_back();
+        rest = &rest[index + old.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_an_artist_leaves_longer_names_alone() {
+        assert_eq!(
+            replace_whole_name("Debi Nova & Ebi", "Ebi", "Ebrahim"),
+            "Debi Nova & Ebrahim"
+        );
+        assert_eq!(replace_whole_name("Ebi feat. Ebi", "Ebi", "X"), "X feat. X");
+        assert_eq!(replace_whole_name("Ebiii, Ebi", "Ebi", "X"), "Ebiii, X");
+        assert_eq!(
+            replace_whole_name("ابی و ابیات", "ابی", "Ebi"),
+            "Ebi و ابیات"
+        );
+        assert_eq!(replace_whole_name("Ebi", "", "X"), "Ebi");
+    }
     use lofty::picture::MimeType;
 
     fn one_pixel_png() -> Vec<u8> {

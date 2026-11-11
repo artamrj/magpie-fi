@@ -39,6 +39,29 @@ pub use tracks::{
     return_to_review, search_artwork, select_candidate, track_audio, update_artwork,
 };
 
+/// Runs a request's work in the workflow slot (see [`AppState::run_in_workflow`]):
+/// it finishes and frees the slot even when the page stops waiting for the answer.
+async fn in_workflow<T, F>(
+    s: &Arc<AppState>,
+    phase: WorkflowPhase,
+    message: &'static str,
+    work: F,
+) -> ApiResult<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match s.run_in_workflow(phase, message, work).await {
+        Some(Ok(done)) => Ok(done),
+        Some(Err(error)) => Err(ApiError::Internal(anyhow::anyhow!(
+            "the work stopped unexpectedly: {error}"
+        ))),
+        None => Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        )),
+    }
+}
+
 /// `GET /api/status`: what the background workflow is doing.
 pub async fn workspace(State(s): State<Arc<AppState>>) -> Json<Workflow> {
     Json(s.workflow.read().await.clone())

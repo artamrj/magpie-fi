@@ -72,24 +72,19 @@ pub async fn save_song(
     State(s): State<Arc<AppState>>,
     Json(body): Json<SongEdit>,
 ) -> ApiResult<Json<Saved>> {
-    if !s
-        .try_claim_workflow(WorkflowPhase::Apply, "Saving a song's tags")
+    let state = s.clone();
+    let work = async move {
+        file_browser::edit_song(
+            &state.pool,
+            &library(&state),
+            &body.path,
+            &body.version,
+            &body.changes,
+        )
         .await
-    {
-        return Err(ApiError::conflict(
-            "Wait for the current scan or write operation to finish",
-        ));
-    }
-    let result = file_browser::edit_song(
-        &s.pool,
-        &library(&s),
-        &body.path,
-        &body.version,
-        &body.changes,
-    )
-    .await;
-    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-    Ok(Json(result?))
+    };
+    let saved = in_workflow(&s, WorkflowPhase::Apply, "Saving a song's tags", work).await?;
+    Ok(Json(saved?))
 }
 
 #[derive(Deserialize)]
@@ -103,17 +98,17 @@ pub async fn save_songs(
     State(s): State<Arc<AppState>>,
     Json(body): Json<SongEdits>,
 ) -> ApiResult<Json<SavedMany>> {
-    if !s
-        .try_claim_workflow(WorkflowPhase::Apply, "Saving tags of several songs")
-        .await
-    {
-        return Err(ApiError::conflict(
-            "Wait for the current scan or write operation to finish",
-        ));
-    }
-    let result = file_browser::edit_songs(&s.pool, &library(&s), &body.edits).await;
-    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-    Ok(Json(result?))
+    let state = s.clone();
+    let work =
+        async move { file_browser::edit_songs(&state.pool, &library(&state), &body.edits).await };
+    let saved = in_workflow(
+        &s,
+        WorkflowPhase::Apply,
+        "Saving tags of several songs",
+        work,
+    )
+    .await?;
+    Ok(Json(saved?))
 }
 
 /// `GET /api/files/folder-tags?path=` — the songs directly in a folder and

@@ -91,7 +91,14 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
 
 1. Read the configuration, create the inbox, library, trash, staging and data folders, connect
    to SQLite (WAL, `0600` file), run migrations. Tracks left `processing` by a restart are marked
-   failed; expired source answers are removed.
+   failed; expired source answers are removed. What a restart interrupted is settled once
+   (`acquire::worker::resume_after_restart`, `library::recover_leftovers`): downloads start
+   again; a file that was being received from Telegram and a link that was still being read
+   are marked failed with "send it again"; half-received files in `staging/.part` are removed;
+   hidden work copies left in the library (`.Song.mp3.magpie-fi-…`, `.Song.tag-clean-…`) go to
+   the trash; an artist folder caught half-way through a rename (`.Artist.magpie-fi-rename`)
+   gets its old name back. Every background loop (inbox, downloads, bot, maintenance) is
+   started again when it stops unexpectedly (`keep_running` in `main.rs`).
 2. Run the daily cache cleanup if it has not run today, empty trash days older than
    `MAGPIE_TRASH_DAYS`, and enforce the media-cache limit.
 3. Start the background tasks:
@@ -119,6 +126,11 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
    Songs still waiting for a pick (or waiting as a duplicate) whose file you deleted from the
    inbox are dropped from Review (`forget_deleted_songs`). A song with a chosen match is kept,
    and nothing is dropped while the inbox folder cannot be read.
+   One cycle takes at most `INBOX_BATCH` (200) files: magpie-fi's own downloads first, then
+   inbox files in path order. A bigger inbox is worked through batch by batch, each batch filed
+   before the next starts, and the next cycle follows at once. Each file is written to
+   `automatic_scan_files` as soon as it is identified, so a restart or "Stop" only repeats the
+   files that were not finished and keeps the picks already made in Review.
 3. For each file, in parallel: read tags and audio properties, check decodability (cached),
    compute a Chromaprint fingerprint (cached) or fall back to SHA-256.
 4. Group duplicates inside the inbox (§8) before any network lookup.
@@ -129,8 +141,9 @@ Each duplicate group is one job (`scan::process::process_file`). A job gets two 
 
 1. **Corrupt** files are marked `corrupt` and go to Issues.
 2. **Identify** with the source cascade (§10). A source that answers 401 (wrong key) is skipped
-   for the rest of that check. A 429 or a timeout pauses it for 30 s, doubling up to 5 minutes,
-   after which it is asked again. iTunes gets at most one search every 3 s (Apple allows ~20 a
+   for the rest of that check. A 429, a 403, a 503, a "quota" or "rate limit" answer or a
+   timeout pauses it for 30 s, doubling up to 5 minutes, after which it is asked again. A song
+   that makes the identifier panic is marked failed (Issues) and the scan carries on. iTunes gets at most one search every 3 s (Apple allows ~20 a
    minute).
 3. **Sort** candidates by trust tier, then score.
 4. **Smart auto-selection** (§9) decides. No candidates → `unmatched`; candidates that fail the
@@ -267,6 +280,14 @@ string, ISRC or MusicBrainz recording ID match **and** the durations are within 
 when the fingerprints **sound the same** (`domain::fingerprint::similarity` ≥ 0.85, best of ±15 s
 offsets; re-encodes score 0.95–1.0, different songs 0.45–0.69) with durations within 3 seconds.
 
+What happens next depends on the proof (`LibraryEntry::proven_by_audio`). Identical content, the
+same fingerprint or the same sound are proof about the file itself: a lossless file replaces a
+lossy library copy, and any other new copy goes to the trash. An ISRC or MusicBrainz recording
+ID belongs to the chosen match, not to the file, and a match can be wrong (a remaster or a
+re-recording matched to the original). On that alone nothing is trashed or replaced: the song
+goes back to Review as "Possible duplicate", and **File anyway** files it next to the other one.
+A file proven by audio is preferred over one found by ID.
+
 **Possible duplicates.** Without that proof, a song with the same title key (`feat.` removed,
 spelling unified), a length within 3 s and an overlapping primary artist (in any order or
 spelling) goes back to Review as "Possible duplicate" before filing. **File anyway** files it.
@@ -351,7 +372,10 @@ A candidate is approved automatically only when:
   (`names::loose_title_key`: the artist Latin key, plus the ezafe "-ye"/"-yeh"/"-e" dropped
   from words that are not last, so "Gheseh Eshgh" = "Ghesseyeh Eshgh");
 - its version tags match the file's (`session` counts as a version, so "Marie (Dach Session)" is
-  not "Marie"), and its length is at most 15 s off the audio.
+  not "Marie"), and its length is at most 15 s off the audio. A match from a source that gives
+  no length (Genius, some Radio Javan pages) is checked through the sources that list the same
+  song with one: when even the closest of those is more than 15 s off, the match is not chosen
+  automatically, however many sources agree on the name. Audio recognition needs no length.
 
 **The best match is kept, cover or not** (`scan::process::decide`). The chosen release is
 completed and needs title, artist, album and a verified cover. Correct tags matter more than a
@@ -547,10 +571,28 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 - **External tools**: the integrity check, fingerprint, repair, rsgain and SongRec run
   through `infrastructure::process`: whether a tool is installed is checked once per
   run, and every call has a timeout after which the process is killed (e.g. 3 min for a
-  fingerprint, 30 min for rsgain on one album). yt-dlp calls have their own timeouts
+  fingerprint, 30 min for rsgain on one album). Code that is not async (tag reading and
+  writing) uses `process::run_blocking`, with the same rule: ffprobe 60 s, the lossless tag
+  cleanup 5 min, WAV/AIFF → FLAC 15 min. yt-dlp calls have their own timeouts
   (`MAGPIE_MAX_DOWNLOAD_SECONDS` for a download, default 15 min).
 - **One workflow at a time**: an inbox cycle, "File now", auto-approve and "Check & fix" never run
   together (`try_claim_workflow`). `POST /api/stop` asks the running one to stop at a safe point.
+  Work that a request does itself (artist changes, saving tags, "Accept confident matches") goes
+  through `AppState::run_in_workflow`: it runs on its own task, so it finishes and frees the slot
+  even when the page stops waiting (it gives up after 30 s) or the work panics. Jobs that
+  already hold the slot (the inbox cycle, filing, "Check & fix", tidying) run under
+  `AppState::guard_workflow`: a panic gives the slot back with a "failed" status.
+- **Changing a song that is already in the library** (`files::edit_on_copy`: Files tab, artist
+  and album fixes, lyrics tidy) happens on a hidden copy. Before the copy replaces the song it
+  must still read as audio of the same length (within 1 s) and is flushed to disk. Moving a
+  song never overwrites a lyrics file or deletes a cover that is already in the new folder: the
+  one that cannot move goes to the trash. Renaming an artist replaces the name only where it
+  stands as a whole name ("Ebi" does not change "Debi Nova").
+- **Library index**: when a library folder cannot be read (a disk that is not mounted), no song
+  is forgotten in that pass.
+- **WAV/AIFF → FLAC** is decided by what is inside the file, not by its name, so an MP3 named
+  `.wav` is copied and never re-encoded. A tag cleanup that would shorten a song by more than
+  1 s is refused and the song goes to Issues.
 
 ---
 

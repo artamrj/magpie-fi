@@ -577,7 +577,9 @@ fn parse_supported_credit(value: &str) -> Vec<ArtistCredit> {
     let mut rest = clean_text(value);
     let mut out = Vec::new();
     while !rest.is_empty() {
-        let lower = rest.to_lowercase();
+        // ASCII lower-casing keeps byte positions, so they are safe to cut
+        // `rest` at; full lower-casing changes the length of "İ" or "ẞ".
+        let lower = rest.to_ascii_lowercase();
         let next = [" / ", " feat. ", " feat ", " ft. ", " ft ", "; "]
             .into_iter()
             .filter_map(|separator| lower.find(separator).map(|index| (index, separator)))
@@ -606,7 +608,8 @@ fn normalize_join_phrase(value: &str) -> String {
 
 fn remove_feature_clause(title: &str) -> (String, Option<String>) {
     let title = clean_text(title);
-    let lower = title.to_lowercase();
+    // Byte positions must match `title` (see `parse_supported_credit`).
+    let lower = title.to_ascii_lowercase();
     for marker in ["(feat. ", "(feat ", "(ft. ", "(ft ", "(featuring "] {
         if let Some(start) = lower.find(marker)
             && let Some(relative_close) = title[start + marker.len()..].find(')')
@@ -636,6 +639,28 @@ fn same_name(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letters_that_change_length_in_lower_case_do_not_break_the_cut() {
+        // "İ" grows and "ẞ" shrinks when lower-cased; cutting at a position
+        // taken from the lower-cased text used to panic inside a letter.
+        let names = |value: &str| {
+            parse_supported_credit(value)
+                .into_iter()
+                .map(|credit| credit.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("İİİİ ft. Öz"), ["İİİİ", "Öz"]);
+        assert_eq!(names("GROẞẞẞ / Öz"), ["GROẞẞẞ", "Öz"]);
+        assert_eq!(
+            remove_feature_clause("İİİİİİ (Feat. Öz)"),
+            ("İİİİİİ".to_owned(), Some("Öz".to_owned()))
+        );
+        assert_eq!(
+            remove_feature_clause("GROẞẞẞ FT. Öz"),
+            ("GROẞẞẞ".to_owned(), Some("Öz".to_owned()))
+        );
+    }
 
     #[test]
     fn the_files_main_singer_goes_first_whatever_a_source_said() {

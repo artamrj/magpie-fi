@@ -13,6 +13,11 @@ pub const USER_AGENT: &str = concat!(
     " ( https://github.com/artamrj/magpie-fi )"
 );
 
+/// Inbox files identified in one inbox check. A bigger inbox is worked through
+/// in batches of this size, each filed before the next starts: the first songs
+/// of a few thousand reach the library within the hour, not after a day, and
+/// Review fills up bit by bit.
+pub const INBOX_BATCH: usize = 200;
 /// Files read and fingerprinted at the same time during an inbox check.
 pub const SCAN_WORKERS: usize = 6;
 pub const FINGERPRINT_WORKERS: usize = 3;

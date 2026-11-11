@@ -102,17 +102,15 @@ pub async fn remove_track(
 pub async fn auto_approve_review(
     State(s): State<Arc<AppState>>,
 ) -> ApiResult<Json<AutoApproveResult>> {
-    if !s
-        .try_claim_workflow(WorkflowPhase::Fetch, "Approving matches in review")
-        .await
-    {
-        return Err(ApiError::conflict(
-            "Wait for the current scan or write operation to finish",
-        ));
-    }
-    let result = approve_review_tracks(&s).await;
-    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-    result.map(Json)
+    let state = s.clone();
+    in_workflow(
+        &s,
+        WorkflowPhase::Fetch,
+        "Approving matches in review",
+        async move { approve_review_tracks(&state).await },
+    )
+    .await?
+    .map(Json)
 }
 
 async fn approve_review_tracks(s: &AppState) -> ApiResult<AutoApproveResult> {
@@ -814,7 +812,11 @@ pub async fn original_artwork_preview(
         tag_writer::read_artwork(std::path::Path::new(&track.path))
     })
     .await
-    .map_err(anyhow::Error::from)??
+    .map_err(anyhow::Error::from)?
+    // A file that cannot be read (damaged, or gone) has no picture to show.
+    // That is "not found" like any song without one, not a server error.
+    .ok()
+    .flatten()
     .ok_or_else(|| ApiError::not_found("No embedded artwork is available for this track"))?;
     artwork_response(artwork)
 }

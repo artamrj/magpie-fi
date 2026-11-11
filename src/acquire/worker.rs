@@ -45,13 +45,22 @@ impl From<anyhow::Error> for Failure {
     }
 }
 
-/// Runs forever: claims due songs, at most `max_parallel_downloads` at a time.
-pub async fn run(state: Arc<AppState>) {
+/// Once, when magpie-fi starts and nothing is being read or downloaded yet:
+/// what a restart interrupted starts again (or is marked failed when it
+/// cannot). Not part of [`run`], which may be started again while downloads
+/// of the stopped run are still going.
+pub async fn resume_after_restart(state: &AppState) {
     match store::reset_interrupted(&state.pool).await {
         Ok(0) => {}
         Ok(count) => tracing::info!(count, "resuming downloads interrupted by a restart"),
         Err(error) => tracing::warn!(%error, "could not resume interrupted downloads"),
     }
+    // Half-received files of the stopped run; they are magpie-fi's own.
+    let _ = tokio::fs::remove_dir_all(state.config.staging_dir.join(".part")).await;
+}
+
+/// Runs forever: claims due songs, at most `max_parallel_downloads` at a time.
+pub async fn run(state: Arc<AppState>) {
     let parallel = state.config.max_parallel_downloads;
     let slots = Arc::new(Semaphore::new(parallel));
     let library = Arc::new(LibraryIndex::default());

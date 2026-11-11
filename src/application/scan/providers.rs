@@ -1157,7 +1157,16 @@ pub(crate) async fn handle_provider_error(
             "authentication failed; check the configured API key/token",
             true,
         ))
-    } else if lower.contains("429 too many requests") {
+    } else if lower.contains("429 too many requests")
+        // Sources also say "slow down" in other words: Apple and sites behind
+        // Cloudflare answer 403, Deezer names its quota, a busy server 503.
+        // Each of these pauses the source for a while, so a long scan does
+        // not keep knocking and get the address blocked.
+        || lower.contains("403 forbidden")
+        || lower.contains("503 service unavailable")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+    {
         Some(("rate limited by provider", false))
     } else if lower.contains("504 gateway timeout") || lower.contains("timed out") {
         Some(("provider timed out", false))
