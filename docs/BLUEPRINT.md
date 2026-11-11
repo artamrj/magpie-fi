@@ -252,6 +252,13 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   singer is put back first. A single's album artist follows. Such a match is also not an exact
   artist match: it is filed on its own only with the audio or a second source agreeing. Review
   shows "Lists X first" or "Leaves out X" on such a match.
+- **A stage name alone is the same person.** Sources spell singers shorter: Shazam gives "MJ
+  feat. Tataloo & Orchid" and Deezer "MJ" for a file tagged "Amir Tataloo feat. Sohrab MJ &
+  Orchid". A name that is the end of another one ("Tataloo" of "Amir Tataloo") is that person;
+  a first name alone ("Amir") is not. When a match names exactly the file's singers, it is told
+  the file's way as soon as it is found, before Review, ranking and approval: the file's order,
+  the fuller spelling of each name. So Review shows what would really be written, and two
+  sources that spell the same singers differently are one recording, not two.
 - **Verified covers.** A cover must belong to the chosen release, download, decode, and not be
   blank or tiny. No verified cover → no filing (the song waits in Review). A cover verified for
   one track of an album is reused for the others.

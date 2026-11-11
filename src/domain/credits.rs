@@ -125,6 +125,12 @@ pub fn normalize_structured(display: &str, title: &str, mut artists: Vec<ArtistC
         credit.name = prefer_latin_alias(&credit.name);
     }
     artists.retain(|credit| !credit.name.is_empty());
+    // Only the display text: read it the plain way. The featured singers in the title must
+    // join the display artist, not replace it ("Amir Tataloo" + "… (feat. Sohrab MJ &
+    // Orchid)" used to become "Sohrab MJ & Orchid").
+    if artists.is_empty() {
+        return normalize_featured(display, title);
+    }
     apply_display_joins(display, &mut artists);
     for credit in &mut artists {
         credit.join_phrase = normalize_join_phrase(&credit.join_phrase);
@@ -151,9 +157,6 @@ pub fn normalize_structured(display: &str, title: &str, mut artists: Vec<ArtistC
             }
             artists.push(ArtistCredit::new(featured.name, ""));
         }
-    }
-    if artists.is_empty() {
-        return normalize_featured(display, &title);
     }
     Credits {
         artist: display_artist(&artists),
@@ -260,6 +263,127 @@ pub fn loose_names(value: &str) -> Vec<String> {
     names
 }
 
+/// `short` is `full` with its first word(s) left off: the stage name or surname alone.
+/// Catalogs credit "Tataloo" for "Amir Tataloo" and "MJ" for "Sohrab MJ". Only the end of
+/// the name counts: a first name alone ("Amir", "Sohrab") is shared by too many people.
+pub fn is_short_form(short: &str, full: &str) -> bool {
+    let (short, full) = (identity_key(short), identity_key(full));
+    short.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+        && full.len() > short.len()
+        && full.ends_with(&format!(" {short}"))
+}
+
+/// Two names in the credits of one song are the same person: the same name, or one is the
+/// other's short form ([`is_short_form`]).
+pub fn same_person(left: &str, right: &str) -> bool {
+    same_name(left, right) || is_short_form(left, right) || is_short_form(right, left)
+}
+
+/// The match's credit told the way the file tells it, when both name exactly the same
+/// people. Sources list the same singers in another order or spell them shorter: Shazam
+/// gives "MJ feat. Tataloo & Orchid" and Deezer "Amir Tataloo & MJ & Orchid" for a file
+/// tagged "Amir Tataloo feat. Sohrab MJ & Orchid". The file's order wins (its first name
+/// is the main singer, the others are featured) and the fuller spelling of each name wins.
+/// When the order already agrees, only the spellings change and the source's joins stay.
+/// A credit with someone the file doesn't name, or without someone it does, is left alone.
+/// Returns whether anything changed.
+pub fn align_with_file(
+    artists: Vec<ArtistCredit>,
+    file_artist: &str,
+    file_title: &str,
+) -> (Vec<ArtistCredit>, bool) {
+    let file_people = individual_names(&normalize_featured(file_artist, file_title).artists)
+        .iter()
+        .flat_map(|name| loose_names(name))
+        .collect::<Vec<_>>();
+    let match_people = artists
+        .iter()
+        .flat_map(|credit| {
+            let names = loose_names(&credit.name);
+            // A MusicBrainz ID belongs to the whole credit: keep it only for one person.
+            let id = (names.len() == 1)
+                .then(|| credit.musicbrainz_id.clone())
+                .flatten();
+            names.into_iter().map(move |name| (name, id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if file_people.is_empty() || file_people.len() != match_people.len() {
+        return (artists, false);
+    }
+    // Which source name is which file name; each source name is used once.
+    let mut order = Vec::with_capacity(file_people.len());
+    for person in &file_people {
+        let Some(index) = (0..match_people.len())
+            .find(|index| !order.contains(index) && same_person(&match_people[*index].0, person))
+        else {
+            return (artists, false);
+        };
+        order.push(index);
+    }
+    let fuller = |source: &str, file: &str| {
+        if is_short_form(source, file) {
+            file.to_owned()
+        } else {
+            source.to_owned()
+        }
+    };
+    let reordered = order.iter().enumerate().any(|(at, index)| at != *index);
+    if !reordered {
+        let respelled = file_people
+            .iter()
+            .zip(&match_people)
+            .any(|(file, (source, _))| is_short_form(source, file));
+        if !respelled {
+            return (artists, false);
+        }
+        let mut people = file_people.iter();
+        let artists = artists
+            .into_iter()
+            .map(|credit| ArtistCredit {
+                name: respell_loose(&credit.name, |source| {
+                    people
+                        .next()
+                        .map_or_else(|| source.to_owned(), |file| fuller(source, file))
+                }),
+                ..credit
+            })
+            .collect();
+        return (artists, true);
+    }
+    let count = order.len();
+    let artists = file_people
+        .iter()
+        .zip(&order)
+        .enumerate()
+        .map(|(at, (file, index))| {
+            let (source, id) = &match_people[*index];
+            let join = match (at, count - at) {
+                (_, 1) => "",
+                (0, _) => " feat. ",
+                _ => " & ",
+            };
+            ArtistCredit {
+                musicbrainz_id: id.clone(),
+                ..ArtistCredit::new(fuller(source, file), join)
+            }
+        })
+        .collect();
+    (artists, true)
+}
+
+/// `value` with every loose name passed through `respell`, its separators kept.
+fn respell_loose(value: &str, mut respell: impl FnMut(&str) -> String) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some((index, length)) = next_loose_separator(rest) {
+        out.push_str(&respell(&clean_text(&rest[..index])));
+        out.push_str(&rest[index..index + length]);
+        rest = &rest[index + length..];
+    }
+    out.push_str(&respell(&clean_text(rest)));
+    clean_text(&out)
+}
+
 /// Puts the file's main singer back when a source credits only the featured singers
 /// ("Sohrab MJ & Orchid" for a file tagged "Amir Tataloo feat. Sohrab MJ & Orchid"). Only
 /// when every name the source gives is also in the file, so a match by someone else, or the
@@ -274,7 +398,7 @@ pub fn restore_missing_main(
         .iter()
         .flat_map(|credit| loose_names(&credit.name))
         .collect::<Vec<_>>();
-    if match_names.is_empty() || match_names.iter().any(|name| same_name(name, main)) {
+    if match_names.is_empty() || match_names.iter().any(|name| same_person(name, main)) {
         return (artists, false);
     }
     let file_names = normalize_featured(file_artist, file_title)
@@ -285,7 +409,7 @@ pub fn restore_missing_main(
         .collect::<Vec<_>>();
     let all_in_file = match_names
         .iter()
-        .all(|name| file_names.iter().any(|other| same_name(other, name)));
+        .all(|name| file_names.iter().any(|other| same_person(other, name)));
     if !all_in_file {
         return (artists, false);
     }
@@ -301,7 +425,7 @@ pub fn restore_missing_main(
 /// main; the others become featured. Returns whether anything moved.
 pub fn keep_main_first(mut artists: Vec<ArtistCredit>, main: &str) -> (Vec<ArtistCredit>, bool) {
     let is_main = |credit: &ArtistCredit| {
-        same_name(&credit.name, main) || same_name(&loose_first_name(&credit.name), main)
+        same_person(&credit.name, main) || same_person(&loose_first_name(&credit.name), main)
     };
     let Some(index) = artists.iter().position(is_main) else {
         return (artists, false);
@@ -310,6 +434,9 @@ pub fn keep_main_first(mut artists: Vec<ArtistCredit>, main: &str) -> (Vec<Artis
         return (artists, false);
     }
     let mut primary = artists.remove(index);
+    if is_short_form(&primary.name, main) {
+        primary.name = main.to_owned();
+    }
     primary.join_phrase = " feat. ".into();
     artists.insert(0, primary);
     if let Some(last) = artists.last_mut() {
@@ -442,6 +569,72 @@ mod tests {
         let source = normalize_featured("Amir Tataloo feat. Sohrab MJ", "").artists;
         assert!(!restore_missing_main(source, "امیر تتلو", "امیر تتلو feat. Sohrab MJ", "").1);
         assert_eq!(loose_names("Sohrab MJ & Orchid"), ["Sohrab MJ", "Orchid"]);
+    }
+
+    #[test]
+    fn featured_singers_in_the_title_join_the_main_singer() {
+        // Apple Music gives a plain artist and the featured singers in the title.
+        let credits = normalize_structured(
+            "Amir Tataloo",
+            "Male Man Bash (feat. Sohrab MJ & Orchid)",
+            Vec::new(),
+        );
+        assert_eq!(credits.artist, "Amir Tataloo feat. Sohrab MJ & Orchid");
+        assert_eq!(credits.title, "Male Man Bash");
+    }
+
+    #[test]
+    fn a_stage_name_alone_is_the_same_person() {
+        assert!(same_person("Tataloo", "Amir Tataloo"));
+        assert!(same_person("Sohrab MJ", "MJ"));
+        assert!(same_person("تتلو", "امیر تتلو"));
+        // A first name alone is not enough, nor is a different surname.
+        assert!(!same_person("Amir", "Amir Tataloo"));
+        assert!(!same_person("Sohrab MJ", "Sohrab Pakzad"));
+        assert!(!same_person("Taloo", "Amir Tataloo"));
+    }
+
+    #[test]
+    fn the_same_singers_are_told_the_way_the_file_tells_them() {
+        let file = "Amir Tataloo feat. Sohrab MJ & Orchid";
+        let aligned = |artist: &str, title: &str| {
+            let source = normalize_structured(artist, title, Vec::new()).artists;
+            let (artists, changed) = align_with_file(source, file, "Male Man Bash");
+            (display_artist(&artists), changed)
+        };
+        // Shazam: a featured singer first and shorter spellings.
+        assert_eq!(
+            aligned("MJ feat. Tataloo & Orchid", "Male Man Bash"),
+            (file.into(), true)
+        );
+        assert_eq!(
+            aligned("MJ", "Male Man Bash (feat. Tataloo & Orchid)"),
+            (file.into(), true)
+        );
+        // Deezer: the right order, "MJ" for "Sohrab MJ"; its joins stay.
+        assert_eq!(
+            aligned("Amir Tataloo & MJ & Orchid", "Male Man Bash"),
+            ("Amir Tataloo & Sohrab MJ & Orchid".into(), true)
+        );
+        // Apple Music and SoundCloud already agree.
+        assert_eq!(
+            aligned("Amir Tataloo", "Male Man Bash (feat. Sohrab MJ & Orchid)"),
+            (file.into(), false)
+        );
+        // Someone the file doesn't name, or a singer missing: left alone.
+        assert_eq!(
+            aligned("MJ feat. Tataloo & Someone", "Male Man Bash"),
+            ("MJ feat. Tataloo & Someone".into(), false)
+        );
+        assert_eq!(
+            aligned("Sohrab Pakzad", "Male Man Bash"),
+            ("Sohrab Pakzad".into(), false)
+        );
+        // A band named with "&" in the same order is not split.
+        let source = normalize_featured("Simon & Garfunkel", "").artists;
+        let (artists, changed) = align_with_file(source, "Simon and Garfunkel", "");
+        assert!(!changed);
+        assert_eq!(display_artist(&artists), "Simon & Garfunkel");
     }
 
     #[test]

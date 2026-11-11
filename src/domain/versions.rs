@@ -184,11 +184,9 @@ pub fn artists_similarity(left: &str, right: &str) -> f64 {
     let direct = artist_similarity(left, right);
     let (left_names, right_names) = (split_names(left), split_names(right));
     let covers = |names: &[String], others: &[String]| {
-        names.iter().all(|name| {
-            others
-                .iter()
-                .any(|other| artist_similarity(name, other) >= 0.9)
-        })
+        names
+            .iter()
+            .all(|name| others.iter().any(|other| same_performer(name, other)))
     };
     if left_names.len() > 1
         && left_names.len() == right_names.len()
@@ -212,11 +210,15 @@ pub fn credit_within(left: &str, right: &str) -> bool {
         (right_names, left_names)
     };
     !shorter.is_empty()
-        && shorter.iter().all(|name| {
-            longer
-                .iter()
-                .any(|other| artist_similarity(name, other) >= 0.9)
-        })
+        && shorter
+            .iter()
+            .all(|name| longer.iter().any(|other| same_performer(name, other)))
+}
+
+/// Two credited names are one person: nearly the same spelling, or one is the other's
+/// stage name or surname alone ("Tataloo" = "Amir Tataloo", "MJ" = "Sohrab MJ").
+fn same_performer(left: &str, right: &str) -> bool {
+    artist_similarity(left, right) >= 0.9 || super::credits::same_person(left, right)
 }
 
 pub fn credited_artist_similarity(
@@ -231,11 +233,7 @@ pub fn credited_artist_similarity(
     performers.extend(title_credits(candidate_title));
     let mut shared = performers
         .iter()
-        .filter(|performer| {
-            credited
-                .iter()
-                .any(|name| artist_similarity(name, performer) >= 0.9)
-        })
+        .filter(|performer| credited.iter().any(|name| same_performer(name, performer)))
         .map(|performer| normalized_text(performer))
         .collect::<Vec<_>>();
     shared.sort();
@@ -269,7 +267,7 @@ fn leaves_out_main_singer(file_artist: &str, file_title: &str, performers: &[Str
     let credits = |name: &str| {
         performers
             .iter()
-            .any(|performer| artist_similarity(name, performer) >= 0.9)
+            .any(|performer| same_performer(name, performer))
     };
     !credits(main) && featured.iter().any(|name| credits(name))
 }

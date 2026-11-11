@@ -144,21 +144,33 @@ fn parse_results(raw: &Value) -> Vec<Candidate> {
         .into_iter()
         .flatten()
         .filter_map(|track| {
-            let mut artist_credits = track["contributors"]
+            let contributors = track["contributors"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|artist| artist["name"].as_str())
-                .map(|name| ArtistCredit::new(name, ""))
+                .filter_map(|artist| {
+                    let featured = artist["role"].as_str() == Some("Featured");
+                    Some((artist["name"].as_str()?, featured))
+                })
+                .collect::<Vec<_>>();
+            // Main singers first, then the featured ones after "feat.": Deezer says who is
+            // which, and "Amir Tataloo & MJ & Orchid" would lose that.
+            let (featured, main): (Vec<_>, Vec<_>) = contributors
+                .into_iter()
+                .partition(|(_, featured)| *featured);
+            let mut artist_credits = main
+                .iter()
+                .chain(&featured)
+                .map(|(name, _)| ArtistCredit::new(*name, " & "))
                 .collect::<Vec<_>>();
             if artist_credits.is_empty() {
                 artist_credits.push(ArtistCredit::new(track["artist"]["name"].as_str()?, ""));
             }
-            if artist_credits.len() > 1 {
-                let last = artist_credits.len() - 1;
-                for credit in &mut artist_credits[..last] {
-                    credit.join_phrase = " & ".into();
-                }
+            if !main.is_empty() && !featured.is_empty() {
+                artist_credits[main.len() - 1].join_phrase = " feat. ".into();
+            }
+            if let Some(last) = artist_credits.last_mut() {
+                last.join_phrase.clear();
             }
             Some(Candidate {
                 provider: "deezer".into(),
@@ -184,6 +196,31 @@ fn parse_results(raw: &Value) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn featured_contributors_follow_feat() {
+        let raw = serde_json::json!({"data": [{
+            "title": "Male Man Bash",
+            "artist": {"name": "Amir Tataloo"},
+            "contributors": [
+                {"name": "Amir Tataloo", "role": "Main"},
+                {"name": "MJ", "role": "Featured"},
+                {"name": "Orchid", "role": "Featured"}
+            ]
+        }]});
+        let candidates = parse_results(&raw);
+        assert_eq!(candidates[0].artist, "Amir Tataloo feat. MJ & Orchid");
+
+        let duet = serde_json::json!({"data": [{
+            "title": "Duet",
+            "artist": {"name": "Ebi"},
+            "contributors": [
+                {"name": "Ebi", "role": "Main"},
+                {"name": "Shadmehr Aghili", "role": "Main"}
+            ]
+        }]});
+        assert_eq!(parse_results(&duet)[0].artist, "Ebi & Shadmehr Aghili");
+    }
 
     #[test]
     fn album_covers_carry_their_album_and_artist() {
