@@ -389,6 +389,15 @@ pub fn clean_video_title(title: &str, artists: &[String]) -> String {
     }
 }
 
+/// True when the title names a different version of a song (live, remix,
+/// cover, sped up…).
+pub fn has_version_words(title: &str) -> bool {
+    let normalized = format!(" {} ", normalize(title));
+    VARIANT_WORDS
+        .iter()
+        .any(|word| normalized.contains(&format!(" {word} ")))
+}
+
 fn variant_penalty(target_title: &str, candidate_title: &str) -> f64 {
     let wanted = format!(" {} ", normalize(target_title));
     let found = format!(" {} ", normalize(candidate_title));
@@ -540,5 +549,15 @@ mod tests {
         assert_eq!(clean_channel_name("Daft Punk - Topic"), "Daft Punk");
         assert_eq!(clean_channel_name("AdeleVEVO"), "Adele");
         assert_eq!(bracket_notes("A (b) [c]"), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn version_words_in_a_title_are_noticed() {
+        assert!(has_version_words("Blinding Lights (Live at Wembley)"));
+        assert!(has_version_words("Blinding Lights - Sped Up"));
+        assert!(!has_version_words(
+            "The Weeknd - Blinding Lights (Official Video)"
+        ));
+        assert!(!has_version_words("Delivery"));
     }
 }

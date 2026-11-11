@@ -9,11 +9,14 @@
 //! | Spotify | embed page | embed page | embed page (as many songs as it shows) |
 //! | Apple Music | iTunes Lookup API | iTunes Lookup API | public playlist page |
 //! | Deezer | public API | public API | public API |
-//! | YouTube / YouTube Music | yt-dlp | — | yt-dlp |
+//! | YouTube / YouTube Music | yt-dlp (a music video becomes its studio song) | yt-dlp (YouTube Music album) | yt-dlp |
 //! | Shazam | song page | — | — |
 //! | Radio Javan | podcast episode (public API) | — | — |
 
-use super::ytdlp;
+use super::{
+    matching::{self, Target},
+    worker, ytdlp,
+};
 use crate::{
     config::Config,
     infrastructure::providers::{self, text},
@@ -155,9 +158,20 @@ pub fn classify(raw: &str) -> Option<Link> {
             if let Some(video) = query("v") {
                 link(Service::YouTube, Scope::Track, &video, None)
             } else if let Some(list) = query("list") {
-                link(Service::YouTube, Scope::Playlist, &list, None)
+                // YouTube Music keeps every album as an "OLAK5uy_…" list.
+                let scope = if list.starts_with(ALBUM_LIST_PREFIX) {
+                    Scope::Album
+                } else {
+                    Scope::Playlist
+                };
+                link(Service::YouTube, scope, &list, None)
             } else if parts.first() == Some(&"shorts") {
                 link(Service::YouTube, Scope::Track, parts.get(1)?, None)
+            } else if parts.first() == Some(&"browse")
+                && parts.get(1)?.starts_with(ALBUM_PAGE_PREFIX)
+            {
+                // music.youtube.com/browse/MPREb_…: a YouTube Music album page.
+                link(Service::YouTube, Scope::Album, parts.get(1)?, None)
             } else {
                 None
             }
@@ -533,24 +547,113 @@ fn deezer_track(track: &Value, album: Option<String>) -> Wanted {
 
 // ── YouTube and Shazam ──────────────────────────────────────────────────────
 
+/// YouTube Music album pages (`/browse/MPREb_…`) and the album lists they open.
+const ALBUM_PAGE_PREFIX: &str = "MPREb_";
+const ALBUM_LIST_PREFIX: &str = "OLAK5uy_";
+
 async fn youtube(config: &Config, link: &Link) -> Result<Collection> {
     if link.scope == Scope::Track {
         let entry = ytdlp::details(config, &link.id).await?;
         return Ok(Collection {
-            songs: vec![youtube_song(entry)],
+            songs: vec![studio_version(config, entry).await],
             ..Collection::default()
         });
     }
-    let listing = ytdlp::playlist(
-        config,
-        &format!("https://www.youtube.com/playlist?list={}", link.id),
-    )
-    .await?;
+    let url = if link.id.starts_with(ALBUM_PAGE_PREFIX) {
+        format!("https://music.youtube.com/browse/{}", link.id)
+    } else {
+        format!("https://www.youtube.com/playlist?list={}", link.id)
+    };
+    let listing = ytdlp::playlist(config, &url).await?;
+    if link.scope == Scope::Album {
+        return Ok(youtube_album(listing));
+    }
     Ok(Collection {
         title: listing.title,
         owner: listing.owner,
         songs: listing.entries.into_iter().map(youtube_song).collect(),
     })
+}
+
+/// A pasted music video becomes the same song's YouTube Music studio upload,
+/// so the file has no intro, skit or outro. The video stays the source when
+/// it is a live, remix or other version, or when no studio upload clearly
+/// matches. The pasted link stays as `source_url`, so pasting it again finds
+/// the song already in the library.
+async fn studio_version(config: &Config, video: ytdlp::Entry) -> Wanted {
+    if video.music_track || matching::has_version_words(&video.title) {
+        return youtube_song(video);
+    }
+    let target = Target {
+        title: matching::clean_video_title(&video.title, &video.artists),
+        artist: (!video.artists.is_empty()).then(|| video.artists.join(", ")),
+        // A music video is longer than the song, so its length can't be compared.
+        duration: None,
+    };
+    let found = match worker::youtube_music_song(config, &target, matching::STRICT).await {
+        Ok(found) => found.filter(|song| fits_in_video(song.duration, video.duration)),
+        Err(error) => {
+            tracing::warn!(%error, video = %video.id, "could not look for the studio song; using the video");
+            None
+        }
+    };
+    let mut song = youtube_song(video);
+    if let Some(found) = found {
+        tracing::info!(video = ?song.youtube_id, song = %found.id, "music video swapped for its studio song");
+        song.title = found.title;
+        if !found.artists.is_empty() {
+            song.artist = Some(found.artists.join(", "));
+        }
+        song.duration = found.duration;
+        song.youtube_id = Some(found.id);
+    }
+    song
+}
+
+/// The studio song is at most a little longer than its music video, and not
+/// so much shorter that it is likely a different track (an interlude, or one
+/// song of a "full album" video).
+fn fits_in_video(song: Option<f64>, video: Option<f64>) -> bool {
+    match (song, video) {
+        (Some(song), Some(video)) => song <= video + 15.0 && song >= video * 0.4,
+        _ => true,
+    }
+}
+
+/// A YouTube Music album in album order. yt-dlp names it "Album - <name>"
+/// (or "EP - …", "Single - …"), and the songs' channel is the singer.
+fn youtube_album(listing: ytdlp::Listing) -> Collection {
+    let album = listing.title.as_deref().map(album_name);
+    let songs: Vec<Wanted> = listing
+        .entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut song = youtube_song(entry);
+            if album.is_some() {
+                song.album = album.clone();
+            }
+            song.track_number = i64::try_from(index + 1).ok();
+            song
+        })
+        .collect();
+    let owner = listing
+        .owner
+        .or_else(|| songs.iter().find_map(|song| song.artist.clone()));
+    Collection {
+        title: album,
+        owner,
+        songs,
+    }
+}
+
+fn album_name(title: &str) -> String {
+    ["Album - ", "EP - ", "Single - "]
+        .iter()
+        .find_map(|prefix| title.strip_prefix(prefix))
+        .unwrap_or(title)
+        .trim()
+        .to_owned()
 }
 
 fn youtube_song(entry: ytdlp::Entry) -> Wanted {
@@ -662,6 +765,76 @@ mod tests {
 
     fn kind(url: &str) -> Option<(Service, Scope, String)> {
         classify(url).map(|link| (link.service, link.scope, link.id))
+    }
+
+    #[test]
+    fn youtube_music_links_that_are_not_songs_or_albums_are_refused() {
+        assert!(classify("https://music.youtube.com/browse/UC0WP5P-ufpRfjbNrmOWwLBQ").is_none());
+        assert!(classify("https://music.youtube.com/browse").is_none());
+    }
+
+    #[test]
+    fn a_youtube_music_album_keeps_its_name_order_and_singer() {
+        let listing = ytdlp::Listing {
+            title: Some("Album - After Hours".into()),
+            owner: None,
+            entries: vec![
+                ytdlp::Entry {
+                    id: "i8r4zJC1i70".into(),
+                    title: "Alone Again".into(),
+                    artists: vec!["The Weeknd".into()],
+                    duration: Some(251.0),
+                    ..ytdlp::Entry::default()
+                },
+                ytdlp::Entry {
+                    id: "r-xaK0LWTZ4".into(),
+                    title: "Too Late".into(),
+                    artists: vec!["The Weeknd".into()],
+                    ..ytdlp::Entry::default()
+                },
+            ],
+        };
+        let album = youtube_album(listing);
+        assert_eq!(album.title.as_deref(), Some("After Hours"));
+        assert_eq!(album.owner.as_deref(), Some("The Weeknd"));
+        assert_eq!(album.songs.len(), 2);
+        assert_eq!(album.songs[1].title, "Too Late");
+        assert_eq!(album.songs[1].album.as_deref(), Some("After Hours"));
+        assert_eq!(album.songs[1].track_number, Some(2));
+        assert_eq!(album.songs[1].youtube_id.as_deref(), Some("r-xaK0LWTZ4"));
+        assert_eq!(album_name("EP - Kiss Land"), "Kiss Land");
+        assert_eq!(album_name("Starboy"), "Starboy");
+    }
+
+    #[test]
+    fn the_studio_song_must_fit_its_music_video() {
+        // Blinding Lights: 202 s song, 263 s video with an intro.
+        assert!(fits_in_video(Some(202.0), Some(263.0)));
+        assert!(fits_in_video(Some(210.0), Some(200.0)));
+        assert!(!fits_in_video(Some(240.0), Some(200.0)));
+        // One song of an hour-long "full album" video.
+        assert!(!fits_in_video(Some(200.0), Some(3600.0)));
+        assert!(fits_in_video(Some(200.0), None));
+    }
+
+    #[tokio::test]
+    #[ignore = "live YouTube Music probe (needs yt-dlp)"]
+    async fn live_youtube_music_probe() {
+        let config = Config::default();
+        // The official video (263 s, with an intro) becomes the 202 s studio song.
+        let link = classify("https://www.youtube.com/watch?v=4NRXx6U8ABQ").unwrap();
+        let video = youtube(&config, &link).await.unwrap();
+        let song = &video.songs[0];
+        assert_eq!(song.youtube_id.as_deref(), Some("J7p4bzqLvCw"));
+        assert_eq!(song.title, "Blinding Lights");
+        assert!(song.source_url.as_deref().unwrap().ends_with("4NRXx6U8ABQ"));
+
+        let link = classify("https://music.youtube.com/browse/MPREb_TH6Wut5eTMQ").unwrap();
+        let album = youtube(&config, &link).await.unwrap();
+        assert_eq!(album.title.as_deref(), Some("After Hours"));
+        assert_eq!(album.songs[0].title, "Alone Again");
+        assert_eq!(album.songs[0].artist.as_deref(), Some("The Weeknd"));
+        assert_eq!(album.songs[0].track_number, Some(1));
     }
 
     #[test]
@@ -783,6 +956,18 @@ mod tests {
                 YouTube,
                 Track,
                 "abc123",
+            ),
+            (
+                "https://music.youtube.com/browse/MPREb_TH6Wut5eTMQ",
+                YouTube,
+                Album,
+                "MPREb_TH6Wut5eTMQ",
+            ),
+            (
+                "https://music.youtube.com/playlist?list=OLAK5uy_l4UqNJCpAF3kNaV37LHdRc_A07MmVdiSU",
+                YouTube,
+                Album,
+                "OLAK5uy_l4UqNJCpAF3kNaV37LHdRc_A07MmVdiSU",
             ),
             (
                 "https://www.shazam.com/song/1499378615/blinding-lights",

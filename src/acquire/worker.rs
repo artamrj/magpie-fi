@@ -323,43 +323,11 @@ async fn choose_source(config: &Config, row: &WantedRow) -> std::result::Result<
         artist: row.artist.clone(),
         duration: row.duration,
     };
-    let query = match row.artist.as_deref() {
-        Some(artist) => format!("{} {}", matching::primary_artist(artist), row.title),
-        None => row.title.clone(),
-    };
-
-    let songs = ytdlp::search_music_songs(config, &query, 5).await?;
-    let mut checked = Vec::new();
-    for entry in songs
-        .iter()
-        .filter(|entry| {
-            matching::similarity(
-                &matching::base_title(&row.title),
-                &matching::base_title(&entry.title),
-            ) >= 60.0
-        })
-        .take(3)
-    {
-        let Ok(details) = ytdlp::details(config, &entry.id).await else {
-            continue;
-        };
-        checked.push(Candidate {
-            id: entry.id.clone(),
-            title: details.title,
-            artists: details.artists,
-            duration: details.duration,
-            official: true,
-        });
-        if let Some((best, score)) = matching::best(&target, &checked, matching::NORMAL)
-            && score.total >= 90.0
-        {
-            return Ok(best.id.clone());
-        }
-    }
-    if let Some((best, _)) = matching::best(&target, &checked, matching::NORMAL) {
-        return Ok(best.id.clone());
+    if let Some(song) = youtube_music_song(config, &target, matching::NORMAL).await? {
+        return Ok(song.id);
     }
 
+    let query = search_query(&target);
     let videos: Vec<Candidate> = ytdlp::search_videos(config, &query, 5)
         .await?
         .into_iter()
@@ -377,6 +345,53 @@ async fn choose_source(config: &Config, row: &WantedRow) -> std::result::Result<
             message: "no matching song on YouTube Music or YouTube".into(),
             retry: false,
         })
+}
+
+/// What to type into a search: the main singer and the title.
+fn search_query(target: &Target) -> String {
+    match target.artist.as_deref() {
+        Some(artist) => format!("{} {}", matching::primary_artist(artist), target.title),
+        None => target.title.clone(),
+    }
+}
+
+/// The best YouTube Music "song" (a label's studio upload) for `target`, if
+/// one passes `thresholds`. Also used for a pasted music video, to get the
+/// song without the video's intro and outro.
+pub(super) async fn youtube_music_song(
+    config: &Config,
+    target: &Target,
+    thresholds: matching::Thresholds,
+) -> Result<Option<Candidate>> {
+    let songs = ytdlp::search_music_songs(config, &search_query(target), 5).await?;
+    let mut checked = Vec::new();
+    for entry in songs
+        .iter()
+        .filter(|entry| {
+            matching::similarity(
+                &matching::base_title(&target.title),
+                &matching::base_title(&entry.title),
+            ) >= 60.0
+        })
+        .take(3)
+    {
+        let Ok(details) = ytdlp::details(config, &entry.id).await else {
+            continue;
+        };
+        checked.push(Candidate {
+            id: entry.id.clone(),
+            title: details.title,
+            artists: details.artists,
+            duration: details.duration,
+            official: true,
+        });
+        if let Some((best, score)) = matching::best(target, &checked, thresholds)
+            && score.total >= 90.0
+        {
+            return Ok(Some(best.clone()));
+        }
+    }
+    Ok(matching::best(target, &checked, thresholds).map(|(best, _)| best.clone()))
 }
 
 /// Writes what the link said (title, artists, album, track number, ISRC) into
