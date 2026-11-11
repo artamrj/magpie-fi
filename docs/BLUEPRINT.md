@@ -344,8 +344,8 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
   name, album artist (or its MusicBrainz ID), MusicBrainz album ID and release date, so songs
   of one album that disagree on any of them show up as two albums. A new song whose album the
   album artist already has (the same album in any spelling: "Khalij" = "Khaleej", a store's
-  " - Single" ending, any year) joins that folder and takes the album's details from a song
-  already there: name, album artist, release date, year, MusicBrainz album and release-group
+  " - Single" ending or a label's " - Persian Music", any year) joins that folder and takes
+  the album's details from a song already there: name, album artist, release date, year, MusicBrainz album and release-group
   IDs, release type, compilation flag and label. A single named like an album the artist has
   (the title song) joins the album, without the single's track number. Editions stay apart
   ("Khalij (Remastered)").

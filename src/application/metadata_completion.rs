@@ -425,7 +425,9 @@ fn release_evidence_compatible(selected: &Candidate, donor: &Candidate) -> bool 
 }
 
 fn comparable_release_title(value: &str) -> String {
-    let cleaned = crate::domain::credits::release_title_without_featured(value);
+    let cleaned = crate::domain::credits::release_title_without_featured(
+        crate::domain::names::without_store_label(value),
+    );
     let lower = cleaned.to_lowercase();
     let without_type = [" - single", " - ep"]
         .into_iter()
@@ -436,7 +438,7 @@ fn comparable_release_title(value: &str) -> String {
 
 /// "Farangis - Single" → "Farangis", "Moorche - EP" → "Moorche".
 fn strip_release_suffix(album: &str) -> String {
-    let trimmed = album.trim();
+    let trimmed = crate::domain::names::without_store_label(album);
     let lower = trimmed.to_ascii_lowercase();
     for suffix in [
         " - single",
@@ -903,6 +905,19 @@ mod tests {
             score: 90.0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_store_label_is_not_written_into_the_album_name() {
+        let mut song = candidate("itunes", Some("Ba Shoma (With You) - Persian Music"));
+        song.title = "Ahooye Por Kereshmeh".into();
+        song.artist = "Martik".into();
+        normalize_release_fields(&mut song);
+        assert_eq!(song.album.as_deref(), Some("Ba Shoma (With You)"));
+        assert!(albums_compatible(
+            Some("Ba Shoma (With You)"),
+            Some("Ba Shoma (With You) - Persian Music")
+        ));
     }
 
     #[test]
