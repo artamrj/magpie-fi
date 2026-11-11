@@ -1,19 +1,16 @@
 import { useState } from "react";
 import { post } from "../../api/client";
-import type { AutoApproveResult, RetryIssuesResult, Track, Workflow } from "../../api/types";
+import type {
+  AutoApproveResult,
+  RetryIssuesResult,
+  Track,
+  TrackCounts,
+  TrackList,
+  Workflow,
+} from "../../api/types";
 import { Icon } from "../Icons";
 import { askConfirm, haptic } from "../telegram";
-import {
-  busyPhases,
-  isConfident,
-  isProblem,
-  isReady,
-  isReview,
-  problemReason,
-  reviewReason,
-  trackArtist,
-  trackTitle,
-} from "../trackUtils";
+import { busyPhases, problemReason, reviewReason, trackArtist, trackTitle } from "../trackUtils";
 import { ChosenCover, OriginalCover } from "./Cover";
 import { EmptyState, ListSkeleton } from "./EmptyStates";
 import { BottomActions, Cell, PageTitle, Section, Spinner, Tag } from "./ui";
@@ -24,10 +21,24 @@ export type Feedback = {
   refresh: () => Promise<void>;
 };
 
-/** Every song that waits for the owner, grouped by what has to happen to it. */
+const noCounts: TrackCounts = {
+  review: 0,
+  issues: 0,
+  skipped: 0,
+  working: 0,
+  ready: 0,
+  confident: 0,
+  damaged: 0,
+};
+
+/** Every song that waits for the owner, grouped by what has to happen to it. A long queue is
+ *  shown a page at a time and searched on the server, so the page stays quick with thousands. */
 export function ReviewList({
-  tracks,
+  list,
   loading,
+  search,
+  onSearch,
+  onMore,
   workflow,
   trashDays,
   selectedId,
@@ -35,8 +46,12 @@ export function ReviewList({
   onOpen,
   feedback,
 }: {
-  tracks: Track[];
+  list?: TrackList;
   loading: boolean;
+  search: string;
+  onSearch: (value: string) => void;
+  /** Show more songs of every section. */
+  onMore: () => void;
   workflow?: Workflow;
   trashDays: number;
   selectedId?: number;
@@ -49,14 +64,27 @@ export function ReviewList({
   const [filing, setFiling] = useState(false);
   const busy = workflow ? busyPhases.has(workflow.phase) : false;
 
-  const review = tracks.filter(isReview);
-  const problems = tracks.filter((track) => isProblem(track) || track.stage === "skipped");
-  const ready = tracks.filter(isReady);
-  const working = tracks.filter(
-    (track) =>
-      !isReview(track) && !isProblem(track) && !isReady(track) && track.stage !== "skipped",
-  );
-  const confident = review.filter(isConfident);
+  const tracks = list?.tracks ?? [];
+  const counts = list?.counts ?? noCounts;
+  const matching = list?.matching ?? noCounts;
+  const review = tracks.filter((track) => track.group === "review");
+  const problems = tracks.filter((track) => track.group === "issues");
+  const ready = tracks.filter((track) => track.group === "ready");
+  const working = tracks.filter((track) => track.group === "working");
+  const total = counts.review + counts.issues + counts.skipped + counts.working + counts.ready;
+  const searching = search.trim().length > 0;
+  /** "Show 100 more" under a section that has more songs than are on the page. */
+  const more = (shown: number, inSection: number) =>
+    inSection > shown && (
+      <Cell
+        key="more"
+        tone="accent"
+        lead={<Icon name="chevron" />}
+        title={`Show ${Math.min(100, inSection - shown)} more`}
+        subtitle={`${shown.toLocaleString()} of ${inSection.toLocaleString()} shown`}
+        onClick={onMore}
+      />
+    );
 
   const run = async (setBusy: (value: boolean) => void, action: () => Promise<void>) => {
     setBusy(true);
@@ -83,7 +111,7 @@ export function ReviewList({
 
   const fixIssues = () =>
     run(setFixing, async () => {
-      const damaged = problems.filter((track) => track.status === "corrupt").length;
+      const damaged = counts.damaged;
       if (
         damaged &&
         !(await askConfirm(
@@ -125,9 +153,9 @@ export function ReviewList({
   const subtitle = loading
     ? "Loading…"
     : [
-        review.length ? `${review.length} need your pick` : "",
-        problems.length ? `${problems.length} ${problems.length === 1 ? "issue" : "issues"}` : "",
-        ready.length ? `${ready.length} ready to file` : "",
+        counts.review ? `${counts.review.toLocaleString()} need your pick` : "",
+        counts.issues ? `${counts.issues} ${counts.issues === 1 ? "issue" : "issues"}` : "",
+        counts.ready ? `${counts.ready.toLocaleString()} ready to file` : "",
       ]
         .filter(Boolean)
         .join(" · ") || "Nothing is waiting";
@@ -181,30 +209,50 @@ export function ReviewList({
         </div>
       )}
 
+      {(total > 8 || searching) && (
+        <label className="search-field">
+          <Icon name="search" size={18} />
+          <span className="sr-only">Search the songs that wait</span>
+          <input
+            id="review-search"
+            value={search}
+            onChange={(event) => onSearch(event.target.value)}
+            placeholder="Search by title, artist or file name"
+            autoComplete="off"
+          />
+        </label>
+      )}
+
       {loading ? (
         <section className="section">
           <ListSkeleton />
         </section>
-      ) : tracks.length === 0 ? (
+      ) : total === 0 ? (
         <EmptyState
           icon="check"
           title="Nothing to review"
           description="Songs magpie-fi is unsure about appear here. Everything else is filed on its own."
         />
+      ) : tracks.length === 0 ? (
+        <EmptyState
+          icon="search"
+          title="No song fits"
+          description="Nothing that waits has these words in its title, artist or file name."
+          action="Clear the search"
+          onAction={() => onSearch("")}
+        />
       ) : (
         <>
           {review.length > 0 && (
             <Section title="Needs your pick">
-              {confident.length > 0 && (
+              {counts.confident > 0 && !searching && (
                 <Cell
                   tone="accent"
                   lead={accepting ? <Spinner /> : <Icon name="sparkles" />}
-                  title={`Accept ${confident.length} confident ${confident.length === 1 ? "match" : "matches"}`}
-                  subtitle={confident
-                    .slice(0, 3)
-                    .map(trackTitle)
+                  title={`Accept ${counts.confident} confident ${counts.confident === 1 ? "match" : "matches"}`}
+                  subtitle={(list?.confident_titles ?? [])
                     .join(", ")
-                    .concat(confident.length > 3 ? "…" : "")}
+                    .concat(counts.confident > 3 ? "…" : "")}
                   chevron
                   disabled={accepting}
                   onClick={() => void acceptConfident()}
@@ -214,7 +262,7 @@ export function ReviewList({
                 row(
                   track,
                   reviewReason(track),
-                  track.candidates.length === 0 ? (
+                  (track.candidate_count ?? track.candidates.length) === 0 ? (
                     <Tag>No match</Tag>
                   ) : reviewReason(track).startsWith("Maybe") ? (
                     <Tag tone="info">Duplicate?</Tag>
@@ -223,6 +271,7 @@ export function ReviewList({
                   ) : undefined,
                 ),
               )}
+              {more(review.length, matching.review)}
             </Section>
           )}
 
@@ -254,19 +303,21 @@ export function ReviewList({
                   </Tag>,
                 ),
               )}
+              {more(problems.length, matching.issues + matching.skipped)}
             </Section>
           )}
 
           {working.length > 0 && (
             <Section title="Working on">
               {working.map((track) => row(track, "Identifying…", <Spinner />))}
+              {more(working.length, matching.working)}
             </Section>
           )}
 
           {ready.length > 0 && (
             <Section
               title="Ready to file"
-              aside={ready.length}
+              aside={counts.ready}
               footer={`Filed songs show up in Navidrome within a minute. Originals stay in the trash for ${trashDays} days.`}
             >
               {ready.map((track) =>
@@ -279,6 +330,7 @@ export function ReviewList({
                   </Tag>,
                 ),
               )}
+              {more(ready.length, matching.ready)}
             </Section>
           )}
         </>
@@ -286,9 +338,9 @@ export function ReviewList({
 
       <BottomActions
         primary={
-          ready.length > 0 && !busy
+          counts.ready > 0 && !busy
             ? {
-                text: `File ${ready.length} ready ${ready.length === 1 ? "song" : "songs"}`,
+                text: `File ${counts.ready} ready ${counts.ready === 1 ? "song" : "songs"}`,
                 onClick: () => void fileReady(),
                 busy: filing,
               }

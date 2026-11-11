@@ -10,24 +10,223 @@ use crate::types::TrackStage;
 use axum::http::{HeaderMap, StatusCode, header};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-pub async fn list_tracks(State(s): State<Arc<AppState>>) -> ApiResult<Json<Vec<WorkspaceTrack>>> {
+/// How many songs of each section `GET /api/tracks` sends unless asked for more.
+const DEFAULT_SECTION_ROWS: usize = 50;
+const MAX_SECTION_ROWS: usize = 1000;
+
+#[derive(Deserialize, Default)]
+pub struct TrackListQuery {
+    /// Words to look for in the file name, title, artist and album.
+    #[serde(default)]
+    q: String,
+    /// Songs per section.
+    limit: Option<usize>,
+}
+
+/// How many songs wait in each section of Review, whatever is searched for.
+#[derive(Default, Serialize)]
+pub struct TrackCounts {
+    review: usize,
+    /// Damaged, missing or failed songs.
+    issues: usize,
+    /// Duplicate uploads that were skipped (listed under Issues).
+    skipped: usize,
+    working: usize,
+    ready: usize,
+    /// Review songs whose first match is strong enough to accept without a look.
+    confident: usize,
+    damaged: usize,
+}
+
+/// One row of the Review list: the song, the match that was chosen for it (if
+/// any) and what the list needs to know about the others.
+#[derive(Serialize)]
+pub struct TrackRow {
+    #[serde(flatten)]
+    track: Track,
+    /// Only the chosen match. All of them come with `GET /api/tracks/{id}`.
+    candidates: Vec<Candidate>,
+    candidate_count: i64,
+    /// `review`, `issues`, `working` or `ready`.
+    group: &'static str,
+    confident: bool,
+}
+
+#[derive(Serialize)]
+pub struct TrackList {
+    counts: TrackCounts,
+    /// Songs per section that fit the search (the rows below are cut at `limit`).
+    matching: TrackCounts,
+    /// The songs that wait for the owner, in list order: Review first, then
+    /// Issues. Ids only, for "next song" and "song 3 of 40".
+    order: Vec<TrackId>,
+    confident_titles: Vec<String>,
+    tracks: Vec<TrackRow>,
+}
+
+/// `GET /api/tracks?q=&limit=`: the Review list.
+///
+/// The page asks for this every few seconds. A first import can leave more
+/// than a thousand songs waiting, each with up to twenty matches, so the list
+/// carries the counts of every section but only the first `limit` songs of
+/// each, and of their matches only the chosen one. That keeps an answer at a
+/// few dozen kilobytes however long the queue is; the matches of one song are
+/// fetched when it is opened.
+pub async fn list_tracks(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<TrackListQuery>,
+) -> ApiResult<Json<TrackList>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SECTION_ROWS)
+        .clamp(1, MAX_SECTION_ROWS);
+    let words = query
+        .q
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+
     let tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {} FROM tracks ORDER BY path LIMIT 10000",
+        "SELECT {} FROM tracks ORDER BY path",
         track_db::TRACK_FIELDS
     )))
     .fetch_all(&s.pool)
     .await?;
-    let mut by_track =
-        track_db::candidates_by_track(&s.pool, tracks.iter().map(|track| track.id)).await?;
-    Ok(Json(
-        tracks
-            .into_iter()
-            .map(|track| WorkspaceTrack {
-                candidates: by_track.remove(&track.id).unwrap_or_default(),
-                track,
+    // Per song: how many matches, the best score and the second best.
+    let scores: Vec<(i64, i64, f64, Option<f64>)> = sqlx::query_as(
+        "SELECT track_id, COUNT(*), MAX(score), MAX(CASE WHEN place=2 THEN score END)
+         FROM (SELECT track_id, score,
+                 ROW_NUMBER() OVER (PARTITION BY track_id ORDER BY score DESC, id) AS place
+               FROM candidates)
+         GROUP BY track_id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let scores = scores
+        .into_iter()
+        .map(|(track, count, best, second)| (track, (count, best, second)))
+        .collect::<std::collections::HashMap<_, _>>();
+    // The chosen match of every song, as far as searching and sorting need it.
+    type Chosen = (i64, Option<String>, Option<String>, Option<String>, String);
+    let chosen: Vec<Chosen> = sqlx::query_as(
+        "SELECT tracks.id, candidates.title, candidates.artist, candidates.album,
+                candidates.artwork_status
+         FROM tracks JOIN candidates ON candidates.id=tracks.selected_candidate_id",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let chosen = chosen
+        .into_iter()
+        .map(|(track, title, artist, album, artwork)| (track, (title, artist, album, artwork)))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut list = TrackList {
+        counts: TrackCounts::default(),
+        matching: TrackCounts::default(),
+        order: Vec::new(),
+        confident_titles: Vec::new(),
+        tracks: Vec::new(),
+    };
+    let mut sections: [Vec<(Track, i64, bool)>; 4] = Default::default();
+    let mut issue_order = Vec::new();
+    for track in tracks {
+        let skipped = track.stage == TrackStage::Skipped;
+        let problem = !skipped
+            && (track.is_missing
+                || track.stage == TrackStage::Failed
+                || matches!(
+                    track.status.as_str(),
+                    "corrupt" | "failed" | "provider_error"
+                ));
+        let section = if problem || skipped {
+            1
+        } else if track.stage == TrackStage::Review {
+            0
+        } else if track.stage == TrackStage::Ready && track.selected_candidate_id.is_some() {
+            3
+        } else {
+            2
+        };
+        let own = chosen.get(&track.id.0);
+        let (count, best, second) = scores.get(&track.id.0).copied().unwrap_or((0, 0.0, None));
+        let confident = section == 0
+            && count > 0
+            && best >= 85.0
+            && second.is_none_or(|second| best - second >= 8.0)
+            && !track.stage_message.as_deref().is_some_and(|message| {
+                message.starts_with(crate::application::apply::POSSIBLE_DUPLICATE)
             })
-            .collect(),
-    ))
+            && own.is_none_or(|(.., artwork)| artwork != "retryable_error");
+        let title = own
+            .and_then(|(title, ..)| title.clone())
+            .or_else(|| track.current_title.clone())
+            .unwrap_or_else(|| track.filename.clone());
+
+        for (counts, counted) in [(&mut list.counts, true), (&mut list.matching, false)] {
+            if !counted {
+                let text = [
+                    Some(track.filename.as_str()),
+                    track.current_title.as_deref(),
+                    track.current_artist.as_deref(),
+                    track.current_album.as_deref(),
+                    own.and_then(|(title, ..)| title.as_deref()),
+                    own.and_then(|(_, artist, ..)| artist.as_deref()),
+                    own.and_then(|(_, _, album, _)| album.as_deref()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+                if !words.iter().all(|word| text.contains(word.as_str())) {
+                    break;
+                }
+            }
+            match section {
+                0 => counts.review += 1,
+                1 if skipped => counts.skipped += 1,
+                1 => counts.issues += 1,
+                2 => counts.working += 1,
+                _ => counts.ready += 1,
+            }
+            counts.confident += usize::from(confident);
+            counts.damaged += usize::from(track.status == "corrupt");
+            if counted {
+                continue;
+            }
+            // This song fits the search.
+            if confident && list.confident_titles.len() < 3 {
+                list.confident_titles.push(title.clone());
+            }
+            match section {
+                0 => list.order.push(track.id),
+                1 if !skipped => issue_order.push(track.id),
+                _ => {}
+            }
+            if sections[section].len() < limit {
+                sections[section].push((track.clone(), count, confident));
+            }
+        }
+    }
+    list.order.extend(issue_order);
+
+    let shown = sections.iter().flatten().map(|(track, ..)| track.id);
+    let mut matches = track_db::selected_candidates(&s.pool, shown).await?;
+    for (section, group) in sections
+        .into_iter()
+        .zip(["review", "issues", "working", "ready"])
+    {
+        for (track, candidate_count, confident) in section {
+            list.tracks.push(TrackRow {
+                candidates: matches.remove(&track.id).into_iter().collect(),
+                track,
+                candidate_count,
+                group,
+                confident,
+            });
+        }
+    }
+    Ok(Json(list))
 }
 
 pub async fn remove_track(
@@ -95,6 +294,16 @@ pub async fn remove_track(
         "removed": true,
         "filename": track.filename,
     })))
+}
+
+/// `GET /api/tracks/{id}`: one song with every match found for it.
+pub async fn get_track(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<WorkspaceTrack>> {
+    let track = track_db::track(&s.pool, id).await?;
+    let candidates = track_db::candidates(&s.pool, id).await?;
+    Ok(Json(WorkspaceTrack { track, candidates }))
 }
 
 /// Picks matches for review tracks where the evidence is strong enough. Holds

@@ -35,7 +35,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/files/audio", get(handlers::song_audio))
         .route(
             "/tracks/{id}",
-            axum::routing::delete(handlers::remove_track),
+            get(handlers::get_track).delete(handlers::remove_track),
         )
         .route("/tracks/retry-issues", post(handlers::retry_issues))
         .route("/tracks/auto-approve", post(handlers::auto_approve_review))

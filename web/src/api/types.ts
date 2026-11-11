@@ -148,7 +148,35 @@ export type Track = {
   stage_message?: string;
   error?: string;
   is_missing: boolean;
+  /** In the Review list: only the chosen match. For one opened song: every match. */
   candidates: Candidate[];
+  /** How many matches the song has (the list does not send them all). */
+  candidate_count?: number;
+  /** The section of the Review list the song belongs to. */
+  group?: "review" | "issues" | "working" | "ready";
+  /** Its first match is strong enough to accept without a look. */
+  confident?: boolean;
+};
+/** How many songs wait in each section of Review. */
+export type TrackCounts = {
+  review: number;
+  issues: number;
+  /** Duplicate uploads that were skipped; they are listed under Issues. */
+  skipped: number;
+  working: number;
+  ready: number;
+  confident: number;
+  damaged: number;
+};
+/** The Review list (GET /api/tracks?q=&limit=): every count, but only the first songs of each section. */
+export type TrackList = {
+  counts: TrackCounts;
+  /** Songs per section that fit the search. */
+  matching: TrackCounts;
+  /** Ids of the songs that wait for you, in list order. */
+  order: number[];
+  confident_titles: string[];
+  tracks: Track[];
 };
 export type AutoApproveResult = {
   approved: number;

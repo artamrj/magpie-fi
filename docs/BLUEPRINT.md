@@ -246,7 +246,7 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
   within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
   the audio's length. A match from a source that gives no length is not chosen when the sources
-  that do give one are all more than 15 s off. Other releases of the same recording (the single and the album, a store
+  that do give one are all more than 15 s off, or when no source gives one at all. Other releases of the same recording (the single and the album, a store
   that lists fewer singers with the same length, a Persian title in another Latin spelling
   with the same length) are not rivals. Review says in plain words what is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
@@ -439,6 +439,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 
 - Source answers and downloaded covers (`provider_cache`) keep a lifetime per source, from 7 to
   90 days. Expired rows are removed at start and once a day. Failed lookups are not cached.
+  Downloaded covers are capped at 200 MiB together; the ones kept the shortest time go first.
 - File analysis (fingerprint, integrity, content hash) is keyed by path, size and mtime, and
   capped at 100 MiB together; the oldest rows go first.
 

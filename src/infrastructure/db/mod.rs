@@ -8,6 +8,13 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 const DAILY_CACHE_CLEANUP_KEY: &str = "last_disposable_cache_cleanup";
 const MEDIA_CACHE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+/// Checked cover images are kept so every song of an album shares one
+/// download. They are by far the biggest thing in the database (hundreds of
+/// kilobytes each), and a first import of a few thousand songs would grow it
+/// past a gigabyte. 200 MiB holds the covers of about 500 albums, far more
+/// than are being worked on at any one time.
+const COVER_CACHE_LIMIT_BYTES: u64 = 200 * 1024 * 1024;
+const COVER_CACHE: &str = "artwork-url";
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub mod candidates;
@@ -92,8 +99,9 @@ pub async fn run_daily_cache_cleanup_if_due(pool: &SqlitePool) -> Result<bool> {
     }
 
     let provider_rows_removed = delete_expired_provider_cache(pool).await?;
-    let media_rows_removed =
-        enforce_media_cache_limit_with_limit(pool, MEDIA_CACHE_LIMIT_BYTES).await?;
+    let media_rows_removed = enforce_media_cache_limit_with_limit(pool, MEDIA_CACHE_LIMIT_BYTES)
+        .await?
+        + enforce_cover_cache_limit(pool).await?;
     sqlx::query(
         "INSERT INTO maintenance(key,value) VALUES(?,?) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -124,6 +132,49 @@ pub async fn enforce_media_cache_limit(pool: &SqlitePool) -> Result<u64> {
         compact(pool).await?;
         tracing::info!(removed, "media-analysis cache limit enforced");
     }
+    Ok(removed)
+}
+
+/// Keeps cached cover images under 200 MiB. Called whenever a cover is added,
+/// so the limit also holds in the middle of a long import. The covers kept
+/// the shortest time go first; a removed cover is simply downloaded again if
+/// another song of its album turns up.
+pub async fn enforce_cover_cache_limit(pool: &SqlitePool) -> Result<u64> {
+    enforce_cover_cache_limit_with_limit(pool, COVER_CACHE_LIMIT_BYTES).await
+}
+
+async fn enforce_cover_cache_limit_with_limit(pool: &SqlitePool, limit_bytes: u64) -> Result<u64> {
+    // The size of a stored value is in its row header, so this does not read
+    // the images themselves.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(length(CAST(response_json AS BLOB))),0)
+         FROM provider_cache WHERE provider=?",
+    )
+    .bind(COVER_CACHE)
+    .fetch_one(pool)
+    .await?;
+    if u64::try_from(total).unwrap_or(0) <= limit_bytes {
+        return Ok(0);
+    }
+    // Down to four fifths of the limit, so this does not run for every cover
+    // once the cache is full. The freed space is reused by the next covers.
+    let keep = i64::try_from(limit_bytes / 5 * 4).unwrap_or(i64::MAX);
+    let removed = sqlx::query(
+        "DELETE FROM provider_cache WHERE provider=?1 AND cache_key IN (
+           SELECT cache_key FROM (
+             SELECT cache_key,
+               SUM(length(CAST(response_json AS BLOB)))
+                 OVER (ORDER BY expires_at DESC, cache_key) AS kept
+             FROM provider_cache WHERE provider=?1
+           ) WHERE kept > ?2
+         )",
+    )
+    .bind(COVER_CACHE)
+    .bind(keep)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    tracing::info!(removed, "cover cache limit enforced");
     Ok(removed)
 }
 
@@ -216,6 +267,47 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_cover_cache_stays_under_its_limit_and_keeps_the_newest() {
+        let pool = test_pool().await;
+        let cover = "x".repeat(1000);
+        for (number, days) in [(1, 10), (2, 30), (3, 20), (4, 25), (5, 5)] {
+            sqlx::query(
+                "INSERT INTO provider_cache(provider,cache_key,response_json,expires_at)
+                 VALUES('artwork-url',?,?,?)",
+            )
+            .bind(format!("url:cover-{number}"))
+            .bind(&cover)
+            .bind(crate::infrastructure::provider_cache::timestamp(
+                Utc::now() + chrono::Duration::days(days),
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Another kind of cached answer is never touched.
+        insert_provider_row(&pool, "search:song", Utc::now() + chrono::Duration::days(1)).await;
+
+        // Room for all five: nothing happens.
+        assert_eq!(
+            enforce_cover_cache_limit_with_limit(&pool, 5000)
+                .await
+                .unwrap(),
+            0
+        );
+        // Room for three and a half: it goes down to four fifths of that, two covers.
+        assert_eq!(
+            enforce_cover_cache_limit_with_limit(&pool, 3500)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            provider_keys(&pool).await,
+            vec!["search:song", "url:cover-2", "url:cover-4"]
+        );
     }
 
     #[tokio::test]
@@ -312,7 +404,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         for (table, expected) in [
             ("reference_files", 0),
             ("candidate_sources", 0),

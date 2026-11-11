@@ -121,20 +121,6 @@ export function selectedCandidate(track: Track) {
   return track.candidates.find((candidate) => candidate.id === track.selected_candidate_id);
 }
 
-function queuePriority(track: Track) {
-  if (isReview(track)) return 0;
-  if (isProblem(track)) return 1;
-  if (isReady(track)) return 2;
-  return 3;
-}
-
-export function preferredTrack(tracks: Track[]) {
-  return [...tracks].sort(
-    (first, second) =>
-      queuePriority(first) - queuePriority(second) || first.filename.localeCompare(second.filename),
-  )[0];
-}
-
 export function folderName(path: string) {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? "";
@@ -243,7 +229,7 @@ export function reviewReason(track: Track) {
   if (message.startsWith("Two different recordings")) return "Two recordings fit";
   if (message.startsWith("Only ")) return "Only one source found it";
   if (/seconds longer or shorter/.test(message)) return "Length differs";
-  const count = track.candidates.length;
+  const count = track.candidate_count ?? track.candidates.length;
   if (count > 1) return `${count} possible matches`;
   if (count === 1) return "One match, not sure";
   return "Nothing recognized it";
@@ -256,19 +242,6 @@ export function problemReason(track: Track) {
   if (track.stage === "skipped") return "Duplicate upload, skipped";
   if (track.status === "provider_error") return "A source was unavailable";
   return "Could not be processed";
-}
-
-/** A review song whose first match is strong enough to accept without a look. */
-export function isConfident(track: Track) {
-  return (
-    isReview(track) &&
-    !isProblem(track) &&
-    !hasRetryableArtwork(track) &&
-    !isPossibleDuplicate(track) &&
-    track.candidates.length > 0 &&
-    track.candidates[0].score >= 85 &&
-    (track.candidates.length === 1 || track.candidates[0].score - track.candidates[1].score >= 8)
-  );
 }
 
 export type Chip = { text: string; tone: "good" | "warn" | "plain" };

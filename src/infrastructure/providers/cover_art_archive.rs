@@ -118,6 +118,10 @@ pub async fn fetch_verified_url_cached(
         Utc::now() + Duration::days(30),
     )
     .await?;
+    // Covers are the bulk of the database; see `enforce_cover_cache_limit`.
+    if let Err(error) = crate::infrastructure::db::enforce_cover_cache_limit(pool).await {
+        tracing::warn!(%error, "could not enforce the cover cache limit");
+    }
     Ok((data, check.info))
 }
 

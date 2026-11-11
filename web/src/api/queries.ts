@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { busyPhases } from "../app/trackUtils";
 import { api } from "./client";
 import type {
@@ -12,6 +12,7 @@ import type {
   SongDetails,
   SplitAlbum,
   Track,
+  TrackList,
   WantedSong,
   Workflow,
 } from "./types";
@@ -72,12 +73,33 @@ export function useStatusQuery() {
   });
 }
 
-export function useTracksQuery(busy: boolean) {
+/** Songs of each Review section the list shows before "Show more". */
+export const REVIEW_PAGE = 50;
+
+/** The Review list: the counts of every section and the first `limit` songs of each that fit
+ *  `search`. The answer stays small however many songs wait, so it can be asked for often. */
+export function useTracksQuery(busy: boolean, search: string, limit: number) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (search) params.set("q", search);
   return useQuery({
-    queryKey: queryKeys.tracks,
-    queryFn: () => api<Track[]>("/tracks"),
+    queryKey: [...queryKeys.tracks, "list", search, limit],
+    queryFn: () => api<TrackList>(`/tracks?${params.toString()}`),
     refetchInterval: busy ? 3000 : 10000,
     refetchIntervalInBackground: true,
+    // While typing or showing more, the old rows stay until the new ones arrive.
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** One song with every match found for it, fetched when the song is opened. */
+export function useTrackQuery(id: number | undefined, busy: boolean) {
+  return useQuery({
+    queryKey: [...queryKeys.tracks, "one", id],
+    queryFn: () => api<Track>(`/tracks/${id}`),
+    enabled: id !== undefined,
+    refetchInterval: busy ? 3000 : 10000,
+    // A song that is gone (filed or removed) is not asked for again.
+    retry: false,
   });
 }
 

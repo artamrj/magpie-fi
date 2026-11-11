@@ -91,6 +91,11 @@ impl Install {
         body
     }
 
+    /// The rows of the Review list.
+    async fn songs(&self) -> Value {
+        self.get("/tracks").await["tracks"].take()
+    }
+
     async fn post(&self, uri: &str, body: Option<Value>) -> Value {
         let (status, body) = self.call(Method::POST, uri, body).await;
         assert_eq!(status, StatusCode::OK, "POST {uri}: {body}");
@@ -212,7 +217,8 @@ async fn a_fresh_install_answers_every_page_and_has_nothing_to_do() {
     let install = Install::new().await;
     assert_eq!(install.get("/health").await["status"], "ok");
     assert_eq!(install.get("/status").await["phase"], "idle");
-    for list in ["/tracks", "/artists", "/requests", "/library/recent"] {
+    assert_eq!(install.songs().await, json!([]));
+    for list in ["/artists", "/requests", "/library/recent"] {
         assert_eq!(install.get(list).await, json!([]), "{list}");
     }
     let root = install.get("/files").await;
@@ -263,7 +269,7 @@ async fn a_song_goes_from_review_into_the_library_and_stays_safe_there() {
     let track = install.song_in_review(&inbox_file, "fp:hamdam").await;
 
     // 1. It waits in Review, and nothing is filed while it does.
-    let waiting = install.get("/tracks").await;
+    let waiting = install.songs().await;
     assert_eq!(waiting.as_array().unwrap().len(), 1);
     assert_eq!(waiting[0]["stage"], "review");
     let (status, _) = install.call(Method::POST, "/write", None).await;
@@ -308,7 +314,7 @@ async fn a_song_goes_from_review_into_the_library_and_stays_safe_there() {
     assert_eq!(trashed.len(), 1);
     assert_eq!(std::fs::read(&trashed[0]).unwrap(), original);
     // Every page agrees.
-    assert_eq!(install.get("/tracks").await, json!([]));
+    assert_eq!(install.songs().await, json!([]));
     let artists = install.get("/artists").await;
     assert_eq!(artists.as_array().unwrap().len(), 1);
     assert_eq!(artists[0]["name"], "Ebi");
@@ -335,7 +341,7 @@ async fn a_song_goes_from_review_into_the_library_and_stays_safe_there() {
     assert_eq!(std::fs::read(&filed).unwrap(), filed_bytes);
     assert!(!again.exists());
     assert_eq!(install.trashed().len(), 2);
-    assert_eq!(install.get("/tracks").await, json!([]));
+    assert_eq!(install.songs().await, json!([]));
 
     // 5. Fix a tag on the Files tab. The song is still whole afterwards.
     let length = crate::domain::audio::read(&filed).unwrap().duration;
@@ -402,6 +408,137 @@ async fn a_song_goes_from_review_into_the_library_and_stays_safe_there() {
 }
 
 #[tokio::test]
+async fn a_long_review_list_stays_small_and_can_be_searched() {
+    let install = Install::new().await;
+    // 400 songs wait in Review with 12 matches each; a few are of other kinds.
+    let mut transaction = install.state.pool.begin().await.unwrap();
+    for number in 0..400_i64 {
+        let (artist, title) = match number % 4 {
+            0 => ("Ebi", format!("Khalij {number}")),
+            1 => ("Googoosh", format!("Hejrat {number}")),
+            2 => ("گوگوش", format!("من آمده ام {number}")),
+            _ => ("Dariush", format!("Cheshme Man {number}")),
+        };
+        let track = sqlx::query(
+            "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
+               last_scanned_at,stage,current_title,current_artist)
+             VALUES(?,?,'needs_review',0,'now','now','now','review',?,?)",
+        )
+        .bind(format!("/inbox/{number:04}.mp3"))
+        .bind(format!("{number:04}.mp3"))
+        .bind(&title)
+        .bind(artist)
+        .execute(&mut *transaction)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        for place in 0..12_i64 {
+            // Every tenth song has one clear winner; the others have two close matches.
+            let score = match (number % 10, place) {
+                (0, 0) => 96.0,
+                (0, _) => 60.0 - place as f64,
+                (_, _) => 90.0 - place as f64,
+            };
+            sqlx::query(
+                "INSERT INTO candidates(track_id,provider,title,artist,album,score,score_breakdown)
+                 VALUES(?,'deezer',?,?,'Album',?,?)",
+            )
+            .bind(track)
+            .bind(&title)
+            .bind(artist)
+            .bind(score)
+            .bind("x".repeat(2000))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+    }
+    for (name, status, stage) in [
+        ("broken.mp3", "corrupt", "failed"),
+        ("lost.mp3", "failed", "failed"),
+        ("twice.mp3", "duplicate", "skipped"),
+        ("busy.mp3", "processing", "discovered"),
+    ] {
+        sqlx::query(
+            "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
+               last_scanned_at,stage) VALUES(?,?,?,0,'now','now','now',?)",
+        )
+        .bind(format!("/inbox/zz {name}"))
+        .bind(name)
+        .bind(status)
+        .bind(stage)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    // The list says how many wait, but sends only the first 50 of a section and
+    // none of their unchosen matches: about 10 MB of matches stay on the server.
+    let list = install.get("/tracks").await;
+    assert_eq!(list["counts"]["review"], 400);
+    assert_eq!(list["counts"]["issues"], 2);
+    assert_eq!(list["counts"]["skipped"], 1);
+    assert_eq!(list["counts"]["working"], 1);
+    assert_eq!(list["counts"]["ready"], 0);
+    assert_eq!(list["counts"]["damaged"], 1);
+    assert_eq!(list["counts"]["confident"], 40);
+    assert_eq!(list["confident_titles"].as_array().unwrap().len(), 3);
+    let rows = list["tracks"].as_array().unwrap();
+    assert_eq!(rows.len(), 50 + 3 + 1);
+    assert_eq!(rows[0]["group"], "review");
+    assert_eq!(rows[0]["filename"], "0000.mp3");
+    assert_eq!(rows[0]["candidate_count"], 12);
+    assert_eq!(rows[0]["confident"], true);
+    assert_eq!(rows[1]["confident"], false);
+    assert_eq!(rows[0]["candidates"], json!([]));
+    assert_eq!(list["order"].as_array().unwrap().len(), 402);
+    assert!(
+        list.to_string().len() < 60_000,
+        "{}",
+        list.to_string().len()
+    );
+
+    // "Show more" asks for more rows of each section.
+    let more = install.get("/tracks?limit=150").await;
+    assert_eq!(more["tracks"].as_array().unwrap().len(), 150 + 3 + 1);
+
+    // Searching looks at every song, not only the ones on the page, in any script.
+    let found = install.get("/tracks?q=googoosh%20hejrat%20397").await;
+    assert_eq!(found["matching"]["review"], 1);
+    assert_eq!(found["counts"]["review"], 400);
+    assert_eq!(found["tracks"][0]["filename"], "0397.mp3");
+    assert_eq!(found["order"].as_array().unwrap().len(), 1);
+    let persian = install.get(&format!("/tracks?q={}", encode("گوگوش"))).await;
+    assert_eq!(persian["matching"]["review"], 100);
+    assert_eq!(persian["tracks"].as_array().unwrap().len(), 50);
+    let nothing = install.get("/tracks?q=no%20such%20song").await;
+    assert_eq!(nothing["tracks"], json!([]));
+    assert_eq!(nothing["matching"]["review"], 0);
+
+    // Opening a song brings all of its matches, best first.
+    let id = rows[1]["id"].as_i64().unwrap();
+    let song = install.get(&format!("/tracks/{id}")).await;
+    let matches = song["candidates"].as_array().unwrap();
+    assert_eq!(matches.len(), 12);
+    assert_eq!(matches[0]["score"], 90.0);
+
+    // A chosen match travels with its row, so the list can show its cover and name.
+    install
+        .post(
+            &format!("/tracks/{id}/choose"),
+            Some(json!({"candidate_id": matches[0]["id"]})),
+        )
+        .await;
+    let chosen = install.get("/tracks?q=0001.mp3").await;
+    assert_eq!(
+        chosen["tracks"][0]["candidates"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(chosen["tracks"][0]["candidates"][0]["id"], matches[0]["id"]);
+}
+
+#[tokio::test]
 async fn a_song_removed_in_review_goes_to_the_trash_and_nowhere_else() {
     let install = Install::new().await;
     let inbox_file = install.inbox().join("unwanted.mp3");
@@ -421,7 +558,7 @@ async fn a_song_removed_in_review_goes_to_the_trash_and_nowhere_else() {
     let trashed = install.trashed();
     assert_eq!(trashed.len(), 1);
     assert_eq!(std::fs::read(&trashed[0]).unwrap(), original);
-    assert_eq!(install.get("/tracks").await, json!([]));
+    assert_eq!(install.songs().await, json!([]));
 }
 
 #[tokio::test]
@@ -440,7 +577,7 @@ async fn a_damaged_file_shows_as_an_issue_and_never_as_a_server_error() {
     .unwrap()
     .last_insert_rowid();
 
-    assert_eq!(install.get("/tracks").await[0]["stage"], "failed");
+    assert_eq!(install.songs().await[0]["stage"], "failed");
     // Everything the page asks about this song gets a plain answer.
     for uri in [
         format!("/tracks/{track}/artwork/original"),
@@ -499,7 +636,7 @@ async fn a_look_alike_is_asked_about_and_filed_next_to_the_other_on_request() {
     assert_eq!(std::fs::read(&owned).unwrap(), owned_bytes);
     assert!(inbox_file.exists());
     assert!(install.trashed().is_empty());
-    let waiting = install.get("/tracks").await;
+    let waiting = install.songs().await;
     assert_eq!(waiting[0]["stage"], "review");
     assert!(
         waiting[0]["stage_message"]
@@ -517,7 +654,7 @@ async fn a_look_alike_is_asked_about_and_filed_next_to_the_other_on_request() {
     let songs = install.library_songs();
     assert_eq!(songs.len(), 2, "{songs:?}");
     assert_eq!(std::fs::read(&owned).unwrap(), owned_bytes);
-    assert_eq!(install.get("/tracks").await, json!([]));
+    assert_eq!(install.songs().await, json!([]));
 }
 
 #[tokio::test]

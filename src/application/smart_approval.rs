@@ -43,6 +43,10 @@ struct Evaluated<'a> {
     /// The source gives no length, and every other source that lists the
     /// same song with a length is this far (more than 15 s) from the file.
     length_contradicted: Option<f64>,
+    /// Neither this source nor any source that lists the same song gives a
+    /// length, and the audio was not recognised: nothing ties the match to
+    /// the sound of the file.
+    length_unknown: bool,
     album_similarity: Option<f64>,
     variants: BTreeSet<&'static str>,
     variant_conflict: bool,
@@ -195,6 +199,11 @@ pub fn unsure_reason(evidence: TrackEvidence<'_>, candidates: &[Candidate]) -> S
     if top.artist_available && top.artist_similarity < 0.72 {
         return format!("The closest match, {found}, is credited to other singers.");
     }
+    if top.length_unknown && top.sources >= 2 {
+        return format!(
+            "The sources that found {found} give no length to compare with this file, so nothing but the name ties it to this audio."
+        );
+    }
     if top.sources < 2 && !top.audio_recognition {
         if top.candidate.duration_delta.is_none() {
             return format!(
@@ -291,17 +300,25 @@ fn evaluate<'a>(
     // song with a length can: when even the closest of them is far from the
     // file, this is another cut of the song or a wrongly tagged file, however
     // many sources agree on the name.
-    let length_contradicted = if candidate.duration_delta.is_none() && !audio_recognition {
+    let closest_agreeing_length = if candidate.duration_delta.is_none() && !audio_recognition {
         candidates
             .iter()
             // By place in the list, not by id: during a scan no match has an id yet.
             .filter(|other| !std::ptr::eq(*other, candidate) && candidates_agree(candidate, other))
             .filter_map(|other| other.duration_delta)
             .min_by(f64::total_cmp)
-            .filter(|closest| *closest > MAX_AUTOMATIC_DURATION_GAP_SECONDS)
     } else {
         None
     };
+    let length_contradicted =
+        closest_agreeing_length.filter(|closest| *closest > MAX_AUTOMATIC_DURATION_GAP_SECONDS);
+    // With no length anywhere, sources that were all searched with the file's
+    // own tags only repeat those tags back. The length is the one thing that
+    // comes from the audio, so without it (and without audio recognition) the
+    // match waits in Review.
+    let length_unknown = candidate.duration_delta.is_none()
+        && !audio_recognition
+        && closest_agreeing_length.is_none();
     let existing_album = meaningful_album(evidence.album);
     let album_similarity = existing_album
         .zip(candidate.album.as_deref())
@@ -387,6 +404,7 @@ fn evaluate<'a>(
         isrc_proof,
         duration_close,
         length_contradicted,
+        length_unknown,
         album_similarity,
         variants,
         variant_conflict,
@@ -410,6 +428,7 @@ fn is_supported(candidate: &Evaluated<'_>) -> bool {
         .duration_delta
         .is_some_and(|delta| delta > MAX_AUTOMATIC_DURATION_GAP_SECONDS)
         || candidate.length_contradicted.is_some()
+        || candidate.length_unknown
     {
         return false;
     }
@@ -1145,6 +1164,12 @@ mod tests {
             song(3, "deezer", Some(254.0)),
         ];
         assert!(select(evidence(), &right_length).is_some());
+        // No source gives a length at all: the names agree, but nothing ties
+        // the match to this audio, so it is asked about.
+        let no_length = [song(1, "genius", None), song(2, "radiojavan", None)];
+        assert!(select(evidence(), &no_length).is_none());
+        let reason = unsure_reason(evidence(), &no_length);
+        assert!(reason.contains("give no length"), "{reason}");
         // Audio recognition is proof about the sound itself and needs no length.
         let mut recognized = song(1, "songrec", None);
         recognized.score_breakdown = Some(

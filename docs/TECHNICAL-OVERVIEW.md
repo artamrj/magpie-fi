@@ -43,7 +43,9 @@ through. The design and its reasons are in [BLUEPRINT.md](BLUEPRINT.md).
 
 - **Web page** (`web/`): React, built with Vite and served from disk by the same process
   (`MAGPIE_WEB_DIR`, `/usr/share/magpie-fi` in the image). It polls `/api/status`, `/api/tracks`
-  and `/api/requests`.
+  and `/api/requests`. The Review list is paged and searched on the server (50 songs per
+  section, "Show 100 more"), and a song's matches are fetched when the song is opened, so the
+  page stays quick with thousands of songs waiting.
 - **Program** (`src/`): one binary. Heavy work (decoding, fingerprinting, network lookups, tag
   writing) runs with bounded concurrency (§13).
 - **Storage**: one SQLite file plus caches in it. Settings come only from `MAGPIE_*` environment
@@ -375,7 +377,10 @@ A candidate is approved automatically only when:
   not "Marie"), and its length is at most 15 s off the audio. A match from a source that gives
   no length (Genius, some Radio Javan pages) is checked through the sources that list the same
   song with one: when even the closest of those is more than 15 s off, the match is not chosen
-  automatically, however many sources agree on the name. Audio recognition needs no length.
+  automatically, however many sources agree on the name. When no source gives a length at
+  all, the match is not chosen either: sources searched with the file's tags only repeat
+  those tags, and the length is the one thing that comes from the audio. Audio recognition
+  needs no length.
 
 **The best match is kept, cover or not** (`scan::process::decide`). The chosen release is
 completed and needs title, artist, album and a verified cover. Correct tags matter more than a
@@ -600,7 +605,7 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 
 | Cache | Key | Lifetime |
 |---|---|---|
-| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily. |
+| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily (index on `expires_at`). Cover images (`artwork-url`) are capped at **200 MiB** together: when a new cover goes over, the ones kept the shortest time are removed down to 160 MiB. |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | path + size + mtime | until the file changes; together capped at **100 MiB**, oldest first (at start, daily and hourly when idle) |
 | `artwork_overrides` | path | until you choose another cover |
 
@@ -623,7 +628,8 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /inbox/check` | Check the inbox now |
 | `POST /stop` | Stop the running workflow at a safe point |
 | `POST /write` | File all Ready songs now |
-| `GET /tracks` | All tracks with their candidates (a plain array) |
+| `GET /tracks?q=&limit=` | The Review list: `counts` per section (review, issues, skipped, working, ready, confident, damaged), `matching` (the same for songs that fit `q`), `order` (ids of the songs that wait, Review then Issues), `confident_titles`, and `tracks`: the first `limit` (default 50, at most 1000) songs of each section that fit `q`, each with `group`, `candidate_count`, `confident` and only its chosen candidate. `q` looks for every word in the file name, title, artist and album. |
+| `GET /tracks/{id}` | One song with all its candidates, best first |
 | `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only), or clear a song whose file is gone |
 | `POST /tracks/retry-issues` | Repair and re-run everything in Issues |
 | `POST /tracks/auto-approve` | Smart auto-select over Review (`approved`, `low_confidence`) |
