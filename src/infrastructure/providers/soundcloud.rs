@@ -1,40 +1,9 @@
-use super::{Candidate, ClientCredentials, nonempty, request_json};
+//! SoundCloud links: title, artist and cover from the public oEmbed page.
+//! Search was removed because it needs an app key SoundCloud no longer gives out.
+use super::{Candidate, request_json};
 use anyhow::{Result, bail};
 use reqwest::Client;
 use serde_json::Value;
-
-pub type SoundCloudAuth = ClientCredentials;
-
-const TOKEN_URL: &str = "https://secure.soundcloud.com/oauth/token";
-
-pub async fn search(
-    client: &Client,
-    auth: &SoundCloudAuth,
-    client_id: &str,
-    client_secret: &str,
-    title: &str,
-    artist: Option<&str>,
-) -> Result<Vec<Candidate>> {
-    let token = auth
-        .token(client, TOKEN_URL, client_id, client_secret)
-        .await?;
-    let query = match artist.filter(|value| !value.trim().is_empty()) {
-        Some(artist) => format!("{} {}", artist.trim(), title.trim()),
-        None => title.trim().to_owned(),
-    };
-    let raw = request_json(
-        client
-            .get("https://api.soundcloud.com/tracks")
-            .header("Authorization", format!("OAuth {token}"))
-            .query(&[
-                ("q", query.as_str()),
-                ("limit", "15"),
-                ("linked_partitioning", "true"),
-            ]),
-    )
-    .await?;
-    Ok(parse_results(&raw))
-}
 
 pub async fn lookup_url(client: &Client, url: &str) -> Result<Candidate> {
     validate_url(url)?;
@@ -58,72 +27,6 @@ fn validate_url(url: &str) -> Result<()> {
         bail!("only HTTPS SoundCloud source links are supported");
     }
     Ok(())
-}
-
-fn parse_results(raw: &Value) -> Vec<Candidate> {
-    raw["collection"]
-        .as_array()
-        .or_else(|| raw.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(candidate_from_track)
-        .collect()
-}
-
-fn candidate_from_track(track: &Value) -> Option<Candidate> {
-    if track["kind"].as_str().is_some_and(|kind| kind != "track") {
-        return None;
-    }
-    let raw_title = track["title"].as_str()?.trim();
-    let explicit_artist = nonempty(track["metadata_artist"].as_str()).map(str::to_owned);
-    let title_credit = split_artist_title(raw_title);
-    let use_title_credit = title_credit.as_ref().is_some_and(|(title_artist, _)| {
-        explicit_artist
-            .as_deref()
-            .is_none_or(|artist| same_credit(title_artist, artist))
-    });
-    let title = title_credit
-        .as_ref()
-        .filter(|_| use_title_credit)
-        .map_or(raw_title, |(_, title)| title);
-    let artist = explicit_artist
-        .or_else(|| {
-            title_credit
-                .as_ref()
-                .filter(|_| use_title_credit)
-                .map(|(artist, _)| artist.clone())
-        })
-        .or_else(|| nonempty(track["user"]["username"].as_str()).map(str::to_owned))?;
-    let credits = crate::domain::credits::normalize_featured(&artist, title);
-    let release_year = track["release_year"].as_i64().map(|year| year.to_string());
-    let release_date = release_year.as_deref().map(|year| {
-        match (
-            track["release_month"].as_u64(),
-            track["release_day"].as_u64(),
-        ) {
-            (Some(month), Some(day)) => format!("{year}-{month:02}-{day:02}"),
-            (Some(month), None) => format!("{year}-{month:02}"),
-            _ => year.to_owned(),
-        }
-    });
-    let album_artist = credits.artists.first().map(|credit| credit.name.clone());
-    Some(Candidate {
-        provider: "soundcloud".into(),
-        title: credits.title,
-        artist: credits.artist,
-        artist_credits: credits.artists,
-        album: track["release"].as_str().map(str::to_owned),
-        album_artist,
-        year: release_year,
-        genre: nonempty(track["genre"].as_str()).map(str::to_owned),
-        label: nonempty(track["label_name"].as_str()).map(str::to_owned),
-        isrc: nonempty(track["isrc"].as_str()).map(str::to_owned),
-        cover_url: track["artwork_url"].as_str().map(upgrade_artwork_url),
-        release_date,
-        duration_delta: track["duration"].as_f64().map(|value| value / 1000.0),
-        raw_json: track.to_string(),
-        ..Default::default()
-    })
 }
 
 fn candidate_from_oembed(raw: &Value) -> Option<Candidate> {
@@ -174,17 +77,6 @@ fn strip_audio_extension(value: &str) -> &str {
     value
 }
 
-fn same_credit(left: &str, right: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|character| character.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    normalize(left) == normalize(right)
-}
-
 pub fn upgrade_artwork_url(url: &str) -> String {
     const SIZES: [&str; 7] = [
         "-large.",
@@ -205,25 +97,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_search_metadata_and_upgrades_cover() {
-        let candidates = parse_results(&serde_json::json!({"collection": [{
-            "kind": "track", "title": "Song (ft Guest)", "metadata_artist": "Artist",
-            "duration": 203000, "genre": "Persian Pop", "isrc": "US1234567890",
-            "release": "Single", "release_year": 2024, "release_month": 3,
-            "release_day": 2, "artwork_url": "https://i1.sndcdn.com/artworks-id-large.jpg",
-            "user": {"username": "Uploader"}
-        }]}));
-        assert_eq!(candidates[0].provider, "soundcloud");
-        assert_eq!(candidates[0].artist, "Artist feat. Guest");
-        assert_eq!(candidates[0].title, "Song");
-        assert_eq!(candidates[0].release_date.as_deref(), Some("2024-03-02"));
-        assert_eq!(
-            candidates[0].cover_url.as_deref(),
-            Some("https://i1.sndcdn.com/artworks-id-t500x500.jpg")
-        );
-    }
-
-    #[test]
     fn parses_user_supplied_soundcloud_example() {
         let candidate = candidate_from_oembed(&serde_json::json!({
             "title": "Arta - Hanooz Yadame (Ft Koorosh, Sami Low, & Raha) by Sina Mohtasham",
@@ -234,19 +107,6 @@ mod tests {
         assert_eq!(candidate.artist, "Arta feat. Koorosh, Sami Low, & Raha");
         assert_eq!(candidate.title, "Hanooz Yadame");
         assert_eq!(candidate.score, 94.0);
-    }
-
-    #[test]
-    fn title_credit_beats_an_unrelated_uploader_name() {
-        let candidate = candidate_from_track(&serde_json::json!({
-            "kind": "track",
-            "title": "Arta - Hanooz Yadame (Ft Koorosh)",
-            "user": {"username": "Sina Mohtasham"},
-            "artwork_url": "https://i1.sndcdn.com/artworks-id-large.jpg"
-        }))
-        .unwrap();
-        assert_eq!(candidate.artist, "Arta feat. Koorosh");
-        assert_eq!(candidate.title, "Hanooz Yadame");
     }
 
     #[test]

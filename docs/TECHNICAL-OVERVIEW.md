@@ -43,7 +43,9 @@ through. The design and its reasons are in [BLUEPRINT.md](BLUEPRINT.md).
 
 - **Web page** (`web/`): React, built with Vite and served from disk by the same process
   (`MAGPIE_WEB_DIR`, `/usr/share/magpie-fi` in the image). It polls `/api/status`, `/api/tracks`
-  and `/api/requests`.
+  and `/api/requests`. The Review list is paged and searched on the server (50 songs per
+  section, "Show 100 more"), and a song's matches are fetched when the song is opened, so the
+  page stays quick with thousands of songs waiting.
 - **Program** (`src/`): one binary. Heavy work (decoding, fingerprinting, network lookups, tag
   writing) runs with bounded concurrency (§13).
 - **Storage**: one SQLite file plus caches in it. Settings come only from `MAGPIE_*` environment
@@ -62,7 +64,7 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `candidates` | One row per suggestion from a source: full field set, `score`, `score_breakdown` (JSON: sources, duration delta, audio recognition, artwork), artist credits, artwork list and status |
 | `artwork_overrides` | Cover chosen by you for a file, so it survives a rescan |
 | `canonical_names` | Preferred spelling of artist/album names (aliases, Latin vs. original script) |
-| `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
+| `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed; `second_look` marks a song that already had its one extra look |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
 | `requests` | One row per link someone asked for; its Telegram status message: id, `card_kind` (`card` or `text`) and the card's last caption |
 | `wanted` | One row per song a request wants, in order: status, attempts, staging/library path; its Telegram review question (`review_message_id`, `review_card`: 0 text or none, 1 card waiting for a choice, 2 card showing how it ended) |
@@ -91,7 +93,14 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
 
 1. Read the configuration, create the inbox, library, trash, staging and data folders, connect
    to SQLite (WAL, `0600` file), run migrations. Tracks left `processing` by a restart are marked
-   failed; expired source answers are removed.
+   failed; expired source answers are removed. What a restart interrupted is settled once
+   (`acquire::worker::resume_after_restart`, `library::recover_leftovers`): downloads start
+   again; a file that was being received from Telegram and a link that was still being read
+   are marked failed with "send it again"; half-received files in `staging/.part` are removed;
+   hidden work copies left in the library (`.Song.mp3.magpie-fi-…`, `.Song.tag-clean-…`) go to
+   the trash; an artist folder caught half-way through a rename (`.Artist.magpie-fi-rename`)
+   gets its old name back. Every background loop (inbox, downloads, bot, maintenance) is
+   started again when it stops unexpectedly (`keep_running` in `main.rs`).
 2. Run the daily cache cleanup if it has not run today, empty trash days older than
    `MAGPIE_TRASH_DAYS`, and enforce the media-cache limit.
 3. Start the background tasks:
@@ -116,6 +125,14 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
    name starts with `.` or `@` (unfinished downloads, NAS metadata).
 2. Keep files that are new or changed since the last check (`automatic_scan_files`). Inbox files
    must also be unchanged for `MAGPIE_INBOX_SETTLE_SECONDS`; staging files don't wait.
+   Songs still waiting for a pick (or waiting as a duplicate) whose file you deleted from the
+   inbox are dropped from Review (`forget_deleted_songs`). A song with a chosen match is kept,
+   and nothing is dropped while the inbox folder cannot be read.
+   One cycle takes at most `INBOX_BATCH` (200) files: magpie-fi's own downloads first, then
+   inbox files in path order. A bigger inbox is worked through batch by batch, each batch filed
+   before the next starts, and the next cycle follows at once. Each file is written to
+   `automatic_scan_files` as soon as it is identified, so a restart or "Stop" only repeats the
+   files that were not finished and keeps the picks already made in Review.
 3. For each file, in parallel: read tags and audio properties, check decodability (cached),
    compute a Chromaprint fingerprint (cached) or fall back to SHA-256.
 4. Group duplicates inside the inbox (§8) before any network lookup.
@@ -126,8 +143,12 @@ Each duplicate group is one job (`scan::process::process_file`). A job gets two 
 
 1. **Corrupt** files are marked `corrupt` and go to Issues.
 2. **Identify** with the source cascade (§10). A source that answers 401 (wrong key) is skipped
-   for the rest of that check. A 429 or a timeout pauses it for 30 s, doubling up to 5 minutes,
-   after which it is asked again. iTunes gets at most one search every 3 s (Apple allows ~20 a
+   for the rest of that check. A 429, a 403, a 503, a "quota" or "rate limit" answer or a
+   timeout pauses it for 30 s, doubling up to 5 minutes, after which it is asked again. A song
+   that was identified while a source was paused and was left unsure (in Review, no match
+   chosen) is identified once more, five minutes later (`automatic_scan_files.second_look`),
+   so it does not wait in Review for good without that source. There is no third look. A song
+   that makes the identifier panic is marked failed (Issues) and the scan carries on. iTunes gets at most one search every 3 s (Apple allows ~20 a
    minute).
 3. **Sort** candidates by trust tier, then score.
 4. **Smart auto-selection** (§9) decides. No candidates → `unmatched`; candidates that fail the
@@ -147,13 +168,26 @@ In Review you can:
 - **Auto-approve** (`POST /api/tracks/auto-approve`): the same rules as Phase 2 over all of
   Review; doubtful songs stay.
 - **Edit by hand** (`PUT /api/tracks/{id}/manual`): a `manual` candidate (score 100). Pasting a
-  Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`).
+  Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`). Every
+  service the Add page reads one song from (Spotify, Apple Music, Deezer, Shazam) goes through
+  the same reader (`acquire::links`), so a service added there works here too; SoundCloud,
+  Audiomack, Navahang, Radio Javan, Genius and YouTube have song page readers of their own.
+  The Artist line and the artist chips always say the same thing: typing in one rewrites the
+  other, and on save chips that name other people than the line are ignored.
+- **Keep the file's own tags** (`POST /api/tracks/{id}/keep-tags`): for when no match is right
+  and the file is. The last choice in the release list, shown when the file has a title and an
+  artist. Its tags are saved like an edit by hand (a `manual` candidate). The picture inside the
+  file becomes its cover when it is square (within 2 %) and at least 500 px; it is read from the
+  file again when the song is filed and is not cached or remembered for later scans. A video
+  frame or a small thumbnail is refused, the page says why, and the song waits for a cover like
+  any other. This is the only path on which a file's own picture counts as a verified cover.
 - **Change the cover** (`PUT /api/tracks/{id}/artwork`): a cover URL or a song link; the image is
   verified and remembered in `artwork_overrides`. **Search again**:
   `POST /api/tracks/{id}/artwork/search`.
 - **Undo** (`POST /api/tracks/{id}/review`): clears the choice, keeps the candidates.
 - **Remove** (`DELETE /api/tracks/{id}`): only unresolved Review songs inside the inbox or
-  staging. Your files go to the trash; magpie-fi's downloads are deleted.
+  staging. Your files go to the trash; magpie-fi's downloads are deleted. When the file is
+  already gone, the song is just cleared from the list, whatever state it is in.
 - **Check & fix** (`POST /api/tracks/retry-issues`): re-runs everything in Issues. Corrupt files
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
@@ -260,6 +294,14 @@ string, ISRC or MusicBrainz recording ID match **and** the durations are within 
 when the fingerprints **sound the same** (`domain::fingerprint::similarity` ≥ 0.85, best of ±15 s
 offsets; re-encodes score 0.95–1.0, different songs 0.45–0.69) with durations within 3 seconds.
 
+What happens next depends on the proof (`LibraryEntry::proven_by_audio`). Identical content, the
+same fingerprint or the same sound are proof about the file itself: a lossless file replaces a
+lossy library copy, and any other new copy goes to the trash. An ISRC or MusicBrainz recording
+ID belongs to the chosen match, not to the file, and a match can be wrong (a remaster or a
+re-recording matched to the original). On that alone nothing is trashed or replaced: the song
+goes back to Review as "Possible duplicate", and **File anyway** files it next to the other one.
+A file proven by audio is preferred over one found by ID.
+
 **Possible duplicates.** Without that proof, a song with the same title key (`feat.` removed,
 spelling unified), a length within 3 s and an overlapping primary artist (in any order or
 spelling) goes back to Review as "Possible duplicate" before filing. **File anyway** files it.
@@ -295,7 +337,8 @@ Saving (`PUT /files/song`, `file_browser::edit_song`) takes the workflow slot, t
    (`files::edit_on_copy`, shared with the Artists page), reads the copy back, and renames it
    over the song only when every field reads as written;
 4. describes the song again into `library_items`.
-A new artist or album artist rewrites ARTISTS / ALBUMARTISTS from the text (`A feat. B` gives
+The page shows the separate ARTISTS values under the artist line as "Credited to" (read-only), so a
+split made on the Artists page can be seen there. A new artist or album artist rewrites ARTISTS / ALBUMARTISTS from the text (`A feat. B` gives
 two, `A & B` stays one) and drops that artist's sort name and MusicBrainz artist IDs; a new year
 also replaces a release date of another year; an empty field removes the tag. The answer holds
 the old values of the changed fields, and the page's Undo saves them again. WAV and AIFF are not
@@ -343,7 +386,13 @@ A candidate is approved automatically only when:
   (`names::loose_title_key`: the artist Latin key, plus the ezafe "-ye"/"-yeh"/"-e" dropped
   from words that are not last, so "Gheseh Eshgh" = "Ghesseyeh Eshgh");
 - its version tags match the file's (`session` counts as a version, so "Marie (Dach Session)" is
-  not "Marie"), and its length is at most 15 s off the audio.
+  not "Marie"), and its length is at most 15 s off the audio. A match from a source that gives
+  no length (Genius, some Radio Javan pages) is checked through the sources that list the same
+  song with one: when even the closest of those is more than 15 s off, the match is not chosen
+  automatically, however many sources agree on the name. When no source gives a length at
+  all, the match is not chosen either: sources searched with the file's tags only repeat
+  those tags, and the length is the one thing that comes from the audio. Audio recognition
+  needs no length.
 
 **The best match is kept, cover or not** (`scan::process::decide`). The chosen release is
 completed and needs title, artist, album and a verified cover. Correct tags matter more than a
@@ -373,6 +422,15 @@ source gave a length at all). The Review screen shows this text. A release witho
   below the 0.82 of an exact match, so it needs the audio or a second source. Remixers named
   in the title don't trigger this. When such a match is used, the main singer is put back
   first (`credits::restore_missing_main`).
+- A match that names only some of the file's singers ("Alireza JJ feat. Hoomaan" for *Alireza
+  JJ, Sijal & Sepehr Khalse feat. Hoomaan*) gets the others back when it is used: everyone it
+  names must be in the file and it must start with the file's main singer
+  (`credits::restore_missing_singers`). A match naming someone the file does not is left alone.
+- An album artist that has to be filled in is the main singers only, without the "feat."
+  guests (`credits::main_credits`).
+- A year is written only as four digits, alone or at the start of a date. A day-first date
+  ("05.10.2020") is turned round; anything else is dropped for the release date's year
+  (`metadata_completion::clean_year`).
 - Two remix (live, acoustic…) titles match when the song and the remixer agree.
 - Artist lists are compared as sets of people: "A, B & C" = "A, C & B". A name that is the end
   of another one is the same person ("Tataloo" = "Amir Tataloo", "MJ" = "Sohrab MJ";
@@ -420,8 +478,9 @@ cheap and free ones first:
    Never for a file longer than 20 minutes (`scan::providers::is_long_mix`): Shazam hears a
    slice, so on a DJ mix it names one song in it.
    Its artist/title is fed back through the catalogs of step 3–5.
-8. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
-   service is used.
+8. **Discogs**, **Last.fm** — each only with its free key or token. No paid service is used.
+   SoundCloud is not searched (its app keys are no longer given out); a pasted SoundCloud link
+   is read from the public oEmbed page without a key.
 
 Free without a key: MusicBrainz, Apple Music, Deezer, Radio Javan, Audiomack, Navahang, Genius,
 SongRec. Other sources: **Cover Art Archive** (covers by MusicBrainz release), **Wikidata**
@@ -476,8 +535,13 @@ second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was
   iTunes and Deezer by title); then the **album itself**: the front cover of the MusicBrainz
   release group (any edition of the same album, Cover Art Archive), and album searches by album
   name and album artist on iTunes (`entity=album`) and Deezer (`search/album`). Each is still
-  checked against album and artist (the album artist counts too). The release and its tags
-  never change. Only then is the cover "missing"; the time of that search is stored as
+  checked against album and artist (the album artist counts too). A song filed as its own
+  single (its album is only its own title) has no album to compare, so it takes the cover of
+  the release the same recording is on in the store: same title, artist and version, a single
+  of the song before an album, never a compilation ("Nemesis" gets the cover of "At Least for
+  Now"). A named release, such as a live single, keeps the strict check. Rows of a fresh
+  store search carry the song's whole length, not its difference from the file, and are
+  compared without a length. The release and its tags never change. Only then is the cover "missing"; the time of that search is stored as
   `metadata_completion.cover_searched_at`.
 - **Cover finder** (`src/application/cover_finder.rs`): in every inbox cycle, between identifying
   and filing, it runs the cover worker again for songs in Review whose chosen match lacks a cover
@@ -524,10 +588,28 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 - **External tools**: the integrity check, fingerprint, repair, rsgain and SongRec run
   through `infrastructure::process`: whether a tool is installed is checked once per
   run, and every call has a timeout after which the process is killed (e.g. 3 min for a
-  fingerprint, 30 min for rsgain on one album). yt-dlp calls have their own timeouts
+  fingerprint, 30 min for rsgain on one album). Code that is not async (tag reading and
+  writing) uses `process::run_blocking`, with the same rule: ffprobe 60 s, the lossless tag
+  cleanup 5 min, WAV/AIFF → FLAC 15 min. yt-dlp calls have their own timeouts
   (`MAGPIE_MAX_DOWNLOAD_SECONDS` for a download, default 15 min).
 - **One workflow at a time**: an inbox cycle, "File now", auto-approve and "Check & fix" never run
   together (`try_claim_workflow`). `POST /api/stop` asks the running one to stop at a safe point.
+  Work that a request does itself (artist changes, saving tags, "Accept confident matches") goes
+  through `AppState::run_in_workflow`: it runs on its own task, so it finishes and frees the slot
+  even when the page stops waiting (it gives up after 30 s) or the work panics. Jobs that
+  already hold the slot (the inbox cycle, filing, "Check & fix", tidying) run under
+  `AppState::guard_workflow`: a panic gives the slot back with a "failed" status.
+- **Changing a song that is already in the library** (`files::edit_on_copy`: Files tab, artist
+  and album fixes, lyrics tidy) happens on a hidden copy. Before the copy replaces the song it
+  must still read as audio of the same length (within 1 s) and is flushed to disk. Moving a
+  song never overwrites a lyrics file or deletes a cover that is already in the new folder: the
+  one that cannot move goes to the trash. Renaming an artist replaces the name only where it
+  stands as a whole name ("Ebi" does not change "Debi Nova").
+- **Library index**: when a library folder cannot be read (a disk that is not mounted), no song
+  is forgotten in that pass.
+- **WAV/AIFF → FLAC** is decided by what is inside the file, not by its name, so an MP3 named
+  `.wav` is copied and never re-encoded. A tag cleanup that would shorten a song by more than
+  1 s is refused and the song goes to Issues.
 
 ---
 
@@ -535,7 +617,7 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 
 | Cache | Key | Lifetime |
 |---|---|---|
-| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily. |
+| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily (index on `expires_at`). Cover images (`artwork-url`) are capped at **200 MiB** together: when a new cover goes over, the ones kept the shortest time are removed down to 160 MiB. |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | path + size + mtime | until the file changes; together capped at **100 MiB**, oldest first (at start, daily and hourly when idle) |
 | `artwork_overrides` | path | until you choose another cover |
 
@@ -558,14 +640,16 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /inbox/check` | Check the inbox now |
 | `POST /stop` | Stop the running workflow at a safe point |
 | `POST /write` | File all Ready songs now |
-| `GET /tracks` | All tracks with their candidates (a plain array) |
-| `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only) |
+| `GET /tracks?q=&limit=` | The Review list: `counts` per section (review, issues, skipped, working, ready, confident, damaged), `matching` (the same for songs that fit `q`), `order` (ids of the songs that wait, Review then Issues), `confident_titles`, and `tracks`: the first `limit` (default 50, at most 1000) songs of each section that fit `q`, each with `group`, `candidate_count`, `confident` and only its chosen candidate. `q` looks for every word in the file name, title, artist and album. |
+| `GET /tracks/{id}` | One song with all its candidates, best first |
+| `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only), or clear a song whose file is gone |
 | `POST /tracks/retry-issues` | Repair and re-run everything in Issues |
 | `POST /tracks/auto-approve` | Smart auto-select over Review (`approved`, `low_confidence`) |
 | `GET /tracks/{id}/audio` | Stream the file (range requests) |
 | `POST /tracks/{id}/choose` | Accept a candidate |
 | `POST /tracks/{id}/review` | Undo the choice |
 | `PUT /tracks/{id}/manual` | Save details typed by hand |
+| `POST /tracks/{id}/keep-tags` | Keep the file's own tags instead of a match |
 | `PUT /tracks/{id}/artwork` | Set and verify a cover URL or song link |
 | `POST /tracks/{id}/artwork/search` | Search covers again |
 | `GET /tracks/{id}/artwork/preview` | The cover that will be embedded |
@@ -573,7 +657,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie-fi |
 | `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
 | `GET /library/recent` | The songs filed most recently |
-| `GET /artists` | Every artist with song count, spellings, "looks like two" and albums spelled two ways |
+| `GET /artists` | Every artist with song count, spellings, "looks like two" and albums spelled two ways. The songs are read once and counted in the program; the page draws 100 artists at a time and searches all of them. |
 | `POST /artists/{id}` | Rename, join, split or confirm an artist, or make one album of a split album (`join_album` with a key from the next route); retags and moves songs |
 | `GET /artists/{id}/albums` | The artist's albums Navidrome shows more than once (`album_changes::split_albums`): each way the album is tagged, the one kept first |
 | `GET /files?path=` | One folder of `library/` ("" is the library): folders with counts, songs |

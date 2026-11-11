@@ -34,10 +34,34 @@ pub use requests::{create_request, list_requests, recent_library, request_songs,
 pub use scan::{check_inbox, retry_issues, run_automatic_cycle, stop_scan};
 pub use settings::setup;
 pub use tracks::{
-    artwork_preview, auto_approve_review, candidate_artwork_preview, file_anyway, list_tracks,
-    manual_candidate, original_artwork_preview, remove_track, resolve_source, return_to_review,
-    search_artwork, select_candidate, track_audio, update_artwork,
+    artwork_preview, auto_approve_review, candidate_artwork_preview, file_anyway, get_track,
+    keep_file_tags, list_tracks, manual_candidate, original_artwork_preview, remove_track,
+    resolve_source, return_to_review, search_artwork, select_candidate, track_audio,
+    update_artwork,
 };
+
+/// Runs a request's work in the workflow slot (see [`AppState::run_in_workflow`]):
+/// it finishes and frees the slot even when the page stops waiting for the answer.
+async fn in_workflow<T, F>(
+    s: &Arc<AppState>,
+    phase: WorkflowPhase,
+    message: &'static str,
+    work: F,
+) -> ApiResult<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match s.run_in_workflow(phase, message, work).await {
+        Some(Ok(done)) => Ok(done),
+        Some(Err(error)) => Err(ApiError::Internal(anyhow::anyhow!(
+            "the work stopped unexpectedly: {error}"
+        ))),
+        None => Err(ApiError::conflict(
+            "Wait for the current scan or write operation to finish",
+        )),
+    }
+}
 
 /// `GET /api/status`: what the background workflow is doing.
 pub async fn workspace(State(s): State<Arc<AppState>>) -> Json<Workflow> {

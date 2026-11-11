@@ -88,23 +88,11 @@ fn embed_one(song: &Path, sidecar: &Path) -> Result<bool> {
     if text.trim().is_empty() {
         return Ok(false);
     }
-    let name = song
-        .file_name()
-        .context("song has no name")?
-        .to_string_lossy();
-    let extension = song
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = song.with_file_name(format!(".{name}.magpie-fi-tidy.{extension}"));
-    let result = std::fs::copy(song, &temporary)
-        .map_err(anyhow::Error::from)
-        .and_then(|_| tag_writer::embed_lyrics(&temporary, text))
-        .and_then(|()| std::fs::rename(&temporary, song).map_err(anyhow::Error::from));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map(|()| true)
+    let text = text.to_owned();
+    crate::application::files::edit_on_copy(song, "tidy", move |copy| {
+        tag_writer::embed_lyrics(copy, &text)?;
+        Ok(true)
+    })
 }
 
 #[cfg(test)]

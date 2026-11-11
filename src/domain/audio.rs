@@ -86,8 +86,11 @@ fn info_from_tagged(path: &Path, tagged: &lofty::file::TaggedFile) -> AudioInfo 
     }
 }
 
+const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn info_from_ffprobe(path: &Path) -> Result<AudioInfo> {
-    let output = std::process::Command::new("ffprobe")
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -98,9 +101,9 @@ fn info_from_ffprobe(path: &Path) -> Result<AudioInfo> {
             "-of",
             "json",
         ])
-        .arg(path)
-        .output()
-        .context("could not start ffprobe")?;
+        .arg(path);
+    // A file on a stalled network folder must not hold a reader forever.
+    let output = crate::infrastructure::process::run_blocking(command, FFPROBE_TIMEOUT)?;
     if !output.status.success() {
         return Err(anyhow!(
             "ffprobe could not read audio: {}",

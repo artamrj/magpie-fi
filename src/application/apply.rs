@@ -177,6 +177,32 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
         db::candidates::update(&s.pool, candidate).await?;
     }
 
+    // A file that is gone because it was already filed: magpie-fi was stopped
+    // right after the song reached the library and before its row here was
+    // cleared. The same audio is in the library, so there is nothing to
+    // restore and nothing to show in Issues.
+    let mut waiting = Vec::with_capacity(sources.len());
+    for source in sources {
+        if let Some(key) = source.track.content_fingerprint.as_deref()
+            && !tokio::fs::try_exists(&source.track.path)
+                .await
+                .unwrap_or(true)
+            && library::has_content(&s.pool, key).await?
+        {
+            sqlx::query("DELETE FROM tracks WHERE id=?")
+                .bind(source.track.id.0)
+                .execute(&s.pool)
+                .await?;
+            tracing::info!(
+                file = source.track.filename,
+                "already filed before the last restart; cleared from the list"
+            );
+            continue;
+        }
+        waiting.push(source);
+    }
+    let mut sources = waiting;
+
     let mut evidence = Vec::with_capacity(sources.len());
     for source in &mut sources {
         source.available = tokio::fs::metadata(&source.track.path)
@@ -264,10 +290,74 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
     Ok(prepared)
 }
 
+/// Songs of one new album filed in the same batch agree on the album before anything is
+/// written. Sources spell and date an album differently ("Khalij" on Apple Music and
+/// Spotify, "Khaleej" as a single on Radio Javan), and the library cannot settle it yet
+/// because none of the songs is there. The spelling most of the batch's songs of that album
+/// use wins, an album before a single of the same name; the others take its album details
+/// (see [`library::join_planned_album`]). Editions stay apart.
+fn join_planned_albums(library: &Path, items: &mut [PreviewItem]) {
+    let group_of = |item: &PreviewItem| {
+        let artist_folder = Path::new(&item.destination_path).parent()?.parent()?;
+        let album = item.candidate.album.as_deref()?;
+        Some((
+            artist_folder.to_path_buf(),
+            crate::domain::names::album_key(album),
+        ))
+    };
+    let groups = items.iter().map(group_of).collect::<Vec<_>>();
+    // How one song writes the album: its name as spelled, and whether it is a single or EP.
+    let spelling = |item: &PreviewItem| {
+        (
+            item.candidate.album.clone(),
+            library::release_suffix(&item.candidate),
+        )
+    };
+    for index in 0..items.len() {
+        let Some(group) = &groups[index] else {
+            continue;
+        };
+        let members = (0..items.len())
+            .filter(|other| groups[*other].as_ref() == Some(group))
+            .collect::<Vec<_>>();
+        let leader = members.iter().copied().max_by_key(|member| {
+            let same = members
+                .iter()
+                .filter(|other| spelling(&items[**other]) == spelling(&items[*member]))
+                .count();
+            (
+                library::release_suffix(&items[*member].candidate).is_empty(),
+                same,
+                // Among equals the first song of the batch decides.
+                std::cmp::Reverse(*member),
+            )
+        });
+        let Some(leader) =
+            leader.filter(|leader| spelling(&items[*leader]) != spelling(&items[index]))
+        else {
+            continue;
+        };
+        let album_song = items[leader].candidate.clone();
+        let item = &mut items[index];
+        if !library::join_planned_album(&mut item.candidate, &album_song) {
+            continue;
+        }
+        let extension = Path::new(&item.destination_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mp3")
+            .to_owned();
+        item.destination_path = library::destination(library, &item.candidate, &extension)
+            .to_string_lossy()
+            .into_owned();
+    }
+}
+
 /// Songs of one new album filed in the same batch get the year of the first
 /// one, so they share one folder and Navidrome never splits the album.
 fn align_planned_albums(output_dir: &str, items: &mut [PreviewItem]) {
     let library = Path::new(output_dir);
+    join_planned_albums(library, items);
     let mut first_year = std::collections::HashMap::<(PathBuf, String, &str), String>::new();
     for item in items {
         let destination = PathBuf::from(&item.destination_path);
@@ -461,7 +551,16 @@ pub(crate) async fn claim_ready(s: &AppState) -> Result<Claim> {
 
 /// Files the prepared items and releases the workflow slot.
 pub(crate) async fn run_claimed(s: Arc<AppState>, items: Vec<PreviewItem>) -> Result<usize> {
-    let result = apply(&s, items).await;
+    // On its own task: a panic while filing one song becomes an error here,
+    // so the slot is always given back below.
+    let filing = tokio::spawn({
+        let s = s.clone();
+        async move { apply(&s, items).await }
+    });
+    let result = match filing.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow!("filing stopped unexpectedly: {error}")),
+    };
     if s.workflow_cancelled().await {
         s.finish_workflow(WorkflowPhase::Idle, "Filing stopped")
             .await;
@@ -820,6 +919,16 @@ async fn file_item(
     )
     .await?
     {
+        // Only the ISRC or MusicBrainz ID of the chosen match says so, and a
+        // match can be wrong (a remaster, a re-recording). Nothing is trashed or
+        // replaced on that alone: the owner decides in Review.
+        Some(existing) if !existing.proven_by_audio => {
+            if !duplicate_allowed(s, item.track_id).await? {
+                return_track_as_possible_duplicate(s, item.track_id, &existing.path).await?;
+                return Ok(Filing::NotFiled);
+            }
+            None
+        }
         Some(existing) if !library::is_upgrade(&item.evidence, &existing) => {
             skip_known_recording(s, item, &existing.path).await?;
             return Ok(Filing::NotFiled);
@@ -867,17 +976,25 @@ async fn file_item(
             .await
             .with_context(|| format!("could not create the album folder {}", parent.display()))?;
     }
-    if is_lossless_uncompressed(&src) {
+    let copied = if is_lossless_uncompressed(&src).await {
         // WAV and AIFF cannot be tagged reliably: they become FLAC, which loses nothing.
-        convert_to_flac(&src, &temporary).await?;
+        convert_to_flac(&src, &temporary).await
     } else {
-        tokio::fs::copy(&src, &temporary).await.with_context(|| {
-            format!(
-                "could not copy {} to {}",
-                src.display(),
-                temporary.display()
-            )
-        })?;
+        tokio::fs::copy(&src, &temporary)
+            .await
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "could not copy {} to {}",
+                    src.display(),
+                    temporary.display()
+                )
+            })
+    };
+    if let Err(error) = copied {
+        // A full disk leaves half a copy behind; it is magpie-fi's own file.
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
     }
 
     // 2. Tags, cover and lyrics (verified) and atomic publish.
@@ -943,6 +1060,7 @@ async fn file_item(
             source: "inbox".into(),
             fingerprint: item.evidence.fingerprint.clone(),
             artist_ids,
+            proven_by_audio: false,
         },
     )
     .await?;
@@ -1004,20 +1122,30 @@ async fn file_item(
 
 /// Writes and verifies the tags and cover of the temporary copy, off the
 /// async runtime and within the tag-writer limit.
-fn is_lossless_uncompressed(path: &Path) -> bool {
-    path.extension()
+/// Is this file really WAV or AIFF? What is inside decides, as it does for
+/// the name the song is filed under: an MP3 that is only named `.wav` is
+/// copied, never re-encoded, and a WAV named `.mp3` still becomes FLAC.
+async fn is_lossless_uncompressed(path: &Path) -> bool {
+    let by_name = path
+        .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "wav" | "aiff" | "aif"
-            )
-        })
+        .map(str::to_ascii_lowercase);
+    let source = path.to_path_buf();
+    let by_content = tokio::task::spawn_blocking(move || crate::domain::audio::read(&source))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|info| info.format.to_ascii_lowercase())
+        .filter(|format| !format.is_empty());
+    by_content
+        .or(by_name)
+        .is_some_and(|format| matches!(format.as_str(), "wav" | "aiff" | "aif"))
 }
 
 /// WAV or AIFF to FLAC: the same samples, about half the size, and a container that holds tags.
 async fn convert_to_flac(source: &Path, target: &Path) -> Result<()> {
-    let output = tokio::process::Command::new("ffmpeg")
+    let mut command = tokio::process::Command::new("ffmpeg");
+    command
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(source)
         .args([
@@ -1032,10 +1160,10 @@ async fn convert_to_flac(source: &Path, target: &Path) -> Result<()> {
             "-f",
             "flac",
         ])
-        .arg(target)
-        .output()
-        .await
-        .context("ffmpeg could not be started")?;
+        .arg(target);
+    let output =
+        crate::infrastructure::process::run(command, std::time::Duration::from_secs(15 * 60))
+            .await?;
     if !output.status.success() {
         bail!(
             "could not convert {} to FLAC: {}",
@@ -1422,6 +1550,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn songs_of_one_new_album_agree_on_its_spelling() {
+        let item = |title: &str, album: &str, kind: Option<&str>, year: &str| {
+            let candidate = Candidate {
+                title: title.into(),
+                artist: "Ebi".into(),
+                album: Some(album.into()),
+                album_artist: Some("Ebi".into()),
+                release_type: kind.map(str::to_owned),
+                year: Some(year.into()),
+                track_number: Some(1),
+                ..Default::default()
+            };
+            PreviewItem {
+                track_id: TrackId(1),
+                filename: format!("{title}.mp3"),
+                current_path: format!("/inbox/{title}.mp3"),
+                destination_path: library::destination(Path::new("/lib"), &candidate, "mp3")
+                    .to_string_lossy()
+                    .into_owned(),
+                candidate,
+                evidence: RecordingEvidence::default(),
+                duplicates: Vec::new(),
+            }
+        };
+        // Radio Javan knows the title song as a single spelled "Khaleej"; the catalogs know
+        // the album as "Khalij". A remaster is another album.
+        let mut items = vec![
+            item("Khaleej", "Khaleej", Some("single"), "1990"),
+            item("Goriz", "Khalij", Some("album"), "1989"),
+            item("Kolbeh Man", "Khalij", Some("album"), "1989"),
+            item("Goriz", "Khalij (Remastered)", Some("album"), "2008"),
+        ];
+        align_planned_albums("/lib", &mut items);
+
+        let title_song = &items[0];
+        assert_eq!(title_song.candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(title_song.candidate.year.as_deref(), Some("1989"));
+        assert_eq!(title_song.candidate.release_type.as_deref(), Some("album"));
+        // A single's "track 1" is not its place on the album; the song keeps its own title.
+        assert_eq!(title_song.candidate.track_number, None);
+        assert_eq!(title_song.candidate.title, "Khaleej");
+        assert!(
+            title_song
+                .destination_path
+                .starts_with("/lib/Ebi/Khalij (1989)/"),
+            "{}",
+            title_song.destination_path
+        );
+        assert_eq!(items[1].candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(
+            items[3].candidate.album.as_deref(),
+            Some("Khalij (Remastered)")
+        );
+
+        // An album never joins a single of the same name.
+        let mut pair = vec![
+            item("Khaleej", "Khaleej", Some("single"), "1990"),
+            item("Goriz", "Khalij", Some("album"), "1989"),
+        ];
+        align_planned_albums("/lib", &mut pair);
+        assert_eq!(pair[1].candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(pair[0].candidate.album.as_deref(), Some("Khalij"));
+    }
+
     #[tokio::test]
     async fn a_cover_that_fails_at_filing_is_asked_for_again() {
         let directory = tempfile::tempdir().unwrap();
@@ -1744,6 +1937,144 @@ mod tests {
             Claim::NothingReady
         ));
         assert!(!state.workflow_running().await);
+    }
+
+    #[tokio::test]
+    async fn a_match_alone_never_trashes_or_replaces_a_library_song() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = filing_state(directory.path()).await;
+        // Your MP3 of the original recording, with its ISRC.
+        let owned = Path::new(&state.config.output_dir).join("Artist/Album/Song.mp3");
+        tokio::fs::create_dir_all(owned.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&owned, b"the original recording")
+            .await
+            .unwrap();
+        library::remember(
+            &state.pool,
+            &library::LibraryEntry {
+                path: owned.to_string_lossy().into_owned(),
+                duration: Some(181.0),
+                content_key: Some("fp:original".into()),
+                isrc: Some("USUM71703861".into()),
+                format: "mp3".into(),
+                source: "index".into(),
+                ..library::LibraryEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A lossless file of another recording, matched to that same catalog song.
+        let source = Path::new(&state.config.input_dir).join("remaster.flac");
+        tokio::fs::write(&source, b"a re-recording").await.unwrap();
+        let track_id = insert_ready_track(&state.pool, &source, Some("flac"), "fp:remaster").await;
+        sqlx::query("UPDATE candidates SET isrc='USUM71703861' WHERE track_id=?")
+            .bind(track_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let Claim::Ready(prepared) = claim_ready(&state).await.unwrap() else {
+            panic!("the track should be ready");
+        };
+        assert_eq!(run_claimed(state.clone(), prepared.items).await.unwrap(), 0);
+
+        assert!(owned.exists(), "the library song stays where it is");
+        assert!(source.exists(), "the new file is not trashed either");
+        assert_eq!(
+            stage_of(&state.pool, track_id).await,
+            ("needs_review".into(), "review".into())
+        );
+        let message: String = sqlx::query_scalar("SELECT stage_message FROM tracks WHERE id=?")
+            .bind(track_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(message.starts_with(POSSIBLE_DUPLICATE), "{message}");
+    }
+
+    #[tokio::test]
+    async fn what_is_inside_a_file_decides_whether_it_becomes_flac() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let encode = |name: &str, format: &str, codec: &[&str]| {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=1")
+                .args(codec)
+                .args(["-f", format])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        // An MP3 that is only named .wav must never be re-encoded.
+        let mp3_named_wav = encode("lossy.wav", "mp3", &["-q:a", "9"]);
+        assert!(!is_lossless_uncompressed(&mp3_named_wav).await);
+        // A WAV named .mp3 still becomes FLAC.
+        let wav_named_mp3 = encode("lossless.mp3", "wav", &["-c:a", "pcm_s16le"]);
+        assert!(is_lossless_uncompressed(&wav_named_mp3).await);
+        assert!(is_lossless_uncompressed(&encode("real.wav", "wav", &["-c:a", "pcm_s16le"])).await);
+        assert!(!is_lossless_uncompressed(&encode("real.mp3", "mp3", &["-q:a", "9"])).await);
+
+        // The conversion keeps every sample and leaves the original alone.
+        let flac = directory.path().join("out.flac");
+        convert_to_flac(&wav_named_mp3, &flac).await.unwrap();
+        let converted = crate::domain::audio::read(&flac).unwrap();
+        assert_eq!(converted.format, "flac");
+        assert!((converted.duration - 1.0).abs() < 0.05);
+        assert!(wav_named_mp3.exists());
+    }
+
+    #[tokio::test]
+    async fn a_song_filed_just_before_a_restart_is_not_shown_as_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = filing_state(directory.path()).await;
+        // The song reached the library and its inbox file went to the trash,
+        // then magpie-fi was stopped before the row was cleared.
+        let filed = Path::new(&state.config.output_dir).join("Artist/Album/Song.mp3");
+        tokio::fs::create_dir_all(filed.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&filed, b"the filed song").await.unwrap();
+        library::remember(
+            &state.pool,
+            &library::LibraryEntry {
+                path: filed.to_string_lossy().into_owned(),
+                duration: Some(180.0),
+                content_key: Some("fp:filed".into()),
+                format: "mp3".into(),
+                source: "inbox".into(),
+                ..library::LibraryEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+        let gone = Path::new(&state.config.input_dir).join("song.mp3");
+        let filed_id = insert_ready_track(&state.pool, &gone, Some("mp3"), "fp:filed").await;
+        // Another song whose file is really missing still shows up in Issues.
+        let lost = Path::new(&state.config.input_dir).join("lost.mp3");
+        let lost_id = insert_ready_track(&state.pool, &lost, Some("mp3"), "fp:lost").await;
+
+        let prepared = prepare_apply(&state).await.unwrap();
+
+        assert!(prepared.items.is_empty());
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id,stage FROM tracks ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(lost_id, "failed".to_owned())]);
+        assert_ne!(filed_id, lost_id);
+        assert!(filed.exists());
     }
 
     #[tokio::test]

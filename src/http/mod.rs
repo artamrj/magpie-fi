@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod error;
 pub mod handlers;
+#[cfg(test)]
+mod journeys;
 pub mod router;
 
 pub use router::router;

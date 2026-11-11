@@ -19,6 +19,34 @@ const labels: Record<string, string> = {
   cover_url: "Cover link",
 };
 
+/**
+ * The chips an artist line stands for: one per artist, split where the tags are split
+ * (feat., "/", ";"). "A, B & C" stays one chip, as it is written to the file.
+ */
+function creditsFromText(text: string): ArtistCredit[] {
+  const parts = text.split(/(\s+(?:feat\.?|ft\.?|featuring)\s+|\s+\/\s+|\s*;\s*)/i);
+  const credits: ArtistCredit[] = [];
+  for (let index = 0; index < parts.length; index += 2) {
+    const name = parts[index].trim();
+    if (!name) continue;
+    const separator = (parts[index + 1] ?? "").trim().toLowerCase();
+    const join = !separator ? "" : separator === "/" ? " / " : separator === ";" ? "; " : " feat. ";
+    credits.push({ name, join_phrase: join });
+  }
+  if (credits.length) credits[credits.length - 1].join_phrase = "";
+  return credits.length ? credits : [{ name: "", join_phrase: "" }];
+}
+
+/** The artist line the chips stand for. */
+function textFromCredits(credits: ArtistCredit[]): string {
+  const named = credits.filter((credit) => credit.name.trim());
+  return named
+    .map((credit, index) =>
+      index + 1 === named.length ? credit.name.trim() : credit.name.trim() + credit.join_phrase,
+    )
+    .join("");
+}
+
 /** Edits the tags by hand or from a song link. Saved by the screen's "Save tags" button. */
 export function ManualEditor({
   track,
@@ -81,8 +109,11 @@ export function ManualEditor({
         isrc: found.isrc || current.isrc,
         cover_url: found.cover_url || current.cover_url,
       }));
+      // The chips follow what was imported, so old chips cannot undo it on save.
       if (found.artist_credits?.length) setArtistCredits(found.artist_credits);
+      else if (found.artist) setArtistCredits(creditsFromText(found.artist));
       if (found.album_artist_credits?.length) setAlbumArtistCredits(found.album_artist_credits);
+      else if (found.album_artist) setAlbumArtistCredits(creditsFromText(found.album_artist));
       setImported(`Filled in from ${found.artist || "the link"}. Check the fields, then save.`);
     } catch (reason) {
       onError((reason as Error).message);
@@ -126,7 +157,7 @@ export function ManualEditor({
         title="Fill in from a link"
         footer={
           imported ||
-          "Spotify, Shazam, SoundCloud, Audiomack, Navahang, Genius, Radio Javan or YouTube."
+          "Spotify, Apple Music, Deezer, Shazam, SoundCloud, Audiomack, Navahang, Genius, Radio Javan or YouTube."
         }
       >
         <label className="field" style={{ borderRadius: 0 }}>
@@ -159,7 +190,13 @@ export function ManualEditor({
               dir="auto"
               value={value}
               inputMode={name === "track_number" || name === "year" ? "numeric" : undefined}
-              onChange={(event) => setForm({ ...form, [name]: event.target.value })}
+              onChange={(event) => {
+                setForm({ ...form, [name]: event.target.value });
+                // The line and the chips say the same thing: typing here rewrites the chips.
+                if (name === "artist") setArtistCredits(creditsFromText(event.target.value));
+                if (name === "album_artist")
+                  setAlbumArtistCredits(creditsFromText(event.target.value));
+              }}
             />
           </label>
         ))}
@@ -169,11 +206,21 @@ export function ManualEditor({
         title="Artists on this song"
         footer="One chip per artist. Duets and features get their own chip so each artist gets credit."
       >
-        <CreditsEditor label="Track artists" credits={artistCredits} onChange={setArtistCredits} />
+        <CreditsEditor
+          label="Track artists"
+          credits={artistCredits}
+          onChange={(credits) => {
+            setArtistCredits(credits);
+            setForm((current) => ({ ...current, artist: textFromCredits(credits) }));
+          }}
+        />
         <CreditsEditor
           label="Album artists"
           credits={albumArtistCredits}
-          onChange={setAlbumArtistCredits}
+          onChange={(credits) => {
+            setAlbumArtistCredits(credits);
+            setForm((current) => ({ ...current, album_artist: textFromCredits(credits) }));
+          }}
         />
       </Section>
       <button type="submit" className="sr-only">

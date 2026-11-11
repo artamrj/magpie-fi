@@ -19,8 +19,6 @@ use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 pub use crate::domain::credits::ArtistCredit;
 
@@ -70,48 +68,6 @@ pub async fn browser_page(client: &Client, url: &str) -> Result<String> {
         .await?)
 }
 
-/// An OAuth client-credentials token (SoundCloud), reused until
-/// shortly before it expires.
-#[derive(Default)]
-pub struct ClientCredentials {
-    token: Mutex<Option<(String, Instant)>>,
-}
-
-impl ClientCredentials {
-    pub async fn token(
-        &self,
-        client: &Client,
-        token_url: &str,
-        client_id: &str,
-        client_secret: &str,
-    ) -> Result<String> {
-        let mut cached = self.token.lock().await;
-        if let Some((token, expires_at)) = cached.as_ref()
-            && *expires_at > Instant::now() + Duration::from_secs(30)
-        {
-            return Ok(token.clone());
-        }
-        let raw = request_json(
-            client
-                .post(token_url)
-                .basic_auth(client_id, Some(client_secret))
-                .header("Accept", "application/json")
-                .form(&[("grant_type", "client_credentials")]),
-        )
-        .await?;
-        let token = raw["access_token"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("the token response had no access token"))?
-            .to_owned();
-        let lifetime = raw["expires_in"].as_u64().unwrap_or(3600).max(60);
-        *cached = Some((
-            token.clone(),
-            Instant::now() + Duration::from_secs(lifetime),
-        ));
-        Ok(token)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +88,11 @@ pub struct ArtworkCandidate {
     /// belongs to it by definition (no album or artist comparison needed).
     #[serde(default)]
     pub own_record: bool,
+    /// The cover came from a catalog row of this same recording: the title,
+    /// artist and version agree. Its album may be another one (the album the
+    /// song is on, for a song filed as its own single).
+    #[serde(default)]
+    pub same_recording: bool,
     pub release_id: Option<String>,
     pub isrc: Option<String>,
     pub album: Option<String>,
@@ -193,10 +154,6 @@ pub struct Candidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
 
     #[test]
     fn phrases_cannot_be_broken_by_quotes() {
@@ -210,33 +167,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!format!("{error:#} {error:?}").contains("SECRET-KEY"));
-    }
-
-    #[tokio::test]
-    async fn client_credentials_are_fetched_once_with_basic_auth() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let app = axum::Router::new().route(
-            "/token",
-            axum::routing::post(move |headers: axum::http::HeaderMap| async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                // "id:secret" in base64.
-                assert_eq!(headers["authorization"], "Basic aWQ6c2VjcmV0");
-                axum::Json(serde_json::json!({"access_token": "t1", "expires_in": 3600}))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/token", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let credentials = ClientCredentials::default();
-        for _ in 0..2 {
-            let token = credentials
-                .token(&Client::new(), &url, "id", "secret")
-                .await
-                .unwrap();
-            assert_eq!(token, "t1");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

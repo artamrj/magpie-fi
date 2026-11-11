@@ -87,11 +87,6 @@ pub(crate) async fn identify(
         out.extend(songrec_candidates);
     }
     let catalog_info = recognized_info.as_ref().unwrap_or(current);
-    if !cfg.soundcloud_client_id.trim().is_empty()
-        && !cfg.soundcloud_client_secret.trim().is_empty()
-    {
-        out.extend(query_soundcloud(state, limits, catalog_info, filename).await);
-    }
     out.extend(query_discogs(state, limits, catalog_info, filename).await);
     out.extend(query_lastfm(state, limits, catalog_info, filename).await);
     // Scores above were measured against the source's own credit. From here on (Review,
@@ -329,40 +324,6 @@ where
             Vec::new()
         }
     }
-}
-
-pub(crate) async fn query_soundcloud(
-    state: &Arc<AppState>,
-    limits: &PipelineLimits,
-    current: &audio::AudioInfo,
-    filename: &str,
-) -> Vec<infra_providers::Candidate> {
-    query_catalog(
-        state,
-        limits,
-        current,
-        filename,
-        CatalogSpec {
-            provider: "soundcloud",
-            source: "soundcloud_track_search",
-            requires_title: true,
-            key_check: |_| None,
-        },
-        |state, current| async move {
-            let cfg = &state.config;
-            let title = current.title.as_deref().unwrap_or_default();
-            infra_providers::soundcloud::search(
-                &state.client,
-                &state.soundcloud_auth,
-                &cfg.soundcloud_client_id,
-                &cfg.soundcloud_client_secret,
-                title,
-                current.artist.as_deref(),
-            )
-            .await
-        },
-    )
-    .await
 }
 
 pub(crate) async fn query_songrec(
@@ -1043,6 +1004,7 @@ pub(crate) async fn apply_artwork_override(
                 url: cover_url.clone(),
                 user_confirmed: true,
                 own_record: false,
+                same_recording: false,
                 release_id: candidate.release_id.clone(),
                 isrc: candidate.isrc.clone(),
                 album: candidate.album.clone(),
@@ -1145,12 +1107,23 @@ pub(crate) struct ProviderPause {
 }
 
 pub(crate) async fn provider_disabled(limits: &PipelineLimits, provider: &str) -> bool {
-    limits
-        .disabled_providers
-        .lock()
-        .await
-        .get(provider)
-        .is_some_and(|pause| pause.until.is_none_or(|until| Instant::now() < until))
+    let pauses = limits.disabled_providers.lock().await;
+    let Some(pause) = pauses.get(provider) else {
+        return false;
+    };
+    match pause.until {
+        // Off for the whole scan (a wrong key): nothing to wait for.
+        None => true,
+        Some(until) if Instant::now() < until => {
+            // A song goes on without this source. It is counted, so the songs
+            // identified meanwhile can get a second look (see `run_files`).
+            limits
+                .lookups_missed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Some(_) => false,
+    }
 }
 
 /// Pauses a source after a failure. A refused key turns it off for the rest of
@@ -1195,7 +1168,16 @@ pub(crate) async fn handle_provider_error(
             "authentication failed; check the configured API key/token",
             true,
         ))
-    } else if lower.contains("429 too many requests") {
+    } else if lower.contains("429 too many requests")
+        // Sources also say "slow down" in other words: Apple and sites behind
+        // Cloudflare answer 403, Deezer names its quota, a busy server 503.
+        // Each of these pauses the source for a while, so a long scan does
+        // not keep knocking and get the address blocked.
+        || lower.contains("403 forbidden")
+        || lower.contains("503 service unavailable")
+        || lower.contains("quota")
+        || lower.contains("rate limit")
+    {
         Some(("rate limited by provider", false))
     } else if lower.contains("504 gateway timeout") || lower.contains("timed out") {
         Some(("provider timed out", false))
@@ -1204,6 +1186,11 @@ pub(crate) async fn handle_provider_error(
     };
 
     if let Some((reason, permanent)) = pause_reason {
+        if !permanent {
+            limits
+                .lookups_missed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(how_long) = pause_provider(limits, provider, permanent).await {
             tracing::warn!(
                 file = filename,

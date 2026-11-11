@@ -161,8 +161,33 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<WantedRow>> {
     .await?)
 }
 
-/// Songs interrupted by a restart start again.
+/// Songs interrupted by a restart start again. Called once at start, when
+/// nothing is being read or downloaded yet.
+///
+/// A file that was being received from Telegram cannot be fetched again
+/// without its message, so it is marked failed (it would otherwise be looked
+/// up on YouTube by its name). A link that was still being read is marked
+/// failed too: nothing would ever finish reading it, and sending the same
+/// link again would only join the dead request.
 pub async fn reset_interrupted(pool: &SqlitePool) -> Result<u64> {
+    let now = now();
+    sqlx::query(
+        "UPDATE wanted SET status='failed',
+           error='Receiving this file was interrupted by a restart. Send it again.',updated_at=?
+         WHERE status='downloading'
+           AND request_id IN (SELECT id FROM requests WHERE kind='upload')",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE requests SET status='failed',
+           error='Reading this link was interrupted by a restart. Send it again.',updated_at=?
+         WHERE status='reading'",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(
         sqlx::query("UPDATE wanted SET status='pending' WHERE status='downloading'")
             .execute(pool)
@@ -864,6 +889,72 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_restart_does_not_leave_links_or_uploads_stuck() {
+        let (_directory, pool) = pool().await;
+        // A link that was still being read.
+        let reading = create_request(
+            &pool,
+            "https://example.test/album",
+            Scope::Album,
+            "web",
+            None,
+        )
+        .await
+        .unwrap();
+        // A link with one song in the middle of its download.
+        let ready = create_request(
+            &pool,
+            "https://example.test/song",
+            Scope::Track,
+            "web",
+            None,
+        )
+        .await
+        .unwrap();
+        save_collection(
+            &pool,
+            ready,
+            "https://example.test/song",
+            Scope::Track,
+            &collection(&["One"]),
+        )
+        .await
+        .unwrap();
+        let download = claim_next(&pool).await.unwrap().unwrap().id;
+        // A file that was being received from Telegram.
+        let upload_request = create_upload_request(&pool, "42").await.unwrap();
+        let upload = add_upload(&pool, upload_request, "Sent file", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(reset_interrupted(&pool).await.unwrap(), 1);
+
+        let status = |table: &'static str, id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                    "SELECT status FROM {table} WHERE id=?"
+                )))
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(status("wanted", download).await, "pending");
+        assert_eq!(status("wanted", upload).await, "failed");
+        assert_eq!(status("requests", reading).await, "failed");
+        assert_eq!(status("requests", ready).await, "ready");
+        // Sending the link again starts a fresh request.
+        assert_eq!(
+            find_reusable_request(&pool, "https://example.test/album")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

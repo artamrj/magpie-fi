@@ -231,6 +231,26 @@ pub async fn candidates(
     Ok(rows.iter().map(CandidateRow::value).collect())
 }
 
+/// The chosen candidate of each of these tracks (tracks without one are left out).
+pub async fn selected_candidates(
+    pool: &sqlx::SqlitePool,
+    tracks: impl IntoIterator<Item = TrackId>,
+) -> Result<HashMap<TrackId, Candidate>, TrackError> {
+    let ids = tracks.into_iter().map(|id| id.0).collect::<Vec<_>>();
+    let rows: Vec<CandidateRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {CANDIDATE_FIELDS} FROM candidates
+         WHERE id IN (SELECT selected_candidate_id FROM tracks
+                      WHERE id IN (SELECT value FROM json_each(?)))"
+    )))
+    .bind(serde_json::json!(ids).to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.track_id, row.value()))
+        .collect())
+}
+
 /// The candidates of these tracks, best score first.
 pub async fn candidates_by_track(
     pool: &sqlx::SqlitePool,

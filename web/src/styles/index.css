@@ -705,7 +705,9 @@ button.cell:active {
   min-height: 48px;
   position: relative;
 }
-.field-row + .field-row::before {
+.field-row + .field-row::before,
+.field-row + .info-row::before,
+.info-row + .field-row::before {
   content: "";
   position: absolute;
   top: 0;
@@ -1361,6 +1363,7 @@ button.tree-row.selected:hover {
     font-weight: 700;
     font-size: 18px;
     padding: 4px 10px 18px;
+    white-space: nowrap;
   }
   .wide .sidebar .brand i {
     width: 28px;
@@ -1370,6 +1373,15 @@ button.tree-row.selected:hover {
     color: var(--button-text);
     display: grid;
     place-items: center;
+  }
+  /* The running version, quiet beside the name. */
+  .wide .sidebar .brand-version {
+    margin-left: -2px;
+    padding-top: 3px;
+    color: var(--hint);
+    font-size: 12px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
   }
   .wide .sidebar nav button {
     display: flex;

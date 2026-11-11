@@ -234,7 +234,7 @@ pub fn base_title(value: &str) -> String {
     if let Some(index) = stripped.find(" - ") {
         stripped.truncate(index);
     }
-    let lower = stripped.to_lowercase();
+    let lower = stripped.to_ascii_lowercase();
     for marker in [" feat. ", " feat ", " ft. ", " ft ", " featuring "] {
         if let Some(index) = lower.find(marker) {
             stripped.truncate(index);
@@ -251,7 +251,10 @@ pub fn base_title(value: &str) -> String {
 
 /// The first credited artist of "A, B & C feat. D".
 pub fn primary_artist(value: &str) -> String {
-    let lower = value.to_lowercase();
+    // ASCII lower-casing keeps every byte position, so a position found in
+    // `lower` is safe to cut `value` at. Full lower-casing changes the length
+    // of some letters ("İ", "ẞ") and the cut would panic in the middle of one.
+    let lower = value.to_ascii_lowercase();
     let mut end = value.len();
     for separator in [
         ",",
@@ -280,7 +283,7 @@ pub fn primary_artist(value: &str) -> String {
 /// "Artist - Topic" or "ArtistVEVO" → "Artist".
 pub fn clean_channel_name(value: &str) -> String {
     let trimmed = value.trim();
-    let lower = trimmed.to_lowercase();
+    let lower = trimmed.to_ascii_lowercase();
     for suffix in ["- topic", " topic", "vevo", " official"] {
         if lower.ends_with(suffix) {
             let cleaned = trimmed[..trimmed.len() - suffix.len()]
@@ -325,7 +328,8 @@ pub fn identity_title(value: &str) -> String {
             kept = head.to_owned();
         }
     }
-    let lower = kept.to_lowercase();
+    // Byte positions must match `kept` (see `primary_artist`).
+    let lower = kept.to_ascii_lowercase();
     for marker in [" feat. ", " feat ", " ft. ", " ft ", " featuring "] {
         if let Some(index) = lower.find(marker) {
             kept.truncate(index);
@@ -443,6 +447,19 @@ fn bracket_notes(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letters_that_change_length_in_lower_case_do_not_break_the_cut() {
+        // "İ" grows and "ẞ" shrinks when lower-cased; a cut position taken
+        // from the lower-cased text used to land inside a letter and panic.
+        assert_eq!(primary_artist("İİİİ ft. Ö"), "İİİİ");
+        assert_eq!(primary_artist("GROẞẞẞ & Ö"), "GROẞẞẞ");
+        assert_eq!(primary_artist("ابی FEAT. شادمهر"), "ابی");
+        assert_eq!(identity_title("GROẞẞẞ ft. Ö"), identity_title("GROẞẞẞ"));
+        assert_eq!(identity_title("İİİİİİ Feat. Ö"), identity_title("İİİİİİ"));
+        assert_eq!(clean_channel_name("İİİİ - Topic"), "İİİİ");
+        assert_eq!(clean_channel_name("ẞẞẞẞVEVO"), "ẞẞẞẞ");
+    }
 
     fn target(title: &str, artist: &str, duration: f64) -> Target {
         Target {

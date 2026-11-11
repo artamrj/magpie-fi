@@ -267,6 +267,51 @@ pub fn reassess(candidate: &mut Candidate) -> CompletionReport {
     report
 }
 
+/// Only a real year is ever written: four digits, alone or at the start of a date
+/// ("2020", "2020-10-05"). A day-first date ("05.10.2020", "5/10/2020") is turned round;
+/// anything else ("05.10.1", a half-typed value) is dropped in favour of the release date.
+fn clean_year(candidate: &mut Candidate) {
+    let Some(raw) = candidate.year.as_deref().map(str::trim) else {
+        return;
+    };
+    let starts_with_year = |value: &str| {
+        value.len() >= 4
+            && value.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+            && matches!(value.as_bytes().get(4), None | Some(b'-'))
+    };
+    if starts_with_year(raw) {
+        return;
+    }
+    let parts = raw
+        .split(['.', '/'])
+        .map(|part| part.trim().parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    let day_first = match parts.as_slice() {
+        [day @ 1..=31, month @ 1..=12, year @ 1000..=9999] => Some((*year, *month, *day)),
+        _ => None,
+    };
+    let from_release_date = candidate
+        .release_date
+        .as_deref()
+        .map(str::trim)
+        .filter(|date| starts_with_year(date))
+        .map(|date| date[..4].to_owned());
+    candidate.year = match day_first {
+        Some((year, month, day)) => {
+            if candidate
+                .release_date
+                .as_deref()
+                .is_none_or(|date| date.trim().is_empty())
+            {
+                candidate.release_date = Some(format!("{year:04}-{month:02}-{day:02}"));
+            }
+            Some(format!("{year:04}"))
+        }
+        None => from_release_date,
+    };
+}
+
 /// Apply the canonical release fields. A single or EP keeps its own title as
 /// the album (Navidrome groups albums by name, so a generic "Single" album would
 /// merge every single of an artist into one). Store suffixes such as
@@ -275,6 +320,7 @@ pub fn reassess(candidate: &mut Candidate) -> CompletionReport {
 /// Returns which fields were changed so metadata-completion reports can include
 /// the generated values.
 pub fn normalize_release_fields(candidate: &mut Candidate) -> (bool, bool) {
+    clean_year(candidate);
     let original_album = candidate.album.clone();
     if candidate
         .release_type
@@ -314,8 +360,21 @@ pub fn normalize_release_fields(candidate: &mut Candidate) -> (bool, bool) {
                 "",
             )];
         } else {
-            candidate.album_artist = Some(candidate.artist.clone());
-            candidate.album_artist_credits = candidate.artist_credits.clone();
+            // The album belongs to the main singers; a guest on the song ("feat.") does not
+            // become an artist of the album.
+            let credits = if candidate.artist_credits.is_empty() {
+                crate::domain::credits::normalize_featured(&candidate.artist, &candidate.title)
+                    .artists
+            } else {
+                candidate.artist_credits.clone()
+            };
+            let main = crate::domain::credits::main_credits(&credits);
+            candidate.album_artist = Some(if main.is_empty() {
+                candidate.artist.clone()
+            } else {
+                crate::domain::credits::display_artist(&main)
+            });
+            candidate.album_artist_credits = main;
         }
     } else if candidate.album_artist_credits.is_empty()
         && let Some(album_artist) = candidate.album_artist.as_deref()
@@ -366,7 +425,9 @@ fn release_evidence_compatible(selected: &Candidate, donor: &Candidate) -> bool 
 }
 
 fn comparable_release_title(value: &str) -> String {
-    let cleaned = crate::domain::credits::release_title_without_featured(value);
+    let cleaned = crate::domain::credits::release_title_without_featured(
+        crate::domain::names::without_store_label(value),
+    );
     let lower = cleaned.to_lowercase();
     let without_type = [" - single", " - ep"]
         .into_iter()
@@ -377,7 +438,7 @@ fn comparable_release_title(value: &str) -> String {
 
 /// "Farangis - Single" → "Farangis", "Moorche - EP" → "Moorche".
 fn strip_release_suffix(album: &str) -> String {
-    let trimmed = album.trim();
+    let trimmed = crate::domain::names::without_store_label(album);
     let lower = trimmed.to_ascii_lowercase();
     for suffix in [
         " - single",
@@ -844,6 +905,55 @@ mod tests {
             score: 90.0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_store_label_is_not_written_into_the_album_name() {
+        let mut song = candidate("itunes", Some("Ba Shoma (With You) - Persian Music"));
+        song.title = "Ahooye Por Kereshmeh".into();
+        song.artist = "Martik".into();
+        normalize_release_fields(&mut song);
+        assert_eq!(song.album.as_deref(), Some("Ba Shoma (With You)"));
+        assert!(albums_compatible(
+            Some("Ba Shoma (With You)"),
+            Some("Ba Shoma (With You) - Persian Music")
+        ));
+    }
+
+    #[test]
+    fn only_a_real_year_is_kept() {
+        let year_of = |year: &str, release_date: Option<&str>| {
+            let mut song = candidate("manual", Some("Double Album"));
+            song.year = Some(year.into());
+            song.release_date = release_date.map(str::to_owned);
+            normalize_release_fields(&mut song);
+            (song.year, song.release_date)
+        };
+        assert_eq!(year_of("2020", None).0.as_deref(), Some("2020"));
+        assert_eq!(year_of("2020-10-05", None).0.as_deref(), Some("2020-10-05"));
+        // A date written day first.
+        assert_eq!(
+            year_of("05.10.2020", None),
+            (Some("2020".into()), Some("2020-10-05".into()))
+        );
+        // A half-typed value is never written; the release date still knows the year.
+        assert_eq!(year_of("05.10.1", None).0, None);
+        assert_eq!(
+            year_of("05.10.1", Some("2020-10-05")).0.as_deref(),
+            Some("2020")
+        );
+    }
+
+    #[test]
+    fn a_guest_on_the_song_is_not_an_album_artist() {
+        let mut song = candidate("deezer", Some("Double Album"));
+        song.artist = "Alireza JJ, Sijal & Sepehr Khalse feat. Hoomaan".into();
+        song.album_artist = None;
+        normalize_release_fields(&mut song);
+        assert_eq!(
+            song.album_artist.as_deref(),
+            Some("Alireza JJ, Sijal & Sepehr Khalse")
+        );
     }
 
     #[test]

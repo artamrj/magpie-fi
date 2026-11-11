@@ -96,9 +96,27 @@ pub fn same_album(left: &str, right: &str) -> bool {
     !key.is_empty() && key == album_key(right)
 }
 
+/// Words a store puts after an album name that are not part of it: Persian labels sell
+/// "Ba Shoma (With You) - Persian Music" for the album "Ba Shoma (With You)".
+const STORE_LABELS: [&str; 1] = [" - persian music"];
+
+/// An album name without a store's label ending (see [`STORE_LABELS`]). The one place that
+/// knows these endings: the name written to a file and every album comparison use it.
+pub fn without_store_label(value: &str) -> &str {
+    let trimmed = value.trim();
+    // ASCII lowercasing keeps byte positions, so the ending can be cut from `trimmed`.
+    let lower = trimmed.to_ascii_lowercase();
+    STORE_LABELS
+        .iter()
+        .find(|ending| lower.len() > ending.len() && lower.ends_with(*ending))
+        .map_or(trimmed, |ending| {
+            trimmed[..trimmed.len() - ending.len()].trim_end()
+        })
+}
+
 /// One key for every spelling of an album name (see [`same_album`]), to group songs by.
 pub fn album_key(value: &str) -> String {
-    let trimmed = value.trim();
+    let trimmed = without_store_label(value);
     // ASCII lowercasing keeps byte positions, so the ending can be cut from `trimmed`.
     let lower = trimmed.to_ascii_lowercase();
     let plain = [" - single", " - ep", " (single)", " (ep)"]
@@ -193,6 +211,17 @@ mod tests {
     fn one_album_in_several_spellings() {
         assert!(same_album("Khalij", "Khaleej"));
         assert!(same_album("Khaleej - Single", "Khalij"));
+        // A store's label after the name is not part of the album.
+        assert!(same_album(
+            "Ba Shoma (With You) - Persian Music",
+            "Ba Shoma (With You)"
+        ));
+        assert_eq!(
+            without_store_label("Ba Shoma (With You) - Persian Music"),
+            "Ba Shoma (With You)"
+        );
+        // An album that is only called that keeps its name.
+        assert_eq!(without_store_label("Persian Music"), "Persian Music");
         assert!(same_album(
             "Apple Music Live: Billie Eilish",
             "apple music live billie eilish"

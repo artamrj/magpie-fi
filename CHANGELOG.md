@@ -2,6 +2,37 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.9.1](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.1) - 2026-11-11
+
+### 🐛 Fixes
+- A store's "- Persian Music" ending no longer splits an album in two ([f38a484](https://github.com/artamrj/magpie-fi/commit/f38a4840256a4cf8dc07f5161fe0b28060fd3084))
+- A wrongly tagged song is no longer filed on its own, and a crash or restart no longer leaves work stuck ([210e6b3](https://github.com/artamrj/magpie-fi/commit/210e6b3e02004a819120d4d0e95ceeea9bdadf9d))
+
+## [0.9.0](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.0) - 2026-11-11
+
+### ✨ New
+- Review can keep a file's own tags when no match is right ([f080640](https://github.com/artamrj/magpie-fi/commit/f080640a2755a8b56fd553b0dee7a7bf5f038d8f))
+- Keeping a file's own tags also keeps its own cover when it is a real one ([276c8f6](https://github.com/artamrj/magpie-fi/commit/276c8f6f8554975b86500b4ab68bfb8eecc10023))
+
+### 🐛 Fixes
+- Songs whose file you deleted from the inbox leave Review, and Remove works on them ([ed76a0e](https://github.com/artamrj/magpie-fi/commit/ed76a0e1066a2dd37ec9610c2b84e290fe4dd097))
+- A match no longer drops the file's co-singers, and Apple Music and Deezer links fill in the tags ([091ebe2](https://github.com/artamrj/magpie-fi/commit/091ebe2d5c607e6f32dbb12b732e75d44228caa9))
+- Songs of one new album filed together land in one album when sources spell it differently ([faa9583](https://github.com/artamrj/magpie-fi/commit/faa95833bee30877e9f278e768261f4456672f32))
+- The cover search finds covers of songs that are only sold on an album ([f69a33f](https://github.com/artamrj/magpie-fi/commit/f69a33f04f22bcd7ad27102c97af74116b7a948f))
+
+## [0.8.3](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.3) - 2026-11-11
+
+### ✨ New
+- **web:** The sidebar shows which version is running, next to the name ([d24d240](https://github.com/artamrj/magpie-fi/commit/d24d240abe46818a8a6b0c50371fb91d8c3a7f20))
+- **web:** The Song page shows each artist a song is credited to ([fb22363](https://github.com/artamrj/magpie-fi/commit/fb22363bc6edaa074919a88e39b9cfd69d4d9101))
+
+### 🐛 Fixes
+- Sending a link again fetches a song you removed in Review ([6b62f19](https://github.com/artamrj/magpie-fi/commit/6b62f19c517134710b9ed92b1ef7c33b1ef6c6ce))
+- **web:** The web page's tools install with no security warnings ([cd56dff](https://github.com/artamrj/magpie-fi/commit/cd56dff7aa8c19bc3a71b4e92e7fd4660b448ff1))
+- Drop SoundCloud search, which needs a key SoundCloud no longer gives out ([90e7463](https://github.com/artamrj/magpie-fi/commit/90e74632a41210febeac32e079adf670e2fb28d5))
+- **web:** The favicon and app icons use the same blue as the logo in the sidebar ([dd63667](https://github.com/artamrj/magpie-fi/commit/dd636679de885faf221a51080253d0134d0904c1))
+- **web:** The magpie sits in the middle of its icon and fills it better ([75cfe8d](https://github.com/artamrj/magpie-fi/commit/75cfe8dcf1b1e5a8ae9b8230aa8ffb4cc7087f66))
+
 ## [0.8.2](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.2) - 2026-11-11
 
 ### ✨ New

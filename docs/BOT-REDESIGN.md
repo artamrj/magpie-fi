@@ -164,7 +164,11 @@ Persian/RTL-safe (`dir="auto"`). Rust embeds it with `include_str!`. A small Nod
 fails if a widget is over 32 KB, over 4 KB compressed, or contains a NUL. The card's words live
 in the widget itself, since it can't fetch them; everything else the bot says stays in `texts.rs`.
 
-### 3.3 Database (`migrations/0013_telegram_widgets.sql`)
+### 3.3 Database (`migrations/0015`–`0017`)
+
+Built as `0015_telegram_cards.sql`, `0016_telegram_review_cards.sql` and
+`0017_telegram_library_card.sql`. They were 0013–0015 in the 0.7.0 release; `main` has since
+released its own 0013 and 0014, so these follow them.
 
 - `requests.card_kind` (`text` | `widget`) so the loop knows which edit to use.
 - `telegram_chats` (chat_id, widgets_ok_until, library_message_id) for the fallback and the

@@ -1,18 +1,26 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { queryKeys, useSetupQuery, useStatusQuery, useTracksQuery } from "../api/queries";
+import { ApiError } from "../api/client";
+import {
+  REVIEW_PAGE,
+  queryKeys,
+  useSetupQuery,
+  useStatusQuery,
+  useTrackQuery,
+  useTracksQuery,
+} from "../api/queries";
 import type { Setup } from "../api/types";
 import { BrandMark, Icon, type IconName } from "./Icons";
 import { AddMusic } from "./components/AddMusic";
 import { CoverScreen } from "./components/CoverScreen";
-import { EmptyState } from "./components/EmptyStates";
+import { EmptyState, ListSkeleton } from "./components/EmptyStates";
 import { Files, type FilesNav } from "./components/Files";
 import { Library } from "./components/Library";
 import { ReviewList, type Feedback } from "./components/ReviewList";
 import { SongScreen } from "./components/SongScreen";
 import { SidebarStatus } from "./components/Status";
 import { haptic, startTrack, startView, telegram, useTelegramBackButton } from "./telegram";
-import { busyPhases, friendlyError, isProblem, isReview, preferredTrack } from "./trackUtils";
+import { busyPhases, friendlyError } from "./trackUtils";
 
 const emptySetup: Setup = {
   inbox_dir: "",
@@ -61,8 +69,22 @@ export function App() {
   const statusQuery = useStatusQuery();
   const workflow = statusQuery.data;
   const busy = workflow ? busyPhases.has(workflow.phase) : false;
-  const tracksQuery = useTracksQuery(busy);
-  const tracks = useMemo(() => tracksQuery.data ?? [], [tracksQuery.data]);
+  // What is typed into Review's search box, and the same a moment later, so
+  // the server is asked once per pause and not once per letter.
+  const [search, setSearch] = useState("");
+  const [searchFor, setSearchFor] = useState("");
+  const [limit, setLimit] = useState(REVIEW_PAGE);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSearchFor(search.trim());
+      setLimit(REVIEW_PAGE);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+  const tracksQuery = useTracksQuery(busy, searchFor, limit);
+  const list = tracksQuery.data;
+  const tracks = useMemo(() => list?.tracks ?? [], [list]);
+  const waiting = (list?.counts.review ?? 0) + (list?.counts.issues ?? 0);
   const setup = setupQuery.data ?? emptySetup;
   const wide = useWide();
 
@@ -80,8 +102,8 @@ export function App() {
   useEffect(() => {
     if (startDecided || tracksQuery.isPending) return;
     setStartDecided(true);
-    setTab(tracks.some((track) => isReview(track) || isProblem(track)) ? "review" : "add");
-  }, [startDecided, tracksQuery.isPending, tracks]);
+    setTab(waiting > 0 ? "review" : "add");
+  }, [startDecided, tracksQuery.isPending, waiting]);
 
   useEffect(() => {
     const phase = statusQuery.data?.phase;
@@ -118,19 +140,22 @@ export function App() {
     if (failure) feedback.fail((failure as Error).message);
   }, [setupQuery.error, statusQuery.error, tracksQuery.error, feedback]);
 
-  const reviewCount = tracks.filter((track) => isReview(track) || isProblem(track)).length;
-  const reviewOrder = useMemo(
-    () => [...tracks.filter(isReview), ...tracks.filter(isProblem)],
-    [tracks],
-  );
-  const open = tracks.find((track) => track.id === openId);
+  const reviewCount = waiting;
+  // Ids of the songs that wait for you, in list order.
+  const reviewOrder = useMemo(() => list?.order ?? [], [list]);
+  // On a wide screen the first waiting song is open next to the list.
+  const selectedId =
+    openId ?? (wide && tab === "review" ? (reviewOrder[0] ?? tracks[0]?.id) : undefined);
+  // The list carries only each song's chosen match; the open song is fetched whole.
+  const songQuery = useTrackQuery(selectedId, busy);
+  const selected = songQuery.data?.id === selectedId ? songQuery.data : undefined;
+  const gone = songQuery.error instanceof ApiError && songQuery.error.status === 404;
   useEffect(() => {
-    if (openId !== undefined && !tracksQuery.isPending && !open) {
+    if (openId !== undefined && gone) {
       setOpenId(undefined);
       if (openId === startTrack) push({ message: "That song is already decided or gone." });
     }
-  }, [openId, open, tracksQuery.isPending, push]);
-  const selected = open ?? (wide && tab === "review" ? preferredTrack(tracks) : undefined);
+  }, [openId, gone, push]);
 
   const goBack = useCallback(() => {
     if (coverMode) setCoverMode(false);
@@ -149,11 +174,11 @@ export function App() {
   /** After a decision: the next song that waits, or back to the list. */
   const next = () => {
     setCoverMode(false);
-    const index = reviewOrder.findIndex((track) => track.id === openId);
+    const index = reviewOrder.indexOf(selectedId ?? -1);
     const following =
-      reviewOrder.find((track, position) => position > index && track.id !== openId) ??
-      reviewOrder.find((track) => track.id !== openId);
-    setOpenId(wide ? following?.id : undefined);
+      reviewOrder.find((id, position) => position > index && id !== selectedId) ??
+      reviewOrder.find((id) => id !== selectedId);
+    setOpenId(wide ? following : undefined);
     if (!wide) window.scrollTo({ top: 0 });
   };
   /** A song opened from another tab (a request's "needs your pick"). */
@@ -173,14 +198,15 @@ export function App() {
 
   const position = selected
     ? (() => {
-        const index = reviewOrder.findIndex((track) => track.id === selected.id);
+        const index = reviewOrder.indexOf(selected.id);
         return index >= 0 ? { index: index + 1, total: reviewOrder.length } : undefined;
       })()
     : undefined;
 
-  const songOrCover = (trackId: number) => {
-    const track = tracks.find((item) => item.id === trackId);
-    if (!track) return null;
+  const songOrCover = () => {
+    const track = selected;
+    // The song's matches are on their way.
+    if (!track) return <ListSkeleton rows={4} />;
     return coverMode ? (
       <CoverScreen
         key={`cover-${track.id}`}
@@ -204,8 +230,11 @@ export function App() {
 
   const reviewList = (
     <ReviewList
-      tracks={tracks}
+      list={list}
       loading={tracksQuery.isPending}
+      search={search}
+      onSearch={setSearch}
+      onMore={() => setLimit((current) => current + 100)}
       workflow={workflow}
       trashDays={setup.trash_days}
       selectedId={selected?.id}
@@ -257,6 +286,7 @@ export function App() {
               <BrandMark size={24} />
             </i>
             magpie-fi
+            <small className="brand-version">{__APP_VERSION__}</small>
           </div>
           <nav aria-label="Sections">
             {tabs.map((item) => (
@@ -287,8 +317,8 @@ export function App() {
             </section>
             <aside className="detail">
               <div className="screen">
-                {selected ? (
-                  songOrCover(selected.id)
+                {selectedId !== undefined && !gone ? (
+                  songOrCover()
                 ) : (
                   <EmptyState
                     icon="inbox"
@@ -312,8 +342,8 @@ export function App() {
 
   const screen =
     tab === "review" ? (
-      openId !== undefined && open ? (
-        <main className="screen no-tabs">{songOrCover(open.id)}</main>
+      openId !== undefined ? (
+        <main className="screen no-tabs">{songOrCover()}</main>
       ) : (
         <main className="screen">{reviewList}</main>
       )

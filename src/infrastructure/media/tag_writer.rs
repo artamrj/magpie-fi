@@ -572,7 +572,7 @@ pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
             let updated = if match_key(&display) == old_key {
                 joined.clone()
             } else if display.contains(old) {
-                display.replace(old, &joined)
+                replace_whole_name(&display, old, &joined)
             } else {
                 display.clone()
             };
@@ -954,6 +954,8 @@ pub fn write_resilient(
     }
 }
 
+const TAG_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
     let extension = detected_container_extension(path).unwrap_or_else(|| {
         path.extension()
@@ -971,7 +973,8 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
         extension
     ));
     let _ = std::fs::remove_file(&repaired);
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -993,14 +996,31 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
             "-1",
             "-y",
         ])
-        .arg(&repaired)
-        .output()
-        .context("could not start FFmpeg for lossless tag cleanup")?;
+        .arg(&repaired);
+    let output = crate::infrastructure::process::run_blocking(command, TAG_CLEANUP_TIMEOUT)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&repaired);
+        })
+        .context("lossless tag cleanup did not finish")?;
     if !output.status.success() || !repaired.is_file() {
         let _ = std::fs::remove_file(&repaired);
         bail!(
             "FFmpeg could not remove malformed metadata: {}",
             String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    // Damaged parts are skipped while copying. A copy that came out shorter
+    // must not be filed as the whole song.
+    if let (Ok(before), Ok(after)) = (
+        crate::domain::audio::read(path),
+        crate::domain::audio::read(&repaired),
+    ) && before.duration - after.duration > 1.0
+    {
+        let _ = std::fs::remove_file(&repaired);
+        bail!(
+            "the tags of this file are damaged and removing them would cut the song from {:.0} s to {:.0} s",
+            before.duration,
+            after.duration
         );
     }
     std::fs::rename(&repaired, path).with_context(|| {
@@ -1013,7 +1033,8 @@ fn sanitize_legacy_metadata(path: &Path) -> Result<()> {
 }
 
 fn detected_container_extension(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("ffprobe")
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -1022,9 +1043,10 @@ fn detected_container_extension(path: &Path) -> Option<String> {
             "-of",
             "default=noprint_wrappers=1:nokey=1",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let output =
+        crate::infrastructure::process::run_blocking(command, std::time::Duration::from_secs(60))
+            .ok()?;
     let format = String::from_utf8_lossy(&output.stdout);
     let names = format.trim().split(',').collect::<Vec<_>>();
     if names
@@ -1233,13 +1255,33 @@ pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<Artwo
     Ok(check.info)
 }
 
+/// The stricter bar for the picture inside one of your own files. Such
+/// pictures are often video frames or small thumbnails, so on top of the
+/// usual checks it must be square (within 2 %) and at least 500 px.
+pub fn check_own_cover(data: &[u8]) -> Result<ArtworkInfo> {
+    let info = inspect_artwork(data, false)?;
+    let (width, height) = (info.width, info.height);
+    if width < 500 || height < 500 {
+        bail!("the file's own picture is too small ({width}x{height}; a cover needs 500x500)");
+    }
+    if width.abs_diff(height) * 50 > width.max(height) {
+        bail!("the file's own picture is not square ({width}x{height})");
+    }
+    Ok(info)
+}
+
 pub fn validate_artwork(data: &[u8]) -> Result<()> {
     inspect_artwork(data, false).map(|_| ())
 }
 
 #[cfg(test)]
 pub fn test_artwork_png() -> Vec<u8> {
-    let image = image::RgbaImage::from_fn(320, 320, |x, y| {
+    test_artwork_png_sized(320, 320)
+}
+
+#[cfg(test)]
+pub fn test_artwork_png_sized(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_fn(width, height, |x, y| {
         if (x / 20 + y / 20) % 2 == 0 {
             image::Rgba([32, 96, 180, 255])
         } else {
@@ -1281,9 +1323,47 @@ fn optional(tag: &mut Tag, key: ItemKey, value: &Option<String>) {
     }
 }
 
+/// Replaces `old` in a display artist ("A & B feat. C") only where it stands
+/// as a whole name. Renaming "Ebi" must not touch "Debi Nova".
+fn replace_whole_name(display: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return display.to_owned();
+    }
+    let mut out = String::with_capacity(display.len());
+    let mut rest = display;
+    let mut before: Option<char> = None;
+    while let Some(index) = rest.find(old) {
+        let after = rest[index + old.len()..].chars().next();
+        let previous = rest[..index].chars().next_back().or(before);
+        let whole = !previous.is_some_and(char::is_alphanumeric)
+            && !after.is_some_and(char::is_alphanumeric);
+        out.push_str(&rest[..index]);
+        out.push_str(if whole { new } else { old });
+        before = old.chars().next_back();
+        rest = &rest[index + old.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_an_artist_leaves_longer_names_alone() {
+        assert_eq!(
+            replace_whole_name("Debi Nova & Ebi", "Ebi", "Ebrahim"),
+            "Debi Nova & Ebrahim"
+        );
+        assert_eq!(replace_whole_name("Ebi feat. Ebi", "Ebi", "X"), "X feat. X");
+        assert_eq!(replace_whole_name("Ebiii, Ebi", "Ebi", "X"), "Ebiii, X");
+        assert_eq!(
+            replace_whole_name("ابی و ابیات", "ابی", "Ebi"),
+            "Ebi و ابیات"
+        );
+        assert_eq!(replace_whole_name("Ebi", "", "X"), "Ebi");
+    }
     use lofty::picture::MimeType;
 
     fn one_pixel_png() -> Vec<u8> {
@@ -1300,6 +1380,18 @@ mod tests {
     #[test]
     fn invalid_cover_data_is_rejected() {
         assert!(picture_from_bytes(vec![0; 12]).is_err());
+    }
+
+    #[test]
+    fn a_files_own_picture_must_be_square_and_at_least_500_px() {
+        assert!(check_own_cover(&test_artwork_png_sized(600, 600)).is_ok());
+        assert!(check_own_cover(&test_artwork_png_sized(600, 606)).is_ok());
+        // A fine catalog cover size, but too small to trust from a file.
+        let small = check_own_cover(&test_artwork_png()).unwrap_err();
+        assert!(small.to_string().contains("too small"));
+        // A video frame.
+        let frame = check_own_cover(&test_artwork_png_sized(800, 600)).unwrap_err();
+        assert!(frame.to_string().contains("not square"));
     }
 
     #[test]

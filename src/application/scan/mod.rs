@@ -52,11 +52,20 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     let cfg = &state.config;
     let (files, walk_errors) = discover_files_in_background(PathBuf::from(&cfg.input_dir)).await?;
     let (downloads, _) = discover_files_in_background(cfg.staging_dir.clone()).await?;
+    let walked_cleanly = walk_errors.is_empty();
     for error in walk_errors {
         tracing::error!(error, "inbox folder walk error");
     }
+    if walked_cleanly && let Ok(inbox) = tokio::fs::canonicalize(&cfg.input_dir).await {
+        forget_deleted_songs(&state, &inbox).await?;
+    }
     let settle = Duration::from_secs(cfg.inbox_settle_seconds);
     let pending = automatic_pending_files(&state.pool, files, downloads, settle).await?;
+    // Found files have their real path, so staging is compared by its real path.
+    let staging = tokio::fs::canonicalize(&cfg.staging_dir)
+        .await
+        .unwrap_or_else(|_| cfg.staging_dir.clone());
+    let (pending, more_waiting) = next_batch(pending, &staging);
     if pending.is_empty() {
         state
             .finish_workflow(WorkflowPhase::Idle, "Inbox: nothing new")
@@ -74,8 +83,23 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     if cancelled {
         return Ok(0);
     }
-    remember_scanned_files(&state.pool, &snapshot_files).await?;
+    remember_unmarked_files(&state.pool, &snapshot_files).await?;
+    if more_waiting {
+        // The next batch starts right after this one is filed, without
+        // waiting for the next inbox check.
+        state.notify_automation_scheduler();
+    }
     Ok(snapshot_files.len())
+}
+
+/// The files of one inbox check: magpie-fi's own downloads first (someone is
+/// waiting for those), then inbox files in path order, so the songs of one
+/// album folder stay together. Also says whether more files are left.
+fn next_batch(mut pending: Vec<PathBuf>, staging: &Path) -> (Vec<PathBuf>, bool) {
+    pending.sort_by_cached_key(|path| (!path.starts_with(staging), path.clone()));
+    let more_waiting = pending.len() > crate::config::INBOX_BATCH;
+    pending.truncate(crate::config::INBOX_BATCH);
+    (pending, more_waiting)
 }
 
 pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()> {
@@ -88,9 +112,161 @@ pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()
     )
     .await?;
     if !cancelled {
-        remember_scanned_files(&state.pool, &snapshot_files).await?;
+        remember_unmarked_files(&state.pool, &snapshot_files).await?;
     }
     Ok(())
+}
+
+/// Clears a song from Review without touching any file: its cached checks, its
+/// download entry and its row. When other copies of the same recording were
+/// waiting behind it as duplicates, the best one takes its place and its matches.
+/// `source` is the file's real path (the recorded path when the file is gone).
+pub async fn forget_track(
+    pool: &sqlx::SqlitePool,
+    track: &crate::infrastructure::db::tracks::Track,
+    source: &Path,
+) -> Result<()> {
+    sqlx::query("UPDATE wanted SET status='removed',error=NULL,updated_at=? WHERE staging_path=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(source.to_string_lossy().as_ref())
+        .execute(pool)
+        .await?;
+    let canonical_path = source.to_string_lossy().into_owned();
+    let mut transaction = pool.begin().await?;
+    for table in [
+        "fingerprint_cache",
+        "content_hash_cache",
+        "integrity_cache",
+        "artwork_overrides",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE path=? OR path=?"
+        )))
+        .bind(&track.path)
+        .bind(&canonical_path)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    if let Some(content_key) = track.content_fingerprint.as_deref() {
+        let duplicate_tracks: Vec<crate::infrastructure::db::tracks::Track> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM tracks
+             WHERE id!=? AND status='duplicate' AND stage='skipped'
+               AND content_fingerprint=? AND is_missing=0
+               AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+                crate::infrastructure::db::tracks::TRACK_FIELDS
+            )))
+            .bind(track.id.0)
+            .bind(content_key)
+            .bind(content_key)
+            .bind(track.duration)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let evidence = duplicate_tracks
+            .iter()
+            .map(|duplicate| input_dedup::RecordingEvidence {
+                path: duplicate.path.clone().into(),
+                format: duplicate.format.clone().unwrap_or_default(),
+                bitrate: duplicate
+                    .bitrate
+                    .and_then(|value| u32::try_from(value).ok()),
+                duration: duplicate.duration,
+                content_key: duplicate.content_fingerprint.clone(),
+                isrc: None,
+                fingerprint: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(group) = input_dedup::group_recordings(&evidence).first() {
+            let promoted = &duplicate_tracks[group.representative];
+            sqlx::query("DELETE FROM candidates WHERE track_id=?")
+                .bind(promoted.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE candidates SET track_id=? WHERE track_id=?")
+                .bind(promoted.id.0)
+                .bind(track.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=NULL,status='review',stage='review',
+                 selected_candidate_id=NULL,error=NULL,
+                 stage_message='Promoted after the previous duplicate representative was removed',
+                 updated_at=? WHERE id=?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=?,stage_message=?,updated_at=?
+                 WHERE id!=? AND status='duplicate' AND stage='skipped'
+                   AND content_fingerprint=?
+                   AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+            )
+            .bind(&promoted.path)
+            .bind(format!("Duplicate of input file: {}", promoted.path))
+            .bind(Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .bind(content_key)
+            .bind(content_key)
+            .bind(track.duration)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    sqlx::query("DELETE FROM tracks WHERE id=?")
+        .bind(track.id.0)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Songs waiting in Review whose file you deleted from the inbox yourself are
+/// dropped, so the list does not keep asking about files that are gone. Only
+/// songs without a chosen match go: a choice you made is kept, and filing
+/// reports that file as missing. Nothing happens while `inbox` itself cannot
+/// be read (an unplugged disk must not empty Review).
+async fn forget_deleted_songs(state: &AppState, inbox: &Path) -> Result<usize> {
+    if tokio::fs::read_dir(inbox).await.is_err() {
+        return Ok(0);
+    }
+    let gone = |path: &str| {
+        let path = PathBuf::from(path);
+        async move {
+            matches!(
+                tokio::fs::metadata(&path).await,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+    };
+    let fields = crate::infrastructure::db::tracks::TRACK_FIELDS;
+    let mut forgotten = 0;
+    // Waiting duplicates first, so a deleted copy is never put in a deleted song's place.
+    for filter in [
+        "status='duplicate' AND stage='skipped'",
+        "stage='review' AND selected_candidate_id IS NULL",
+    ] {
+        let tracks: Vec<crate::infrastructure::db::tracks::Track> = sqlx::query_as(
+            sqlx::AssertSqlSafe(format!("SELECT {fields} FROM tracks WHERE {filter}")),
+        )
+        .fetch_all(&state.pool)
+        .await?;
+        for track in tracks {
+            let path = Path::new(&track.path);
+            let ours = path.starts_with(inbox) || path.starts_with(&state.config.staging_dir);
+            if !ours || !gone(&track.path).await {
+                continue;
+            }
+            forget_track(&state.pool, &track, path).await?;
+            tracing::info!(
+                file = track.filename,
+                "forgot a song whose file was deleted"
+            );
+            forgotten += 1;
+        }
+    }
+    Ok(forgotten)
 }
 
 /// Audio files under `root` as real paths (the form every track row uses).
@@ -126,13 +302,29 @@ async fn automatic_pending_files(
         .map_or(i64::MAX, |time| {
             i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
         });
-    let rows: Vec<(String, i64, i64)> =
-        sqlx::query_as("SELECT path,file_size,file_mtime_ns FROM automatic_scan_files")
+    let rows: Vec<(String, i64, i64, String)> =
+        sqlx::query_as("SELECT path,file_size,file_mtime_ns,checked_at FROM automatic_scan_files")
             .fetch_all(pool)
             .await?;
+    // Songs that wait for a second look are left alone until the longest
+    // pause of a source is over.
+    let too_early = |checked_at: &str| {
+        chrono::DateTime::parse_from_rfc3339(checked_at).is_ok_and(|checked| {
+            Utc::now()
+                .signed_duration_since(checked)
+                .to_std()
+                .unwrap_or_default()
+                < SECOND_LOOK_AFTER
+        })
+    };
+    let not_yet = rows
+        .iter()
+        .filter(|(_, size, _, checked_at)| *size == SECOND_LOOK_PENDING && too_early(checked_at))
+        .map(|(path, ..)| path.clone())
+        .collect::<std::collections::HashSet<_>>();
     let mut known = rows
         .into_iter()
-        .map(|(path, size, modified)| (path, (size, modified)))
+        .map(|(path, size, modified, _)| (path, (size, modified)))
         .collect::<HashMap<_, _>>();
     let candidates = inbox
         .into_iter()
@@ -144,7 +336,10 @@ async fn automatic_pending_files(
         let Ok(stamp) = files::stamp(&path).await else {
             continue;
         };
-        if stamp.1 <= settled_before && previous != Some(stamp) {
+        if stamp.1 <= settled_before
+            && previous != Some(stamp)
+            && !not_yet.contains(path.to_string_lossy().as_ref())
+        {
             pending.push(path);
         }
     }
@@ -159,6 +354,76 @@ async fn automatic_pending_files(
         transaction.commit().await?;
     }
     Ok(pending)
+}
+
+/// How long a song waits for its second look: the longest a source is paused.
+const SECOND_LOOK_AFTER: Duration = Duration::from_secs(5 * 60);
+/// The size stored for a file that waits for its second look. No file has
+/// it, so the file counts as changed and is identified again.
+const SECOND_LOOK_PENDING: i64 = -1;
+
+/// Remembers songs that were identified while a source was paused. The ones
+/// left unsure (in Review with no match chosen) are marked for one more look;
+/// the others, and songs that already had their second look, are remembered
+/// as usual. A song is never looked at a third time: a source that stays
+/// down must not make the inbox check run in circles.
+async fn remember_for_second_look(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
+    for path in files {
+        let text = path.to_string_lossy();
+        let unsure: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tracks WHERE path=? AND stage='review'
+                           AND selected_candidate_id IS NULL)",
+        )
+        .bind(text.as_ref())
+        .fetch_one(pool)
+        .await?;
+        let had_second_look: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM automatic_scan_files WHERE path=? AND second_look=1)",
+        )
+        .bind(text.as_ref())
+        .fetch_one(pool)
+        .await?;
+        if !unsure || had_second_look {
+            remember_scanned_files(pool, std::slice::from_ref(path)).await?;
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO automatic_scan_files(path,file_size,file_mtime_ns,checked_at,second_look)
+             VALUES(?,?,?,?,1)
+             ON CONFLICT(path) DO UPDATE SET
+               file_size=excluded.file_size,
+               file_mtime_ns=excluded.file_mtime_ns,
+               checked_at=excluded.checked_at,
+               second_look=1",
+        )
+        .bind(text.as_ref())
+        .bind(SECOND_LOOK_PENDING)
+        .bind(SECOND_LOOK_PENDING)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+        tracing::info!(file = %path.display(), "a source was paused; this song gets a second look");
+    }
+    Ok(())
+}
+
+/// [`remember_scanned_files`] for the end of a run: every file of the run is
+/// remembered, except those just marked for a second look.
+async fn remember_unmarked_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
+    let waiting: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM automatic_scan_files WHERE file_size=?")
+            .bind(SECOND_LOOK_PENDING)
+            .fetch_all(pool)
+            .await?;
+    let waiting = waiting
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let unmarked = files
+        .iter()
+        .filter(|path| !waiting.contains(path.to_string_lossy().as_ref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    remember_scanned_files(pool, &unmarked).await
 }
 
 async fn remember_scanned_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
@@ -205,6 +470,7 @@ async fn run_files(
         // rate limits.
         songrec: Semaphore::new(2),
         disabled_providers: Mutex::new(HashMap::new()),
+        lookups_missed: std::sync::atomic::AtomicU64::new(0),
     });
     state
         .set_workflow(
@@ -236,7 +502,57 @@ async fn run_files(
                 let Some(job) = job else {
                     break;
                 };
-                process_file(&state, &limits, job, total).await;
+                let paths = job
+                    .members
+                    .iter()
+                    .map(|member| member.path.clone())
+                    .collect::<Vec<_>>();
+                // On its own task: a song that makes the identifier panic is
+                // marked failed and shown in Issues, and this worker carries
+                // on with the next song. (When every worker died, the scan
+                // used to wait forever with the workflow slot taken.)
+                let missed_before = limits
+                    .lookups_missed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let work = AbortOnDrop(tokio::spawn({
+                    let (state, limits) = (state.clone(), limits.clone());
+                    async move { process_file(&state, &limits, job, total).await }
+                }));
+                if let Err(error) = work.finished().await {
+                    tracing::error!(files = ?paths, "identifying a song stopped unexpectedly: {error}");
+                    for path in &paths {
+                        let _ = persist_failed(
+                            &state.pool,
+                            path,
+                            "magpie-fi could not read this file (an unexpected error). \
+                             The other songs were not affected.",
+                        )
+                        .await;
+                    }
+                }
+                // Remembered song by song: after a restart or "Stop" only the
+                // songs that were not finished are identified again, and the
+                // matches already chosen in Review stay chosen. A stopped
+                // song is not finished.
+                if state.workflow_cancelled().await {
+                    break;
+                }
+                // A source was paused while this song was identified. If the
+                // song was left unsure, it is looked at once more when the
+                // source is back; otherwise it would wait in Review for good
+                // without the answer of what may be its best source.
+                let source_missed = limits
+                    .lookups_missed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    != missed_before;
+                let remembered = if source_missed {
+                    remember_for_second_look(&state.pool, &paths).await
+                } else {
+                    remember_scanned_files(&state.pool, &paths).await
+                };
+                if let Err(error) = remembered {
+                    tracing::warn!(%error, "could not remember a scanned file");
+                }
             }
         });
     }
@@ -267,6 +583,22 @@ async fn run_files(
             .await;
     }
     Ok(cancelled)
+}
+
+/// A task that stops when its owner is stopped ("Stop" aborts the scan
+/// workers, and the song they are working on must stop with them).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    async fn finished(mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn prepare_input_jobs(
@@ -419,6 +751,9 @@ pub(super) struct PipelineLimits {
     pub(super) acoustid: Semaphore,
     pub(super) songrec: Semaphore,
     pub(super) disabled_providers: Mutex<HashMap<String, ProviderPause>>,
+    /// How often a song went on without a source that was paused for a while
+    /// (a rate limit, a timeout).
+    pub(super) lookups_missed: std::sync::atomic::AtomicU64,
 }
 
 pub(super) struct FileJob {
@@ -465,6 +800,7 @@ mod tests {
             acoustid: Semaphore::new(1),
             songrec: Semaphore::new(1),
             disabled_providers: Mutex::new(HashMap::new()),
+            lookups_missed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -505,6 +841,28 @@ mod tests {
         assert!(provider_disabled(&limits, "spotify").await);
     }
 
+    #[tokio::test]
+    async fn a_source_that_says_slow_down_in_other_words_is_paused_too() {
+        for (source, answer) in [
+            ("itunes", "HTTP status client error (403 Forbidden) for url"),
+            ("deezer", "Deezer error 4: Quota limit exceeded"),
+            (
+                "genius",
+                "HTTP status server error (503 Service Unavailable)",
+            ),
+            ("shazam", "SongRec: rate limit reached"),
+        ] {
+            let limits = limits();
+            handle_provider_error(&limits, "a.mp3", source, anyhow::anyhow!(answer)).await;
+            assert!(provider_disabled(&limits, source).await, "{source}");
+        }
+        // Any other failure is only logged: the next song asks again.
+        let limits = limits();
+        let other = anyhow::anyhow!("error decoding response body");
+        handle_provider_error(&limits, "a.mp3", "itunes", other).await;
+        assert!(!provider_disabled(&limits, "itunes").await);
+    }
+
     #[test]
     fn discovery_skips_hidden_and_nas_folders() {
         let directory = tempfile::tempdir().unwrap();
@@ -529,6 +887,112 @@ mod tests {
             .canonicalize()
             .unwrap();
         assert_eq!(files, vec![expected]);
+    }
+
+    #[test]
+    fn a_big_inbox_is_taken_in_batches_with_downloads_first() {
+        let staging = Path::new("/music/.magpie-fi/staging");
+        let mut pending = (0..crate::config::INBOX_BATCH + 5)
+            .map(|number| PathBuf::from(format!("/music/inbox/Album/{number:04}.mp3")))
+            .collect::<Vec<_>>();
+        pending.push(staging.join("download.m4a"));
+
+        let (batch, more_waiting) = next_batch(pending, staging);
+
+        assert!(more_waiting);
+        assert_eq!(batch.len(), crate::config::INBOX_BATCH);
+        assert_eq!(batch[0], staging.join("download.m4a"));
+        assert_eq!(batch[1], PathBuf::from("/music/inbox/Album/0000.mp3"));
+
+        let (batch, more_waiting) = next_batch(vec![PathBuf::from("/music/inbox/a.mp3")], staging);
+        assert_eq!(batch.len(), 1);
+        assert!(!more_waiting);
+    }
+
+    #[tokio::test]
+    async fn a_song_left_unsure_while_a_source_was_paused_gets_one_second_look() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("second-look.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let file = |name: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path.canonicalize().unwrap()
+        };
+        let (unsure, chosen, filed) = (file("unsure.mp3"), file("chosen.mp3"), file("filed.mp3"));
+        for (path, stage, selected) in [(&unsure, "review", None), (&chosen, "review", Some(7))] {
+            sqlx::query(
+                "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
+                   last_scanned_at,stage,selected_candidate_id)
+                 VALUES(?,'x','needs_review',0,'now','now','now',?,?)",
+            )
+            .bind(path.to_string_lossy().as_ref())
+            .bind(stage)
+            .bind(selected)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let all = vec![unsure.clone(), chosen.clone(), filed.clone()];
+        let pending = |pool: sqlx::SqlitePool| {
+            let all = all.clone();
+            async move {
+                automatic_pending_files(&pool, all, vec![], Duration::ZERO)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A source was paused while all three were identified.
+        remember_for_second_look(&pool, &all).await.unwrap();
+        // The end of the run does not undo the mark.
+        remember_unmarked_files(&pool, &all).await.unwrap();
+        // Nothing is asked again right away: the source may still be paused.
+        assert!(pending(pool.clone()).await.is_empty());
+
+        // Five minutes later only the unsure song is looked at again. A song
+        // with a chosen match or one that is not in Review is left alone.
+        sqlx::query("UPDATE automatic_scan_files SET checked_at=?")
+            .bind((Utc::now() - chrono::Duration::minutes(6)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending(pool.clone()).await, vec![unsure.clone()]);
+
+        // The source is still down at the second look: no third one.
+        remember_for_second_look(&pool, std::slice::from_ref(&unsure))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE automatic_scan_files SET checked_at=?")
+            .bind((Utc::now() - chrono::Duration::minutes(6)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(pending(pool.clone()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_paused_source_counts_the_songs_that_went_on_without_it() {
+        let limits = limits();
+        let missed = || {
+            limits
+                .lookups_missed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert!(!provider_disabled(&limits, "itunes").await);
+        assert_eq!(missed(), 0);
+        let busy = anyhow::anyhow!("HTTP status client error (429 Too Many Requests)");
+        handle_provider_error(&limits, "a.mp3", "itunes", busy).await;
+        assert_eq!(missed(), 1);
+        assert!(provider_disabled(&limits, "itunes").await);
+        assert_eq!(missed(), 2);
+        // A refused key is off for good; waiting would not help.
+        let refused = anyhow::anyhow!("HTTP status client error (401 Unauthorized)");
+        handle_provider_error(&limits, "a.mp3", "spotify", refused).await;
+        assert!(provider_disabled(&limits, "spotify").await);
+        assert_eq!(missed(), 2);
     }
 
     #[tokio::test]
@@ -574,6 +1038,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remembered, 0);
+    }
+
+    #[tokio::test]
+    async fn songs_whose_file_was_deleted_from_the_inbox_leave_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let inbox = directory.path().join("inbox");
+        tokio::fs::create_dir(&inbox).await.unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        let kept = inbox.join("still-here.mp3");
+        tokio::fs::write(&kept, b"audio").await.unwrap();
+        let database = directory.path().join("deleted.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let state = AppState::new(
+            crate::config::Config {
+                input_dir: inbox.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            pool.clone(),
+        );
+        let add = |name: &'static str, path: String, status: &'static str, stage: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,
+                     last_seen_at,last_scanned_at,stage) VALUES(?,?,?,0,'now','now','now',?)",
+                )
+                .bind(path)
+                .bind(name)
+                .bind(status)
+                .bind(stage)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let path = |name: &str| inbox.join(name).to_string_lossy().into_owned();
+        add(
+            "still-here.mp3",
+            path("still-here.mp3"),
+            "needs_review",
+            "review",
+        )
+        .await;
+        add("deleted.mp3", path("deleted.mp3"), "needs_review", "review").await;
+        add(
+            "deleted-copy.mp3",
+            path("deleted-copy.mp3"),
+            "duplicate",
+            "skipped",
+        )
+        .await;
+        // A deleted file elsewhere is not the inbox's business.
+        add(
+            "elsewhere.mp3",
+            "/somewhere/else.mp3".into(),
+            "needs_review",
+            "review",
+        )
+        .await;
+        // A match you already chose is kept; filing reports the missing file.
+        let chosen = add("chosen.mp3", path("chosen.mp3"), "selected", "review").await;
+        let candidate = sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,score) VALUES(?,'manual','Song','Artist',100.0)",
+        )
+        .bind(chosen)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+            .bind(candidate)
+            .bind(chosen)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // An inbox that cannot be read (an unplugged disk) changes nothing.
+        let unplugged = directory.path().join("not-mounted");
+        assert_eq!(forget_deleted_songs(&state, &unplugged).await.unwrap(), 0);
+
+        assert_eq!(forget_deleted_songs(&state, &inbox).await.unwrap(), 2);
+        let mut left: Vec<String> = sqlx::query_scalar("SELECT filename FROM tracks")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        left.sort();
+        assert_eq!(left, ["chosen.mp3", "elsewhere.mp3", "still-here.mp3"]);
+        assert!(kept.exists());
     }
 
     #[tokio::test]

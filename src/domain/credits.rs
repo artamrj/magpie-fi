@@ -230,8 +230,9 @@ pub fn main_name(artist: &str, title: &str) -> Option<String> {
 }
 
 /// Separators sources use between co-singers inside one credit.
-const LOOSE_SEPARATORS: [&str; 9] = [
-    ", ", "، ", " & ", " x ", " and ", " و ", " vs ", " vs. ", " with ",
+const LOOSE_SEPARATORS: [&str; 10] = [
+    // Before ", ": "A, B, & C" must not leave "& C" as a name.
+    ", & ", ", ", "، ", " & ", " x ", " and ", " و ", " vs ", " vs. ", " with ",
 ];
 
 /// The earliest loose separator in `value`: (byte index, separator length).
@@ -420,6 +421,113 @@ pub fn restore_missing_main(
     (artists, true)
 }
 
+/// Puts back the singers a source left out. Catalogs often credit only the first of
+/// several co-singers: "Alireza JJ feat. Hoomaan" for a file tagged "Alireza JJ, Sijal &
+/// Sepehr Khalse feat. Hoomaan". When everyone the source names is in the file, the source
+/// starts with the file's main singer and the file names more people, the file's credit is
+/// used: its people, order and joins, each name spelled the fuller of the two ways. A
+/// source naming someone the file does not is left alone: that is another credit, not a
+/// shorter one. Returns whether anything changed.
+pub fn restore_missing_singers(
+    artists: Vec<ArtistCredit>,
+    file_artist: &str,
+    file_title: &str,
+) -> (Vec<ArtistCredit>, bool) {
+    let file_credits = normalize_featured(file_artist, file_title).artists;
+    let file_people = file_credits
+        .iter()
+        .flat_map(|credit| loose_names(&credit.name))
+        .collect::<Vec<_>>();
+    let match_people = artists
+        .iter()
+        .flat_map(|credit| {
+            let names = loose_names(&credit.name);
+            // A MusicBrainz ID belongs to the whole credit: keep it only for one person.
+            let id = (names.len() == 1)
+                .then(|| credit.musicbrainz_id.clone())
+                .flatten();
+            names.into_iter().map(move |name| (name, id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let (Some(file_main), Some((match_main, _))) = (file_people.first(), match_people.first())
+    else {
+        return (artists, false);
+    };
+    if file_people.len() <= match_people.len() || !same_person(match_main, file_main) {
+        return (artists, false);
+    }
+    // Each source name must be one of the file's people, each of them used once.
+    let mut used = Vec::with_capacity(match_people.len());
+    for (name, _) in &match_people {
+        let Some(index) = (0..file_people.len())
+            .find(|index| !used.contains(index) && same_person(name, &file_people[*index]))
+        else {
+            return (artists, false);
+        };
+        used.push(index);
+    }
+    let source_of = |file: &str| {
+        match_people
+            .iter()
+            .find(|(name, _)| same_person(name, file))
+    };
+    let restored = file_credits
+        .into_iter()
+        .map(|credit| {
+            let people = loose_names(&credit.name);
+            let musicbrainz_id = match people.as_slice() {
+                [only] => source_of(only).and_then(|(_, id)| id.clone()),
+                _ => None,
+            };
+            ArtistCredit {
+                name: respell_loose(&credit.name, |file| match source_of(file) {
+                    Some((source, _)) if !is_short_form(source, file) => source.clone(),
+                    _ => file.to_owned(),
+                }),
+                musicbrainz_id,
+                ..credit
+            }
+        })
+        .collect();
+    (restored, true)
+}
+
+/// Whether `artists` name exactly the people the display text does. The tag editor sends
+/// both the Artist line and one chip per artist; when they disagree, the line you typed is
+/// what you meant.
+pub fn names_same_people(display: &str, title: &str, artists: &[ArtistCredit]) -> bool {
+    let people = |credits: &[ArtistCredit]| {
+        credits
+            .iter()
+            .flat_map(|credit| loose_names(&credit.name))
+            .collect::<Vec<_>>()
+    };
+    let typed = people(&normalize_featured(display, title).artists);
+    let mut chips = people(artists);
+    typed.len() == chips.len()
+        && typed.iter().all(|name| {
+            chips
+                .iter()
+                .position(|chip| same_person(chip, name))
+                .map(|index| chips.swap_remove(index))
+                .is_some()
+        })
+}
+
+/// The singers an album is filed under: everyone before the first `feat.`. A guest on
+/// one song is not an artist of the album.
+pub fn main_credits(artists: &[ArtistCredit]) -> Vec<ArtistCredit> {
+    let end = artists
+        .iter()
+        .position(|credit| credit.join_phrase.trim().eq_ignore_ascii_case("feat."))
+        .map_or(artists.len(), |index| index + 1);
+    let mut main = artists[..end].to_vec();
+    if let Some(last) = main.last_mut() {
+        last.join_phrase.clear();
+    }
+    main
+}
+
 /// Puts the song's main singer first when a source listed them after a featured artist
 /// ("Ferap feat. Tqvis" for a file tagged "Tqvis & Ferap"). The file's own tags say who is
 /// main; the others become featured. Returns whether anything moved.
@@ -469,7 +577,9 @@ fn parse_supported_credit(value: &str) -> Vec<ArtistCredit> {
     let mut rest = clean_text(value);
     let mut out = Vec::new();
     while !rest.is_empty() {
-        let lower = rest.to_lowercase();
+        // ASCII lower-casing keeps byte positions, so they are safe to cut
+        // `rest` at; full lower-casing changes the length of "İ" or "ẞ".
+        let lower = rest.to_ascii_lowercase();
         let next = [" / ", " feat. ", " feat ", " ft. ", " ft ", "; "]
             .into_iter()
             .filter_map(|separator| lower.find(separator).map(|index| (index, separator)))
@@ -498,7 +608,8 @@ fn normalize_join_phrase(value: &str) -> String {
 
 fn remove_feature_clause(title: &str) -> (String, Option<String>) {
     let title = clean_text(title);
-    let lower = title.to_lowercase();
+    // Byte positions must match `title` (see `parse_supported_credit`).
+    let lower = title.to_ascii_lowercase();
     for marker in ["(feat. ", "(feat ", "(ft. ", "(ft ", "(featuring "] {
         if let Some(start) = lower.find(marker)
             && let Some(relative_close) = title[start + marker.len()..].find(')')
@@ -528,6 +639,28 @@ fn same_name(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letters_that_change_length_in_lower_case_do_not_break_the_cut() {
+        // "İ" grows and "ẞ" shrinks when lower-cased; cutting at a position
+        // taken from the lower-cased text used to panic inside a letter.
+        let names = |value: &str| {
+            parse_supported_credit(value)
+                .into_iter()
+                .map(|credit| credit.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("İİİİ ft. Öz"), ["İİİİ", "Öz"]);
+        assert_eq!(names("GROẞẞẞ / Öz"), ["GROẞẞẞ", "Öz"]);
+        assert_eq!(
+            remove_feature_clause("İİİİİİ (Feat. Öz)"),
+            ("İİİİİİ".to_owned(), Some("Öz".to_owned()))
+        );
+        assert_eq!(
+            remove_feature_clause("GROẞẞẞ FT. Öz"),
+            ("GROẞẞẞ".to_owned(), Some("Öz".to_owned()))
+        );
+    }
 
     #[test]
     fn the_files_main_singer_goes_first_whatever_a_source_said() {

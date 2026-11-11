@@ -291,6 +291,46 @@ fn join_album(
     }
 }
 
+/// The same as joining an album in the library, for two songs filed in one batch: `song`
+/// takes the album details of `album_song`, another song of the same album that a catalog
+/// spelled or dated differently. A single joins an album (the title song), an album never
+/// joins a single. Returns whether the song joined.
+pub(crate) fn join_planned_album(song: &mut Candidate, album_song: &Candidate) -> bool {
+    let (kind, album_kind) = (release_kind(song), release_kind(album_song));
+    if kind != album_kind && album_kind != ReleaseKind::Album {
+        return false;
+    }
+    song.album = album_song.album.clone();
+    song.album_artist = album_song.album_artist.clone();
+    song.album_artist_credits = album_song.album_artist_credits.clone();
+    song.album_artist_sort = album_song.album_artist_sort.clone();
+    if song.release_id.as_deref().map(str::to_ascii_lowercase)
+        != album_song
+            .release_id
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+    {
+        // The track ID belongs to the other edition.
+        song.release_track_id = None;
+    }
+    song.release_id = album_song.release_id.clone();
+    song.release_group_id = album_song.release_group_id.clone();
+    song.release_date = album_song.release_date.clone();
+    song.original_date = album_song.original_date.clone();
+    song.year = album_song.year.clone();
+    song.release_type = album_song.release_type.clone();
+    song.is_compilation = album_song.is_compilation;
+    song.label = album_song.label.clone();
+    if kind != album_kind {
+        // A single's "track 1 of 1" is not its place on the album.
+        song.track_number = None;
+        song.track_total = None;
+        song.disc_number = None;
+        song.disc_total = None;
+    }
+    true
+}
+
 /// "Khalij (1999) [Single]" → (("Khalij", Some("1999")), Single).
 fn folder_release(name: &str) -> ((&str, Option<&str>), ReleaseKind) {
     let (rest, kind) = if let Some(rest) = name.strip_suffix(" [Single]") {
@@ -463,6 +503,10 @@ pub struct LibraryEntry {
     pub fingerprint: Option<String>,
     /// Artist identities of the song, primary first.
     pub artist_ids: Vec<i64>,
+    /// Set by [`find_same_recording`]: the two files themselves are the same
+    /// recording (same bytes or same sound). False when only the ISRC or
+    /// MusicBrainz ID of the chosen match says so, and the match can be wrong.
+    pub proven_by_audio: bool,
 }
 
 /// The title as compared for "probably the same song": no `feat.` part, and
@@ -533,6 +577,11 @@ type Row = (
 /// (identical file or identical audio fingerprint), the same ISRC or the same
 /// MusicBrainz recording — the last three only with lengths within 3 seconds.
 /// Rows whose file has disappeared are dropped on the way.
+///
+/// A file proven by its audio wins over one found only by ISRC or MusicBrainz
+/// ID. Those two come from the chosen match, not from the new file, so the
+/// caller must ask the owner before it trashes or replaces anything on them
+/// (`proven_by_audio` is false).
 pub async fn find_same_recording(
     pool: &SqlitePool,
     evidence: &RecordingEvidence,
@@ -554,6 +603,7 @@ pub async fn find_same_recording(
     .bind(recording_id)
     .fetch_all(pool)
     .await?;
+    let mut by_match_only = None;
     for (path, duration, content_key, row_isrc, row_recording, format, bitrate) in rows {
         let exact = evidence
             .content_key
@@ -576,7 +626,8 @@ pub async fn find_same_recording(
             forget(pool, Path::new(&path)).await?;
             continue;
         }
-        return Ok(Some(LibraryEntry {
+        let proven_by_audio = exact || (close && same_fingerprint);
+        let entry = LibraryEntry {
             path,
             duration,
             content_key,
@@ -584,10 +635,15 @@ pub async fn find_same_recording(
             recording_id: row_recording,
             format,
             bitrate: bitrate.and_then(|value| u32::try_from(value).ok()),
+            proven_by_audio,
             ..LibraryEntry::default()
-        }));
+        };
+        if proven_by_audio {
+            return Ok(Some(entry));
+        }
+        by_match_only.get_or_insert(entry);
     }
-    find_same_sound(pool, evidence).await
+    Ok(find_same_sound(pool, evidence).await?.or(by_match_only))
 }
 
 /// path, duration, content key, format, bitrate, fingerprint.
@@ -640,6 +696,7 @@ async fn find_same_sound(
             content_key,
             format,
             bitrate: bitrate.and_then(|value| u32::try_from(value).ok()),
+            proven_by_audio: true,
             ..LibraryEntry::default()
         }));
     }
@@ -679,6 +736,94 @@ pub async fn find_possible_duplicate(
     Ok(None)
 }
 
+/// Is a file with exactly this audio (its content key) in the library?
+pub async fn has_content(pool: &SqlitePool, content_key: &str) -> Result<bool> {
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM library_items WHERE content_key=?")
+            .bind(content_key)
+            .fetch_all(pool)
+            .await?;
+    for path in paths {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Hidden work files that a stop in the middle of a job left in the library:
+/// copies of songs magpie-fi was tagging or filing (`.Song.mp3.magpie-fi-…`,
+/// `.Song.tag-clean-…`), and an artist folder caught half-way through a
+/// rename (`.Artist.magpie-fi-rename`). Called once at start, when no job is
+/// running, so every such file is stale.
+///
+/// The copies go to the trash, never straight to `rm`: the song they were
+/// made from is still in its place. A half-renamed artist folder gets its old
+/// name back, because every scan skips hidden folders and its songs would
+/// otherwise be gone from the library.
+pub async fn recover_leftovers(library: &Path, trash: &Path) -> Result<usize> {
+    const RENAMING: &str = ".magpie-fi-rename";
+    let root = library.to_path_buf();
+    let (folders, files) = tokio::task::spawn_blocking(move || {
+        let (mut folders, mut files) = (Vec::new(), Vec::new());
+        let mut walk = walkdir::WalkDir::new(&root).follow_links(false).into_iter();
+        while let Some(Ok(entry)) = walk.next() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.depth() == 0 || !name.starts_with('.') {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                if name.ends_with(RENAMING) {
+                    folders.push(entry.path().to_path_buf());
+                }
+                // Other hidden folders (the trash, NAS metadata) are not ours to look into.
+                walk.skip_current_dir();
+            } else if entry.file_type().is_file()
+                && (name.contains(".magpie-fi-") || name.contains(".tag-clean-"))
+            {
+                files.push(entry.path().to_path_buf());
+            }
+        }
+        (folders, files)
+    })
+    .await?;
+
+    let mut recovered = 0;
+    for folder in folders {
+        let Some(name) = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('.'))
+            .and_then(|name| name.strip_suffix(RENAMING))
+        else {
+            continue;
+        };
+        let original = folder.with_file_name(name);
+        if tokio::fs::try_exists(&original).await.unwrap_or(true) {
+            tracing::warn!(folder = %folder.display(), "a half-renamed artist folder could not get its name back: the name is taken");
+            continue;
+        }
+        match tokio::fs::rename(&folder, &original).await {
+            Ok(()) => {
+                tracing::warn!(folder = %original.display(), "an artist folder was caught half-way through a rename and got its old name back");
+                recovered += 1;
+            }
+            Err(error) => {
+                tracing::warn!(%error, folder = %folder.display(), "could not give a half-renamed artist folder its name back");
+            }
+        }
+    }
+    for file in files {
+        match move_to_trash(trash, library, &file).await {
+            Ok(_) => recovered += 1,
+            Err(error) => {
+                tracing::warn!(%error, file = %file.display(), "could not move a leftover work file to the trash");
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 /// True when `new` should replace `existing`: only a lossless file replaces a
 /// lossy one. Anything else keeps what is already in the library.
 pub fn is_upgrade(new: &RecordingEvidence, existing: &LibraryEntry) -> bool {
@@ -690,7 +835,18 @@ pub fn is_upgrade(new: &RecordingEvidence, existing: &LibraryEntry) -> bool {
 /// rewritten). Entries for deleted files are removed.
 pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
     let root = library.to_path_buf();
-    let (files, _) = tokio::task::spawn_blocking(move || files::audio_files(&root)).await?;
+    let (files, walk_errors) =
+        tokio::task::spawn_blocking(move || files::audio_files(&root)).await?;
+    // A folder that could not be read (a disk not mounted, a permission
+    // problem) says nothing about its songs. Forgetting them would make
+    // magpie-fi download songs you already have.
+    let walked_cleanly = walk_errors.is_empty();
+    for error in walk_errors {
+        tracing::error!(
+            error,
+            "library folder walk error; no song is forgotten in this pass"
+        );
+    }
 
     // Rows from before artist identities and sound checks are described again,
     // a few hundred per pass so the inbox is never held up for long.
@@ -710,8 +866,10 @@ pub async fn index_library(pool: &SqlitePool, library: &Path) -> Result<usize> {
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
-    for path in known.keys().filter(|path| !present.contains(*path)) {
-        forget(pool, Path::new(path)).await?;
+    if walked_cleanly {
+        for path in known.keys().filter(|path| !present.contains(*path)) {
+            forget(pool, Path::new(path)).await?;
+        }
     }
 
     let mut indexed = 0;
@@ -786,6 +944,7 @@ pub async fn describe_file(pool: &SqlitePool, path: &Path) -> Result<LibraryEntr
         source: "existing".into(),
         fingerprint,
         artist_ids,
+        proven_by_audio: false,
     })
 }
 
@@ -1174,6 +1333,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_files_left_by_a_stop_are_cleared_and_a_half_renamed_folder_comes_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let trash = library.join(".magpie-fi/trash");
+        let album = library.join("Ebi/Khalij");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 - Song.mp3"), b"the song").unwrap();
+        std::fs::write(album.join(".01 - Song.mp3.magpie-fi-artist.mp3"), b"copy").unwrap();
+        std::fs::write(album.join(".01 - Song.tag-clean-77.mp3"), b"copy").unwrap();
+        std::fs::write(album.join(".DS_Store"), b"not ours").unwrap();
+        // An artist folder caught between the two steps of a rename.
+        let hidden = library.join(".Googoosh.magpie-fi-rename");
+        std::fs::create_dir_all(hidden.join("Album")).unwrap();
+        std::fs::write(hidden.join("Album/01 - Song.mp3"), b"googoosh").unwrap();
+        // Something already in the trash is left alone.
+        std::fs::create_dir_all(trash.join("2026-01-01")).unwrap();
+        std::fs::write(trash.join("2026-01-01/.old.magpie-fi-x.mp3"), b"old").unwrap();
+
+        assert_eq!(recover_leftovers(&library, &trash).await.unwrap(), 3);
+
+        assert_eq!(
+            std::fs::read(album.join("01 - Song.mp3")).unwrap(),
+            b"the song"
+        );
+        assert!(!album.join(".01 - Song.mp3.magpie-fi-artist.mp3").exists());
+        assert!(!album.join(".01 - Song.tag-clean-77.mp3").exists());
+        assert!(album.join(".DS_Store").exists());
+        assert_eq!(
+            std::fs::read(library.join("Googoosh/Album/01 - Song.mp3")).unwrap(),
+            b"googoosh"
+        );
+        assert!(!hidden.exists());
+        assert!(trash.join("2026-01-01/.old.magpie-fi-x.mp3").exists());
+        // Nothing is left to do the second time.
+        assert_eq!(recover_leftovers(&library, &trash).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn indexing_finds_songs_added_by_hand_and_forgets_deleted_ones() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let (directory, pool) = pool().await;
+        let library = directory.path().join("library");
+        let folder = library.join("Ebi/Khalij (1999)");
+        std::fs::create_dir_all(&folder).unwrap();
+        let song = folder.join("01 - Hamdam.mp3");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=2")
+            .args(["-q:a", "9"])
+            .arg(&song)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let before = std::fs::read(&song).unwrap();
+        let count = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM library_items")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(index_library(&pool, &library).await.unwrap(), 1);
+        assert_eq!(count().await, 1);
+        // Indexing only reads: the song is byte for byte what it was.
+        assert_eq!(std::fs::read(&song).unwrap(), before);
+        // Nothing changed, so nothing is indexed again.
+        assert_eq!(index_library(&pool, &library).await.unwrap(), 0);
+
+        // The disk is not there (not mounted): every song is still known.
+        let unmounted = directory.path().join("not-mounted");
+        assert_eq!(index_library(&pool, &unmounted).await.unwrap(), 0);
+        assert_eq!(count().await, 1);
+
+        // The song is really deleted: now it is forgotten.
+        std::fs::remove_file(&song).unwrap();
+        assert_eq!(index_library(&pool, &library).await.unwrap(), 0);
+        assert_eq!(count().await, 0);
+    }
+
+    #[tokio::test]
     async fn the_same_recording_is_found_by_fingerprint_isrc_or_musicbrainz_id() {
         let (directory, pool) = pool().await;
         let file = directory.path().join("song.m4a");
@@ -1213,6 +1461,27 @@ mod tests {
             }
         };
         assert!(hit(probe(Some("fp:abc"), None, 201.0), None).await);
+        // Only the audio proves it about the file itself; an ISRC or a
+        // MusicBrainz ID comes from the match, which can be the wrong one.
+        let by_audio = |evidence: RecordingEvidence, mbid: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                find_same_recording(&pool, &evidence, mbid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .proven_by_audio
+            }
+        };
+        assert!(
+            by_audio(
+                probe(Some("fp:abc"), Some("USUM71703861"), 201.0),
+                Some("mbid-1")
+            )
+            .await
+        );
+        assert!(!by_audio(probe(None, Some("USUM71703861"), 198.0), None).await);
+        assert!(!by_audio(probe(None, None, 200.5), Some("mbid-1")).await);
         assert!(hit(probe(None, Some("USUM71703861"), 198.0), None).await);
         assert!(hit(probe(None, None, 200.5), Some("mbid-1")).await);
         // Same fingerprint but a very different length is a different recording.

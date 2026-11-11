@@ -45,7 +45,16 @@ pub async fn search(
     // The same song turns up for several search terms; keep it once.
     let mut seen = std::collections::HashSet::new();
     for term in terms {
-        let raw = search_term(pool, client, &term).await?;
+        let raw = match search_term(pool, client, &term).await {
+            Ok(raw) => raw,
+            // One search that fails must not throw away what the earlier
+            // ones found. The rest are skipped: the source is having trouble.
+            Err(error) if !out.is_empty() => {
+                tracing::warn!(%error, term, "an iTunes search failed; using what the other searches found");
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         out.extend(
             raw["results"]
                 .as_array()

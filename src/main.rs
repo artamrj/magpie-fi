@@ -43,39 +43,56 @@ async fn main() -> Result<()> {
     purge_trash(&config).await;
     infrastructure::db::enforce_media_cache_limit(&pool).await?;
     let state = Arc::new(app::AppState::new(config, pool));
-    let maintenance_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(duration_until_next_local_midnight()).await;
-            while maintenance_state.workflow_running().await {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+    acquire::worker::resume_after_restart(&state).await;
+    match application::library::recover_leftovers(
+        Path::new(&state.config.output_dir),
+        &state.config.trash_dir,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "cleared work files left by the last stop"),
+        Err(error) => tracing::warn!(%error, "could not clear work files left by the last stop"),
+    }
+    keep_running(
+        "daily maintenance",
+        &state,
+        |maintenance_state| async move {
+            loop {
+                tokio::time::sleep(duration_until_next_local_midnight()).await;
+                while maintenance_state.workflow_running().await {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                if let Err(error) =
+                    infrastructure::db::run_daily_cache_cleanup_if_due(&maintenance_state.pool)
+                        .await
+                {
+                    tracing::warn!(%error, "daily disposable cache cleanup failed");
+                }
+                purge_trash(&maintenance_state.config).await;
             }
-            if let Err(error) =
-                infrastructure::db::run_daily_cache_cleanup_if_due(&maintenance_state.pool).await
-            {
-                tracing::warn!(%error, "daily disposable cache cleanup failed");
-            }
-            purge_trash(&maintenance_state.config).await;
-        }
-    });
-    let media_cache_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
-        interval.tick().await;
-        loop {
+        },
+    );
+    keep_running(
+        "media-cache limit",
+        &state,
+        |media_cache_state| async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
             interval.tick().await;
-            if media_cache_state.workflow_running().await {
-                continue;
+            loop {
+                interval.tick().await;
+                if media_cache_state.workflow_running().await {
+                    continue;
+                }
+                if let Err(error) =
+                    infrastructure::db::enforce_media_cache_limit(&media_cache_state.pool).await
+                {
+                    tracing::warn!(%error, "media-analysis cache limit check failed");
+                }
             }
-            if let Err(error) =
-                infrastructure::db::enforce_media_cache_limit(&media_cache_state.pool).await
-            {
-                tracing::warn!(%error, "media-analysis cache limit check failed");
-            }
-        }
-    });
-    let inbox_state = state.clone();
-    tokio::spawn(async move {
+        },
+    );
+    keep_running("inbox loop", &state, |inbox_state| async move {
         // Check the inbox at a fixed interval, or right away when someone asks
         // ("Check inbox now" in the web page). A cycle never runs twice at once.
         let interval = Duration::from_secs(inbox_state.config.inbox_check_seconds);
@@ -94,27 +111,35 @@ async fn main() -> Result<()> {
                     .try_claim_workflow(types::WorkflowPhase::Apply, "Tidying the library")
                     .await
                 {
-                    match application::artist_changes::split_featured_artists(&inbox_state).await {
-                        Ok(0) => {}
-                        Ok(count) => {
-                            tracing::info!(count, "split featured artists out of artist names")
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "splitting featured artist names failed")
-                        }
-                    }
-                    if !inbox_state.config.sidecars {
-                        match application::tidy::embed_sidecars(&inbox_state).await {
-                            Ok(tidied) if tidied.lyrics > 0 => tracing::info!(
-                                lyrics = tidied.lyrics,
-                                "put lyrics from .lrc files inside their songs"
-                            ),
-                            Ok(_) => {}
+                    let tidy_state = inbox_state.clone();
+                    let tidying = async move {
+                        match application::artist_changes::split_featured_artists(&tidy_state).await
+                        {
+                            Ok(0) => {}
+                            Ok(count) => {
+                                tracing::info!(count, "split featured artists out of artist names")
+                            }
                             Err(error) => {
-                                tracing::warn!(%error, "tidying lyrics and cover files failed")
+                                tracing::warn!(%error, "splitting featured artist names failed")
                             }
                         }
-                    }
+                        if !tidy_state.config.sidecars {
+                            match application::tidy::embed_sidecars(&tidy_state).await {
+                                Ok(tidied) if tidied.lyrics > 0 => tracing::info!(
+                                    lyrics = tidied.lyrics,
+                                    "put lyrics from .lrc files inside their songs"
+                                ),
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "tidying lyrics and cover files failed")
+                                }
+                            }
+                        }
+                    };
+                    // Whatever happens while tidying, the inbox check below still runs.
+                    let _ = inbox_state
+                        .guard_workflow("Tidying the library", tidying)
+                        .await;
                     inbox_state
                         .reset_workflow(types::WorkflowPhase::Idle, "Ready")
                         .await;
@@ -122,7 +147,12 @@ async fn main() -> Result<()> {
                 next_index = tokio::time::Instant::now() + Duration::from_secs(6 * 60 * 60);
             }
             if !inbox_state.workflow_running().await
-                && let Err(error) = http::handlers::run_automatic_cycle(inbox_state.clone()).await
+                && let Some(Err(error)) = inbox_state
+                    .guard_workflow(
+                        "The inbox check",
+                        http::handlers::run_automatic_cycle(inbox_state.clone()),
+                    )
+                    .await
             {
                 tracing::error!(%error, "inbox cycle failed");
                 inbox_state
@@ -138,10 +168,9 @@ async fn main() -> Result<()> {
             }
         }
     });
-    tokio::spawn(acquire::worker::run(state.clone()));
-    tokio::spawn(telegram::run(state.clone()));
-    let updater_state = state.clone();
-    tokio::spawn(async move {
+    keep_running("download worker", &state, acquire::worker::run);
+    keep_running("Telegram bot", &state, telegram::run);
+    keep_running("yt-dlp update", &state, |updater_state| async move {
         // yt-dlp breaks whenever YouTube changes, so it is updated every day.
         loop {
             let config = &updater_state.config;
@@ -183,6 +212,33 @@ async fn main() -> Result<()> {
         .await?;
     state.pool.close().await;
     Ok(())
+}
+
+/// Starts a background loop and starts it again when it stops unexpectedly.
+/// A loop that panicked used to be gone until the next restart, while the web
+/// page stayed up and looked healthy: the inbox was never checked again, or
+/// the bot never answered again.
+fn keep_running<F, Fut>(name: &'static str, state: &Arc<app::AppState>, start: F)
+where
+    F: Fn(Arc<app::AppState>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(start(state.clone())).await {
+                // It ended on its own (the bot without a token, for example).
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::error!(
+                        task = name,
+                        "background task stopped unexpectedly and is started again: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
 }
 
 fn listen_address() -> Result<SocketAddr> {

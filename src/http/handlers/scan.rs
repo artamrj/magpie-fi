@@ -51,7 +51,49 @@ pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<Retr
             "Wait for the current scan or write operation to finish",
         ));
     }
+    // On its own task, so the slot never stays taken when the page stopped
+    // waiting for the answer: it is freed when collecting fails or finds
+    // nothing, and the check itself starts from here otherwise.
+    let starting = tokio::spawn({
+        let s = s.clone();
+        async move {
+            let collected = collect_issue_files(&s).await;
+            let (available, unavailable) = match collected {
+                Ok((available, unavailable)) if !available.is_empty() => (available, unavailable),
+                other => {
+                    s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+                    return other.map(|(_, unavailable)| (0, unavailable));
+                }
+            };
+            let queued = available.len();
+            tokio::spawn(async move {
+                let recovering = recover_issue_files(s.clone(), available);
+                if let Some(Err(error)) = s.guard_workflow("Check & fix", recovering).await {
+                    s.finish_workflow(WorkflowPhase::Failed, error.to_string())
+                        .await;
+                }
+            });
+            Ok((queued, unavailable))
+        }
+    });
+    let (queued, unavailable) = match starting.await {
+        Ok(started) => started?,
+        Err(error) => {
+            s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "the check stopped unexpectedly: {error}"
+            )));
+        }
+    };
+    Ok(Json(RetryIssuesResult {
+        started: queued > 0,
+        queued,
+        unavailable,
+    }))
+}
 
+/// The files "Check & fix" should look at again, and how many are still missing.
+async fn collect_issue_files(s: &AppState) -> ApiResult<(Vec<(PathBuf, bool)>, usize)> {
     let issue_paths: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT id,path,status FROM tracks
          WHERE status IN ('corrupt','failed','provider_error')
@@ -95,30 +137,7 @@ pub async fn retry_issues(State(s): State<Arc<AppState>>) -> ApiResult<Json<Retr
             .await?;
         }
     }
-
-    let queued = available.len();
-    if queued == 0 {
-        s.reset_workflow(WorkflowPhase::Idle, "Ready").await;
-        return Ok(Json(RetryIssuesResult {
-            started: false,
-            queued,
-            unavailable,
-        }));
-    }
-
-    let state = s.clone();
-    tokio::spawn(async move {
-        if let Err(error) = recover_issue_files(state.clone(), available).await {
-            state
-                .finish_workflow(WorkflowPhase::Failed, error.to_string())
-                .await;
-        }
-    });
-    Ok(Json(RetryIssuesResult {
-        started: true,
-        queued,
-        unavailable,
-    }))
+    Ok((available, unavailable))
 }
 
 async fn recover_issue_files(state: Arc<AppState>, issues: Vec<(PathBuf, bool)>) -> Result<()> {

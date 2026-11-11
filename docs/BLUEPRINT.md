@@ -59,16 +59,19 @@ there, while Premium-only episodes are refused); not Lidarr (no "monitor every a
 2. **Your files are sacred.** Nothing is overwritten (atomic, no-clobber publish). Originals go to
    a trash with retention, never straight to `rm`. Existing library files are indexed, not moved
    or renamed. Their tags change only when you ask: a fix on the Artists page, or a field you
-   edit on the Files tab, written on a copy that replaces the song in one rename. Only magpie-fi
-   writes into `library/`.
+   edit on the Files tab, written on a copy that replaces the song in one rename, after the copy
+   was checked to still be the whole song. Only magpie-fi writes into `library/`.
 3. **Sure → file, unsure → ask.** A song is filed automatically only when the evidence is strong
    (audio recognition or several agreeing sources, matching length, matching version). Everything
    else waits for you. A wrong guess never goes silently into the library.
 4. **One pipeline for every input.** A link, a Telegram file and a dropped file all end up as a
    file in the inbox or in `.magpie-fi/staging/` and go through the same identification and filing.
 5. **One copy per recording.** Duplicates are found by proof (same bytes, same fingerprint, same
-   ISRC or MusicBrainz ID with matching length), never by title alone. A lossless copy replaces a
-   lossy one; anything else that is already there goes to the trash.
+   ISRC or MusicBrainz ID with matching length), never by title alone. When the audio itself is
+   the proof (same bytes, same or similar-sounding fingerprint), a lossless copy replaces a lossy
+   one and anything else that is already there goes to the trash. An ISRC or MusicBrainz ID
+   comes from the chosen match, which can be wrong, so on that alone nothing is trashed or
+   replaced: the song waits in Review as a possible duplicate.
 6. **No Navidrome API.** magpie-fi only writes files (songs with tags, cover and lyrics inside,
    and `.m3u8` playlists).
    Navidrome's file watcher picks them up. No Navidrome credentials, no coupling to its versions.
@@ -139,7 +142,7 @@ were kept on purpose (§8).
 
 | Loop | When | What |
 |---|---|---|
-| Inbox cycle | every `MAGPIE_INBOX_CHECK_SECONDS` (60), or on "Check inbox now" | identify new files, then file everything Ready |
+| Inbox cycle | every `MAGPIE_INBOX_CHECK_SECONDS` (60), or on "Check inbox now" | identify new files (200 per cycle; the next cycle follows at once while more wait), then file everything Ready |
 | Library index | at start, then every 6 hours | index files added by hand, forget deleted ones |
 | Download worker | continuously | works through `wanted`, `MAGPIE_MAX_PARALLEL_DOWNLOADS` at a time |
 | Telegram bot | continuously (long polling) | commands, links, files, buttons; status messages every 3 s |
@@ -167,8 +170,11 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     file), with "Accept N confident matches" and "Check and repair" as the first rows. One song
     opens as its own screen that asks one question: which release (a radio list with only the
     differences as chips, details on demand), pick a cover, file anyway, repair, or remove. The
-    manual tag editor is a mode of that screen. The screen's action is Telegram's native Main
-    Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
+    last choice in the release list is "keep the file's own tags", for a file that is more
+    correct than every match. Its own picture counts as the cover only here, and only when it is
+    square and at least 500 px; otherwise the song still needs a verified cover. The manual tag
+    editor is a mode of that screen. The screen's action is Telegram's native Main Button
+    (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
   - **Artists**: song and artist counts, and the artists (rename, join, split a duet, make an
     album that Navidrome shows twice one album, from a bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
     log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar
@@ -250,15 +256,17 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   ID in the filename); Apple Music, Deezer and the Persian catalogs Radio Javan, Audiomack and
   Navahang; Genius; SongRec (Shazam) for audio recognition when nothing else matched or the text
   sources could not decide, never on a file longer than 20 minutes (Shazam hears a slice, so
-  on a DJ mix it names one song in it); SoundCloud,
-  Discogs and Last.fm. Sources that need a (free) key are off without it. Cover Art Archive
+  on a DJ mix it names one song in it);
+  Discogs and Last.fm. SoundCloud only reads a pasted SoundCloud link (its public link page);
+  there is no SoundCloud search, because its app keys are no longer given out. Sources that need a (free) key are off without it. Cover Art Archive
   supplies covers, Wikidata artist genres, LRCLIB lyrics.
 - **Smart approval.** Every candidate gets a weighted score (title, artist, length, album,
   completeness, agreement between sources, audio recognition, version tags). Automatic only when
   the best one is supported (recognised by audio, the file's own ISRC with the same length,
   confirmed by two sources, or an exact catalog match), scores ≥ 68, has no different recording
   within 12 points, has the same version tags (live, remix, session, …) and is at most 15 s off
-  the audio's length. Other releases of the same recording (the single and the album, a store
+  the audio's length. A match from a source that gives no length is not chosen when the sources
+  that do give one are all more than 15 s off, or when no source gives one at all. Other releases of the same recording (the single and the album, a store
   that lists fewer singers with the same length, a Persian title in another Latin spelling
   with the same length) are not rivals. Review says in plain words what is unsure.
 - **Completion.** Missing fields are filled only from agreeing recordings and compatible releases;
@@ -272,7 +280,9 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   singer that the chosen match credits in another position, that singer goes first and the
   others become featured. When the match leaves the main singer out but every name it gives is
   in the file ("Sohrab MJ & Orchid" for "Amir Tataloo feat. Sohrab MJ & Orchid"), the main
-  singer is put back first. A single's album artist follows. Such a match is also not an exact
+  singer is put back first. Co-singers the match left out come back the same way ("Alireza JJ
+  feat. Hoomaan" for "Alireza JJ, Sijal & Sepehr Khalse feat. Hoomaan"). A single's album
+  artist follows. Such a match is also not an exact
   artist match: it is filed on its own only with the audio or a second source agreeing. Review
   shows "Lists X first" or "Leaves out X" on such a match.
 - **DJ mixes are podcast episodes.** Radio Javan lists DJ mixes as podcasts. A podcast
@@ -350,13 +360,16 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 - Folder artist = **the first album artist's identity**, never the track artist and never a
   combined `A & B` name. Every spelling of an artist (`گوگوش`, `Googoosh`, `GOOGOOSH`) has one
   identity, so one folder (§5.4).
-- Songs of one new album filed together get one year, so the album never splits.
+- Songs of one new album filed together agree on the album first, so it never splits: the
+  spelling most of them use wins ("Khalij" on Apple Music and Spotify against a "Khaleej"
+  single on Radio Javan), an album before a single of the same name, and the others take its
+  name, album artist, year and release details. Editions stay apart.
 - **An album already in the library decides its details.** Navidrome tells albums apart by
   name, album artist (or its MusicBrainz ID), MusicBrainz album ID and release date, so songs
   of one album that disagree on any of them show up as two albums. A new song whose album the
   album artist already has (the same album in any spelling: "Khalij" = "Khaleej", a store's
-  " - Single" ending, any year) joins that folder and takes the album's details from a song
-  already there: name, album artist, release date, year, MusicBrainz album and release-group
+  " - Single" ending or a label's " - Persian Music", any year) joins that folder and takes
+  the album's details from a song already there: name, album artist, release date, year, MusicBrainz album and release-group
   IDs, release type, compilation flag and label. A single named like an album the artist has
   (the title song) joins the album, without the single's track number. Editions stay apart
   ("Khalij (Remastered)").
@@ -446,6 +459,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 
 - Source answers and downloaded covers (`provider_cache`) keep a lifetime per source, from 7 to
   90 days. Expired rows are removed at start and once a day. Failed lookups are not cached.
+  Downloaded covers are capped at 200 MiB together; the ones kept the shortest time go first.
 - File analysis (fingerprint, integrity, content hash) is keyed by path, size and mtime, and
   capped at 100 MiB together; the oldest rows go first.
 
@@ -491,7 +505,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 | 15 | Web page in the binary? | **No, served from disk** next to it (`MAGPIE_WEB_DIR`); same single origin. |
 | 16 | ReplayGain | **Only rsgain, per album folder after each batch.** The per-file ffmpeg pass was removed: rsgain already measures track and album gain. |
 | 17 | Fewer sources | **Two were removed** (Nov 2026): an extra metadata catalog and the Wikidata song search. Wikidata stays for artist genres. |
-| 18 | Paid sources | **None.** AudD and the Spotify Web API (owner needs Premium since 2026) were removed; Spotify links are read from the public page. Free-key sources (AcoustID, Last.fm, Discogs, YouTube, SoundCloud) stay, off unless a key is set. |
+| 18 | Paid sources | **None.** AudD and the Spotify Web API (owner needs Premium since 2026) were removed; Spotify links are read from the public page. Free-key sources (AcoustID, Last.fm, Discogs, YouTube) stay, off unless a key is set. SoundCloud search was removed (app keys are no longer handed out); SoundCloud links still work without a key. |
 | 19 | A song fails while filing | **It goes to Issues** instead of being retried every cycle; the others continue. |
 | 20 | Persian music | Tags and folders in the original script, NFC-normalised. |
 | 21 | Dependency updates | **Dependabot**, monthly. yt-dlp updates itself daily. |

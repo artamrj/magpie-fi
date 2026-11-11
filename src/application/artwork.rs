@@ -195,15 +195,29 @@ pub async fn ensure_usable_cover(pool: &SqlitePool, client: &Client, candidate: 
         Ok(found) => sources.extend(found),
         Err(error) => check.retryable |= is_retryable_artwork_error(&error),
     }
+    // A song filed as its own single has no album to compare: the cover of the
+    // release this same recording is on is its cover (what every store shows).
+    let own_title = is_own_title_release(candidate);
+    let same_album =
+        |source: &Candidate| albums_compatible(candidate.album.as_deref(), source.album.as_deref());
     for result in [itunes, deezer] {
         match result {
-            Ok(found) => sources.extend(found.into_iter().filter(|source| {
+            Ok(found) => sources.extend(found.into_iter().map(without_length).filter(|source| {
                 same_recording(candidate, source)
-                    && albums_compatible(candidate.album.as_deref(), source.album.as_deref())
+                    && (same_album(source) || (own_title && !source.is_compilation))
             })),
             Err(error) => check.retryable |= is_retryable_artwork_error(&error),
         }
     }
+    // The same release first, then a single of this song ("What Was I Made For? (From
+    // …) - Single"), then the album the song is on.
+    let song = crate::domain::names::match_key(&candidate.title);
+    let named_after_song = |source: &Candidate| {
+        source.album.as_deref().is_some_and(|album| {
+            !song.is_empty() && crate::domain::names::match_key(album).starts_with(&song)
+        })
+    };
+    sources.sort_by_key(|source| (!same_album(source), !named_after_song(source)));
     for source in sources {
         if let Some(url) = source.cover_url {
             push_new(
@@ -211,6 +225,7 @@ pub async fn ensure_usable_cover(pool: &SqlitePool, client: &Client, candidate: 
                 ArtworkCandidate {
                     provider: source.provider,
                     url,
+                    same_recording: true,
                     release_id: source.release_id,
                     isrc: source.isrc,
                     album: source.album,
@@ -309,6 +324,25 @@ async fn album_artwork(
         }
     }
     (out, retryable)
+}
+
+/// A row fresh from a store search carries the song's whole length where a scanned match
+/// carries its difference from the file. The file's length is not known here, so the row
+/// is compared without one; read as a difference, every row looked minutes off and no
+/// cover was ever found this way.
+fn without_length(mut row: Candidate) -> Candidate {
+    row.duration_delta = None;
+    row
+}
+
+/// The song is filed as its own single: its album is only its own title, because no
+/// source named an album or the match is a single. A named album or a version in the
+/// album name ("… (Live at …)") is a release of its own and keeps the strict check.
+fn is_own_title_release(candidate: &Candidate) -> bool {
+    let title = crate::domain::credits::release_title_without_featured(&candidate.title);
+    candidate.album.as_deref().is_some_and(|album| {
+        crate::domain::names::album_key(album) == crate::domain::names::album_key(&title)
+    })
 }
 
 fn is_various_artists(artist: &str) -> bool {
@@ -490,6 +524,9 @@ fn artwork_matches_candidate(candidate: &Candidate, artwork: &ArtworkCandidate) 
             .chain(candidate.album_artist.as_deref())
             .any(|name| text_similarity(artist, name) >= 0.82)
     });
+    if artwork.same_recording && is_own_title_release(candidate) {
+        return same_artist;
+    }
     // Entries are only created for rows that already agreed on the recording
     // (same title), so a row without an album name only needs the artist.
     same_artist
@@ -530,7 +567,118 @@ mod tests {
         }
     }
 
+    /// Well-known songs whose cover every store shows. Run with
+    /// `cargo test --locked covers_of_well_known_songs -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live cover probe"]
+    async fn covers_of_well_known_songs_are_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("covers.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let client = Client::new();
+        for (title, artist, album, kind) in [
+            (
+                "Nemesis",
+                "Benjamin Clementine",
+                Some("At Least for Now"),
+                Some("album"),
+            ),
+            (
+                "Nemesis",
+                "Benjamin Clementine",
+                Some("Nemesis"),
+                Some("single"),
+            ),
+            ("Nemesis", "Benjamin Clementine", Some("Nemesis"), None),
+            (
+                "What Was I Made For?",
+                "Billie Eilish",
+                Some("What Was I Made For?"),
+                Some("single"),
+            ),
+            (
+                "What Was I Made For?",
+                "Billie Eilish",
+                Some("What Was I Made For? (live from Lollapalooza Chicago 2023)"),
+                None,
+            ),
+        ] {
+            let mut song = Candidate {
+                provider: "musicbrainz".into(),
+                title: title.into(),
+                artist: artist.into(),
+                album: album.map(str::to_owned),
+                release_type: kind.map(str::to_owned),
+                duration_delta: Some(1.0),
+                ..Default::default()
+            };
+            ensure_usable_cover(&pool, &client, &mut song).await;
+            // A live release no store carries has no cover to find; the others do.
+            let in_stores = !album.is_some_and(|album| album.contains("Lollapalooza"));
+            assert_eq!(
+                song.artwork_status == ArtworkStatus::Verified,
+                in_stores,
+                "{title} / {album:?}: {:?}",
+                song.artwork_message
+            );
+            println!(
+                "{title} / {album:?} / {kind:?}\n  status={:?} cover={:?}\n  message={:?}\n  options={:?}",
+                song.artwork_status,
+                song.cover_url,
+                song.artwork_message,
+                song.artwork_candidates
+                    .iter()
+                    .map(|item| (
+                        item.provider.clone(),
+                        item.album.clone(),
+                        item.artist.clone()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     const RELEASE: &str = "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d";
+
+    #[test]
+    fn a_song_filed_as_its_own_single_takes_the_cover_of_the_album_it_is_on() {
+        // "Nemesis" is only sold on the album "At Least for Now".
+        let mut song = candidate("musicbrainz", Some("Nemesis"));
+        song.title = "Nemesis".into();
+        song.artist = "Benjamin Clementine".into();
+        let store_row = |same_recording| ArtworkCandidate {
+            provider: "itunes".into(),
+            url: "https://example.test/at-least-for-now.jpg".into(),
+            same_recording,
+            album: Some("At Least for Now".into()),
+            artist: Some("Benjamin Clementine".into()),
+            ..Default::default()
+        };
+        assert!(artwork_matches_candidate(&song, &store_row(true)));
+        // An album found by name only, not through this recording, still has to match.
+        assert!(!artwork_matches_candidate(&song, &store_row(false)));
+        // Another artist's "Nemesis" never counts.
+        let mut other = store_row(true);
+        other.artist = Some("Arch Enemy".into());
+        assert!(!artwork_matches_candidate(&song, &other));
+        // A named release keeps the strict check: a live single does not get the studio cover.
+        song.album = Some("Nemesis (Live For Burberry)".into());
+        assert!(!artwork_matches_candidate(&song, &store_row(true)));
+    }
+
+    #[test]
+    fn a_fresh_store_row_is_compared_without_its_length() {
+        use crate::application::metadata_completion::same_recording;
+        // The scanned match is 1 s off the file; the store row says the song lasts 300 s.
+        let mut song = candidate("musicbrainz", Some("Farangis"));
+        song.duration_delta = Some(1.0);
+        let mut row = candidate("itunes", Some("Farangis"));
+        row.duration_delta = Some(300.0);
+        assert!(!same_recording(&song, &row));
+        assert!(same_recording(&song, &without_length(row)));
+    }
 
     #[test]
     fn confirmed_single_accepts_its_isrc_matched_catalog_cover_title() {
