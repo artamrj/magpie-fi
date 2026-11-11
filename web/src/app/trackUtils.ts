@@ -290,8 +290,8 @@ export function candidateChips(track: Track, candidate: Candidate, rank: number)
     const fileMain = mainName(track.current_artist);
     const matchNames = creditNames(candidate.artist);
     const matchMain = matchNames[0] ?? "";
-    if (fileMain && matchMain && normalizeText(fileMain) !== normalizeText(matchMain)) {
-      const credited = matchNames.some((name) => normalizeText(name) === normalizeText(fileMain));
+    if (fileMain && matchMain && !samePerson(fileMain, matchMain)) {
+      const credited = matchNames.some((name) => samePerson(name, fileMain));
       chips.push({
         text: credited ? `Lists ${matchMain} first` : `Leaves out ${fileMain}`,
         tone: "warn",
@@ -314,6 +314,26 @@ function creditNames(value?: string) {
     .split(/\s*(?:,|،|\s&\s|\sx\s|\sand\s|\sو\s|feat\.?\s|ft\.?\s|featuring\s|\/|;)\s*/i)
     .map((name) => name.trim())
     .filter(Boolean);
+}
+
+/**
+ * The same person: the same name, or one is the other's stage name or surname alone
+ * ("Tataloo" = "Amir Tataloo", "MJ" = "Sohrab MJ"). Matches `credits::same_person`.
+ */
+function samePerson(left: string, right: string) {
+  const words = (value: string) =>
+    value
+      .toLocaleLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(Boolean);
+  const [a, b] = [words(left), words(right)];
+  if (a.join(" ") === b.join(" ")) return true;
+  const [short, full] = a.length < b.length ? [a, b] : [b, a];
+  return (
+    short.join("").length >= 2 &&
+    short.length > 0 &&
+    full.slice(full.length - short.length).join(" ") === short.join(" ")
+  );
 }
 
 /** The first name in a credit. */

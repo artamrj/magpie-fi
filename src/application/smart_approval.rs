@@ -840,6 +840,60 @@ mod tests {
     }
 
     #[test]
+    fn shazam_spelling_the_singers_its_own_way_is_the_same_recording() {
+        // Shazam lists a featured singer first and spells the names shorter; Apple Music
+        // agrees with the file. Both are the same recording with the same singers.
+        let evidence = || TrackEvidence {
+            filename: "male-man-bash.mp3",
+            title: Some("Male Man Bash"),
+            artist: Some("Amir Tataloo feat. Sohrab MJ & Orchid"),
+            album: None,
+            isrc: None,
+        };
+        let file = crate::application::FileTags {
+            artist: Some("Amir Tataloo feat. Sohrab MJ & Orchid"),
+            title: Some("Male Man Bash"),
+        };
+        let mut shazam = performed(
+            1,
+            "songrec",
+            "Male Man Bash",
+            "MJ feat. Tataloo & Orchid",
+            "Male Man Bash",
+            1.0,
+        );
+        shazam.score = 96.0;
+        shazam.score_breakdown = Some(
+            serde_json::json!({"audio_recognition": true, "sources": ["SongRec / Shazam"]})
+                .to_string(),
+        );
+        let apple = performed(
+            2,
+            "itunes",
+            "Male Man Bash",
+            "Amir Tataloo feat. Sohrab MJ & Orchid",
+            "Male Man Bash (feat. Orchid & Sohrab MJ) - EP",
+            1.0,
+        );
+        let mut candidates = vec![shazam, apple];
+        for candidate in &mut candidates {
+            crate::application::align_with_file_credit(candidate, file);
+        }
+        assert_eq!(
+            candidates[0].artist,
+            "Amir Tataloo feat. Sohrab MJ & Orchid"
+        );
+        let reason = unsure_reason(evidence(), &candidates);
+        assert!(!reason.starts_with("Two different recordings"), "{reason}");
+        let decision = select(evidence(), &candidates).expect("audio and a catalog agree");
+        let chosen = candidates
+            .iter()
+            .find(|candidate| candidate.id == Some(decision.candidate_id))
+            .unwrap();
+        assert!(chosen.artist.starts_with("Amir Tataloo"));
+    }
+
+    #[test]
     fn agreeing_catalogs_cannot_outvote_the_audio_length() {
         // A two-minute file tagged as a famous song: every catalog finds that
         // song by its tags, but the song is 80 seconds longer than the file.

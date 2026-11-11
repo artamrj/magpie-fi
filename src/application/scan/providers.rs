@@ -87,6 +87,17 @@ pub(crate) async fn identify(
     }
     out.extend(query_discogs(state, limits, catalog_info, filename).await);
     out.extend(query_lastfm(state, limits, catalog_info, filename).await);
+    // Scores above were measured against the source's own credit. From here on (Review,
+    // source agreement, approval) a match naming the file's singers is told the file's way.
+    for candidate in &mut out {
+        crate::application::align_with_file_credit(
+            candidate,
+            crate::application::FileTags {
+                artist: current.artist.as_deref(),
+                title: current.title.as_deref(),
+            },
+        );
+    }
     crate::application::canonical_names::canonicalize_candidates(
         &state.pool,
         None,

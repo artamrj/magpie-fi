@@ -40,7 +40,22 @@ pub struct FileTags<'a> {
 /// singer is put back first. The album artist follows (a single's album artist is its main
 /// singer; a compilation is left alone).
 pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
-    let Some(file_artist) = file.artist else {
+    follow_file_credit(candidate, file, true);
+}
+
+/// The part of [`keep_file_main_singer`] that is safe before the owner or the approval
+/// rules look at a match: a match naming exactly the file's singers, in another order or
+/// spelled shorter ("MJ feat. Tataloo & Orchid" for "Amir Tataloo feat. Sohrab MJ &
+/// Orchid"), is told the file's way. Review then shows what would really be written, and
+/// two sources naming the same singers count as the same recording. A main singer the
+/// match left out is not added here: that match must still prove itself (see
+/// `versions::credited_artist_similarity`).
+pub fn align_with_file_credit(candidate: &mut Candidate, file: FileTags<'_>) {
+    follow_file_credit(candidate, file, false);
+}
+
+fn follow_file_credit(candidate: &mut Candidate, file: FileTags<'_>, restore_missing: bool) {
+    let Some(file_artist) = file.artist.filter(|artist| !artist.trim().is_empty()) else {
         return;
     };
     let file_title = file.title.unwrap_or_default();
@@ -52,9 +67,15 @@ pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
     } else {
         std::mem::take(&mut candidate.artist_credits)
     };
-    let (artists, moved) = match credits::keep_main_first(artists, &main) {
+    let (artists, moved) = match credits::align_with_file(artists, file_artist, file_title) {
         (artists, true) => (artists, true),
-        (artists, false) => credits::restore_missing_main(artists, &main, file_artist, file_title),
+        (artists, false) if !restore_missing => (artists, false),
+        (artists, false) => match credits::keep_main_first(artists, &main) {
+            (artists, true) => (artists, true),
+            (artists, false) => {
+                credits::restore_missing_main(artists, &main, file_artist, file_title)
+            }
+        },
     };
     candidate.artist_credits = artists;
     if !moved {
@@ -72,7 +93,7 @@ pub fn keep_file_main_singer(candidate: &mut Candidate, file: FileTags<'_>) {
                 .artist_credits
                 .iter()
                 .flat_map(|credit| credits::loose_names(&credit.name))
-                .any(|singer| credits::identity_key(&singer) == credits::identity_key(&name))
+                .any(|singer| credits::same_person(&singer, &name))
         });
     if album_artist_is_a_singer {
         candidate.album_artist = Some(primary.name.clone());

@@ -357,7 +357,16 @@ source gave a length at all). The Review screen shows this text. A release witho
   in the title don't trigger this. When such a match is used, the main singer is put back
   first (`credits::restore_missing_main`).
 - Two remix (live, acoustic…) titles match when the song and the remixer agree.
-- Artist lists are compared as sets of people: "A, B & C" = "A, C & B".
+- Artist lists are compared as sets of people: "A, B & C" = "A, C & B". A name that is the end
+  of another one is the same person ("Tataloo" = "Amir Tataloo", "MJ" = "Sohrab MJ";
+  `credits::same_person`), a first name alone is not.
+- After every source answered and before artist names are resolved, a match that names exactly
+  the file's singers takes the file's order and the fuller spellings
+  (`application::align_with_file_credit`, `credits::align_with_file`). The per-source scores
+  were measured before this; adding a main singer the match left out still waits until a match
+  is used.
+- Deezer lists "Featured" contributors after "feat."; a source that gives a plain artist and
+  "(feat. …)" in the title keeps its main artist first (`credits::normalize_structured`).
 - **Upload sites** (Audiomack, SoundCloud, YouTube) show what the uploader typed, often the same
   wrong tags as the file, so they are not an exact catalog match by themselves.
 
