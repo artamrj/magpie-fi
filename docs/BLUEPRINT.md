@@ -161,7 +161,8 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     pick, failed with the reason and a Retry); older entries behind "Show earlier". A song that
     needs a pick opens in Review; an album or playlist opens its songs. Sending the same link
     again retries the existing entry instead of adding a second one; a song removed in Review
-    leaves the list.
+    leaves the list, and sending its link again fetches it again (a removed song inside an
+    album or playlist that still has other songs stays removed).
   - **Review**: songs grouped by what has to happen to them (needs your pick, issues, ready to
     file), with "Accept N confident matches" and "Check and repair" as the first rows. One song
     opens as its own screen that asks one question: which release (a radio list with only the
