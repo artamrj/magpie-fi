@@ -1,6 +1,6 @@
 # magpie-fi — Telegram bot redesign (Bot API 10.4)
 
-> Status: **agreed, being built step by step** (Nov 2026). Steps A and B are built. Written against
+> Status: **agreed, being built step by step** (Nov 2026). Steps A, B and C are built. Written against
 > Bot API 10.4 (9 Nov 2026).
 > Once a phase is built, [BLUEPRINT.md](BLUEPRINT.md) and
 > [TECHNICAL-OVERVIEW.md](TECHNICAL-OVERVIEW.md) are updated in the same commit.
@@ -63,8 +63,8 @@ Sent as a reply when a link or file arrives. `chat_data` is updated by the exist
 - Header: album or playlist name, artist, source badge (Spotify, YouTube, file…).
 - Background: a soft gradient from the **cover's colours**. Once the song has a verified cover,
   the bot reads 3 colours from it (the `image` crate is already a dependency) and puts them into
-  `chat_data`. For a single song, a tiny blurred 16×16 thumbnail (about 500 bytes as a `data:`
-  URL) also fits. Only from a verified cover, the same rule as the web page (rule 3).
+  `chat_data`. Only from a filed song's cover, which passed the cover gate (rule 3). (Built
+  without the thumbnail idea: colours alone keep the state small.)
 - A progress ring and one chip per song: waiting · downloading · identifying · in library ·
   needs you · failed. Chips animate when they change. Long playlists show counts plus the last
   few songs, so the 1024 bytes are enough.
@@ -122,7 +122,7 @@ The API is two days old. Some clients may not show widgets, and `sendWidget` may
   chat, and tries widgets again after a day.
 - Every widget has a plain **caption** ("Album · 7 of 12 in your library") so the message still
   says something in notifications and in clients that can't draw it.
-- A switch `MAGPIE_TELEGRAM_WIDGETS=on|off` (default `on`) as an off switch for the owner.
+- A switch `MAGPIE_TELEGRAM_CARDS` (default on) as an off switch for the owner.
 
 ---
 
@@ -156,11 +156,12 @@ Unknown fields are ignored, so new API versions never break parsing. This remove
 | `rich.rs` | Small builders for rich messages and coloured button rows |
 | `texts.rs` | **All** bot text, including the ~25 strings now inline in `mod.rs` / `status.rs` |
 
-Widget HTML lives in `web/widgets/{request,review,library}.html`. It's hand-written: plain JS,
-Telegram theme colours from `TelegramWidget.themeParams`, Persian/RTL-safe. Rust embeds it with
-`include_str!`. A small Node script (built-in `zlib`, no new package) runs in `npm run lint` and
-fails if a widget is over 32 KB or 4 KB compressed. A local preview page with a fake
-`TelegramWidget` lets us work on widgets in the browser.
+Widget HTML lives in `src/telegram/widgets/` (inside `src/`, so the Docker build needs no
+change). It's hand-written: plain JS, Telegram theme colours from the `--tg-theme-*` variables,
+Persian/RTL-safe (`dir="auto"`). Rust embeds it with `include_str!`. A small Node script
+(`web/scripts/check-widgets.mjs`, built-in `zlib`, no new package) runs in `npm run lint` and
+fails if a widget is over 32 KB, over 4 KB compressed, or contains a NUL. The card's words live
+in the widget itself, since it can't fetch them; everything else the bot says stays in `texts.rs`.
 
 ### 3.3 Database (`migrations/0013_telegram_widgets.sql`)
 
@@ -207,13 +208,13 @@ Each step ships on its own and keeps the bot working.
 |---|---|---|
 | **A. Base** ✅ built | Own types, `actions.rs`, split `mod.rs` into `intake.rs` and `commands.rs`, all text into `texts.rs`, tests for uploads, buttons and review questions | None |
 | **B. Messages** ✅ built | Rich `/start` `/help` `/guests` and Details, coloured and disabled buttons, ephemeral Details and `/queue` `/health` `/id`, `web_app` button on owners' status messages, plain-text fallbacks. Guests no longer get a web-page button on review questions (they can't open the page) | Clearer, tidier chat |
-| **C. Request card** | `request.html`, `cards.rs`, the loop edits widget state, text fallback, 🎉 at the end | The big one |
+| **C. Request card** ✅ built | `widgets/request.html`, `cards.rs`, the loop edits card state and caption, text fallback for a day after a refusal, `MAGPIE_TELEGRAM_CARDS` off switch, 🎉 at the end | The big one |
 | **D. Review card** | `review.html`, candidate cards with score bars, taps file the song | Choosing in the chat |
 | **E. Library card** | Shared widget, `/library`, pinned | Live library at a glance |
 | **F. Extras** | 📲 Send me the file, optional clip preview, optional topics | — |
 
 Docs: BLUEPRINT §3.3/§3.4 and decision #3, TECHNICAL-OVERVIEW §6/§7 and the settings list
-(`MAGPIE_TELEGRAM_WIDGETS`) are updated with each step. Known drift to fix along the way: the
+(`MAGPIE_TELEGRAM_CARDS`) are updated with each step. Known drift to fix along the way: the
 "📱 Open review" button name, the missing status-message button, "menu button set when an owner
 writes", and TECHNICAL-OVERVIEW still saying the bot always shows three candidates.
 
@@ -222,6 +223,6 @@ writes", and TECHNICAL-OVERVIEW still saying the bot always shows three candidat
 ## 5. Open questions
 
 1. ~~Drop `frankenstein` for our own types?~~ Done in step A.
-2. Add the `MAGPIE_TELEGRAM_WIDGETS` off switch, or rely only on the automatic fallback?
+2. ~~Off switch or only the automatic fallback?~~ Both, built in step C (`MAGPIE_TELEGRAM_CARDS`).
 3. Should guests get the request card and the library card, or only owners?
 4. Private-chat topics ("Requests" / "Review"): worth it, or keep one chat?

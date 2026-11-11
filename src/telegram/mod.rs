@@ -4,12 +4,14 @@
 //!
 //! - `api.rs`: the Bot API client; `types.rs`: the Bot API types we read.
 //! - `intake.rs`: links and audio files; `commands.rs`: `/…` commands and guests.
-//! - `actions.rs`: every button, its permission check and what it does.
+//! - `actions.rs`: every button and card tap, its permission check and what it does.
+//! - `cards.rs`: requests as live cards (Bot API 10.4 widgets) and their state.
 //! - `status.rs`: the loop that updates status messages and asks about Review.
 //! - `texts.rs`: everything the bot says.
 
 mod actions;
 pub mod api;
+mod cards;
 mod commands;
 mod intake;
 mod status;
@@ -35,6 +37,9 @@ pub struct Context {
     /// (chat, user) → the upload request still open for more files. Only
     /// uploads of the last few seconds are kept.
     uploads: Mutex<HashMap<(i64, i64), (i64, Instant)>>,
+    /// Request → its card's cover colours (`None`: its cover had none), so a
+    /// song's cover is read once, not every few seconds.
+    colours: Mutex<HashMap<i64, Option<cards::Colours>>>,
 }
 
 /// Runs the bot until magpie-fi stops. Does nothing without a bot token.
@@ -90,6 +95,7 @@ async fn serve(state: Arc<AppState>, config: TelegramConfig, bot: Bot) {
         config,
         username,
         uploads: Mutex::new(HashMap::new()),
+        colours: Mutex::new(HashMap::new()),
     });
     tokio::spawn(status::run(context.clone()));
     poll(context).await;
@@ -105,7 +111,8 @@ async fn poll(context: Arc<Context>) {
             .bot
             .call(
                 "getUpdates",
-                &json!({"offset": offset, "timeout": 50, "allowed_updates": ["message", "callback_query"]}),
+                &json!({"offset": offset, "timeout": 50,
+                        "allowed_updates": ["message", "callback_query", "widget_query"]}),
             )
             .await
         {
@@ -123,6 +130,8 @@ async fn poll(context: Arc<Context>) {
                 on_message(&context, message).await
             } else if let Some(query) = &update.callback_query {
                 actions::on_button(&context, query).await
+            } else if let Some(query) = &update.widget_query {
+                actions::on_card_tap(&context, query).await
             } else {
                 Ok(())
             };
@@ -249,6 +258,11 @@ pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────────
+
+/// A card state's revision: the card ignores states older than the one it shows.
+fn revision() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 
 /// Who sees a message.
 #[derive(Clone, Debug)]
@@ -523,6 +537,8 @@ mod tests {
         refuse_rich: std::sync::atomic::AtomicBool,
         /// Refuse ephemeral messages (they can be refused or lost).
         refuse_ephemeral: std::sync::atomic::AtomicBool,
+        /// Refuse widgets, as a Telegram without them would.
+        refuse_cards: std::sync::atomic::AtomicBool,
     }
 
     impl FakeTelegram {
@@ -554,7 +570,9 @@ mod tests {
             || (params.get("ephemeral_message_parameters").is_some()
                 && fake
                     .refuse_ephemeral
-                    .load(std::sync::atomic::Ordering::SeqCst));
+                    .load(std::sync::atomic::Ordering::SeqCst))
+            || (method == "sendWidget"
+                && fake.refuse_cards.load(std::sync::atomic::Ordering::SeqCst));
         if refused {
             return Json(
                 json!({"ok": false, "error_code": 400, "description": "Bad Request: not here"}),
@@ -574,7 +592,7 @@ mod tests {
             "getFile" => {
                 json!({"file_id": params["file_id"], "file_unique_id": "u", "file_path": "music/a.mp3"})
             }
-            "sendMessage" | "sendRichMessage" | "editMessageText" => {
+            "sendMessage" | "sendRichMessage" | "sendWidget" | "editMessageText" => {
                 let mut next = fake.next_message.lock().unwrap();
                 *next += 1;
                 json!({"message_id": 1000 + *next, "date": 0, "chat": {"id": params["chat_id"], "type": "private"}, "text": params["text"]})
@@ -628,6 +646,18 @@ mod tests {
     async fn start_with(
         public_url: Option<&str>,
     ) -> (tempfile::TempDir, Arc<FakeTelegram>, Arc<AppState>) {
+        start_full(public_url, false).await
+    }
+
+    /// A bot that shows requests as cards (widgets).
+    async fn start_cards() -> (tempfile::TempDir, Arc<FakeTelegram>, Arc<AppState>) {
+        start_full(Some("https://music.example"), true).await
+    }
+
+    async fn start_full(
+        public_url: Option<&str>,
+        cards: bool,
+    ) -> (tempfile::TempDir, Arc<FakeTelegram>, Arc<AppState>) {
         let fake = Arc::new(FakeTelegram::default());
         let app = Router::new()
             .route("/{bot}/{method}", post(fake_api))
@@ -645,6 +675,7 @@ mod tests {
         let telegram = TelegramConfig {
             token: "1:test".into(),
             owners: vec![OWNER as i64],
+            cards,
         };
         config.telegram = Some(telegram.clone());
         config.public_url = public_url.map(str::to_owned);
@@ -1161,5 +1192,193 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert!(calls[2].get("ephemeral_message_parameters").is_none());
         assert_eq!(calls[2]["chat_id"], json!(OWNER));
+    }
+
+    fn card_tap(update: u32, user: u64, data: &str) -> Value {
+        json!({"update_id": update, "widget_query": {
+            "id": format!("w{update}"), "chat_instance": "c", "type": {"type": "data"},
+            "from": {"id": user, "is_bot": false, "first_name": format!("User{user}")},
+            "data": data
+        }})
+    }
+
+    /// The card state in an `editMessageWidgetData` or `sendWidget` call.
+    fn card_state(params: &Value) -> Value {
+        serde_json::from_str(params["chat_data"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn owners_see_requests_as_live_cards() {
+        let (_directory, fake, _state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        fake.push(audio(1, OWNER, "One More Time", 5_000_000));
+
+        let card = wait_for(&fake, "sendWidget", "html").await;
+        assert!(
+            card["html"]
+                .as_str()
+                .unwrap()
+                .contains("magpie-fi request card")
+        );
+        assert_eq!(card["allow_queries"], true);
+        assert_eq!(card["caption"], texts::READING_LINK);
+        assert_eq!(card["reply_parameters"]["message_id"], 1);
+        assert_eq!(
+            card["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://music.example/"
+        );
+        let first = card_state(&card);
+        assert_eq!(
+            (first["s"].as_str(), first["k"].as_str()),
+            (Some("reading"), Some("upload"))
+        );
+
+        // The status loop redraws the card quietly and keeps the caption current.
+        let update = wait_for(&fake, "editMessageWidgetData", "One More Time").await;
+        let state = card_state(&update);
+        assert_eq!(state["s"], "busy");
+        assert!(state["v"].as_i64().unwrap() > first["v"].as_i64().unwrap());
+        let caption = wait_for(&fake, "editMessageCaption", "On the way").await;
+        assert!(
+            caption["caption"]
+                .as_str()
+                .unwrap()
+                .contains("Daft Punk – One More Time")
+        );
+        assert!(caption["reply_markup"].to_string().contains("web_app"));
+        // No text status message was sent.
+        assert!(
+            !fake
+                .calls("sendMessage")
+                .iter()
+                .any(|params| params.to_string().contains(texts::READING_LINK))
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_cards_fall_back_to_text() {
+        let (_directory, fake, state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        fake.refuse_cards
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.push(audio(1, OWNER, "One More Time", 5_000_000));
+
+        wait_for(&fake, "sendMessage", texts::READING_LINK).await;
+        // Tried with the app button, then without, then text.
+        let tries = fake.calls("sendWidget");
+        assert_eq!(tries.len(), 2);
+        assert!(tries[0].get("reply_markup").is_some() && tries[1].get("reply_markup").is_none());
+        // Text for this chat for a while.
+        assert!(
+            !store::cards_allowed(&state.pool, OWNER as i64)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store::cards_allowed(&state.pool, FRIEND as i64)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn card_taps_follow_the_same_rules_as_buttons() {
+        let (_directory, fake, state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        sqlx::query(
+            "INSERT INTO telegram_guests(user_id,name,invited_by,created_at) VALUES(?,?,?,?)",
+        )
+        .bind(FRIEND as i64)
+        .bind("Friend")
+        .bind(OWNER as i64)
+        .bind("now")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let owners = playlist(&state, "100").await;
+
+        fake.push(card_tap(1, FRIEND, &format!("stop:{owners}")));
+        let refused = wait_for(&fake, "answerWidgetQuery", "w1").await;
+        assert!(
+            refused["data"]
+                .as_str()
+                .unwrap()
+                .contains(texts::NOT_ALLOWED)
+        );
+
+        fake.push(card_tap(2, OWNER, &format!("stop:{owners}")));
+        let stopped = wait_for(&fake, "answerWidgetQuery", "w2").await;
+        assert!(
+            stopped["data"]
+                .as_str()
+                .unwrap()
+                .contains("Stopped 2 songs")
+        );
+
+        fake.push(card_tap(3, OWNER, &format!("details:{owners}")));
+        let details = wait_for(&fake, "answerWidgetQuery", "w3").await;
+        let answer: Value = serde_json::from_str(details["data"].as_str().unwrap()).unwrap();
+        assert_eq!(answer["d"][0][1], "Failed: Stopped");
+
+        // Junk is answered too, so the card doesn't wait.
+        fake.push(card_tap(4, OWNER, "launch:everything"));
+        wait_for(&fake, "answerWidgetQuery", "w4").await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_playlist_card_celebrates_once() {
+        let (directory, fake, state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        let pool = &state.pool;
+        let url = "https://x/playlist/party";
+        let request =
+            store::create_request(pool, url, links::Scope::Playlist, "telegram", Some("100"))
+                .await
+                .unwrap();
+        let collection = links::Collection {
+            title: Some("Party".into()),
+            owner: None,
+            songs: (0..5)
+                .map(|index| links::Wanted {
+                    title: format!("Song {index}"),
+                    ..links::Wanted::default()
+                })
+                .collect(),
+        };
+        store::save_collection(pool, request, url, links::Scope::Playlist, &collection)
+            .await
+            .unwrap();
+        store::attach_telegram(pool, request, OWNER as i64, 5, 900)
+            .await
+            .unwrap();
+        store::set_card(pool, request, texts::READING_LINK)
+            .await
+            .unwrap();
+        let file = directory.path().join("a.m4a");
+        tokio::fs::write(&file, b"a").await.unwrap();
+        while let Some(song) = store::claim_next(pool).await.unwrap() {
+            store::mark_in_library(pool, song.id, file.to_str().unwrap())
+                .await
+                .unwrap();
+        }
+
+        let done = wait_for(&fake, "editMessageWidgetData", r#"\"s\":\"done\""#).await;
+        assert_eq!(card_state(&done)["n"][0], 5);
+        let party = wait_for(&fake, "sendMessage", "🎉").await;
+        assert!(
+            party["text"]
+                .as_str()
+                .unwrap()
+                .contains("<b>Party</b> is in your library: 5 of 5")
+        );
+        assert!(party["message_effect_id"].is_string());
+        assert_eq!(party["reply_parameters"]["message_id"], 900);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let parties = fake
+            .calls("sendMessage")
+            .iter()
+            .filter(|params| params.to_string().contains("🎉"))
+            .count();
+        assert_eq!(parties, 1);
     }
 }

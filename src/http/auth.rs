@@ -447,6 +447,7 @@ mod tests {
             config.telegram = Some(TelegramConfig {
                 token: TOKEN.into(),
                 owners: vec![100],
+                cards: false,
             });
         }
         let pool =

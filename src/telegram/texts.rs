@@ -299,6 +299,7 @@ pub fn welcome_guest(name: &str) -> Rich {
 
 pub const READING_LINK: &str = "🔎 Reading the link…";
 pub const NOT_ALLOWED: &str = "Not allowed";
+pub const TAP_FAILED: &str = "That didn't work. Try again.";
 pub const STOP: &str = "⏹ Stop";
 pub const RETRY_FAILED: &str = "🔁 Retry failed";
 pub const DETAILS: &str = "ℹ️ Details";
@@ -321,6 +322,37 @@ pub fn retrying(songs: u64) -> String {
     format!("Trying {songs} songs again")
 }
 
+pub const EVERY_SONG_FINE: &str = "Every song is fine. 🐦";
+
+pub fn and_more(count: usize) -> String {
+    format!("…and {count} more")
+}
+
+/// Details for a card, as plain text: [song, what happened] per song that
+/// failed or needs someone.
+pub fn details_rows(songs: &[WantedView]) -> Vec<[String; 2]> {
+    songs
+        .iter()
+        .filter(|song| matches!(song.status.as_str(), "failed" | "review"))
+        .map(|song| {
+            let name = match &song.artist {
+                Some(artist) => format!("{} · {artist}", song.title),
+                None => song.title.clone(),
+            };
+            let what = if song.status == "review" {
+                "Needs you"
+            } else {
+                "Failed"
+            };
+            let what = match &song.error {
+                Some(error) => format!("{what}: {error}"),
+                None => what.to_owned(),
+            };
+            [name, what]
+        })
+        .collect()
+}
+
 /// The Details button: songs of a request that failed or need someone.
 pub fn details(songs: &[WantedView]) -> Rich {
     const SHOWN: usize = 30;
@@ -329,7 +361,7 @@ pub fn details(songs: &[WantedView]) -> Rich {
         .filter(|song| matches!(song.status.as_str(), "failed" | "review"))
         .collect();
     if problems.is_empty() {
-        return Rich::plain("Every song is fine. 🐦");
+        return Rich::plain(EVERY_SONG_FINE);
     }
     let mut html = String::from(
         "<table bordered striped compact><tr><th>Song</th><th>What happened</th></tr>",
@@ -366,7 +398,7 @@ pub fn details(songs: &[WantedView]) -> Rich {
     }
     html.push_str("</table>");
     if problems.len() > SHOWN {
-        let more = format!("…and {} more", problems.len() - SHOWN);
+        let more = and_more(problems.len() - SHOWN);
         html.push_str(&format!("<footer>{more}</footer>"));
         plain.push_str(&more);
     }
@@ -424,8 +456,10 @@ pub fn is_final(summary: &RequestSummary) -> bool {
         || (summary.status == "ready" && summary.working == 0 && summary.review == 0)
 }
 
-pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
-    let name = match summary.kind.as_str() {
+/// The request's name: the song for one song, "3 files", or the album or
+/// playlist title.
+pub fn request_name(summary: &RequestSummary, view: &StatusView) -> String {
+    match summary.kind.as_str() {
         "track" | "upload" if summary.total <= 1 => {
             view.song.clone().unwrap_or_else(|| "your song".to_owned())
         }
@@ -434,7 +468,33 @@ pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
             .title
             .clone()
             .unwrap_or_else(|| summary.kind.clone()),
-    };
+    }
+}
+
+/// The text status message (with a progress bar).
+pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
+    status_text(summary, view, true)
+}
+
+/// A card's caption: the same words without the bar, because the card shows
+/// the progress itself. It is also what the chat list, notifications and apps
+/// without widgets show.
+pub fn caption(summary: &RequestSummary, view: &StatusView) -> String {
+    status_text(summary, view, false)
+}
+
+/// The note sent once an album or playlist is done: unlike edits, it notifies.
+pub fn celebrate(summary: &RequestSummary, view: &StatusView) -> String {
+    format!(
+        "🎉 <b>{}</b> is in your library: {} of {} songs.",
+        escape(&request_name(summary, view)),
+        summary.done,
+        summary.total
+    )
+}
+
+fn status_text(summary: &RequestSummary, view: &StatusView, with_bar: bool) -> String {
+    let name = request_name(summary, view);
     let kind = match summary.kind.as_str() {
         "album" => " · album",
         "playlist" => " · playlist",
@@ -462,11 +522,13 @@ pub fn status(summary: &RequestSummary, view: &StatusView) -> String {
     };
     let mut text = format!("{icon} {header}\n");
     if summary.total > 1 {
+        if with_bar {
+            text.push_str(&bar(summary.done, summary.total));
+            text.push(' ');
+        }
         text.push_str(&format!(
-            "{} {} of {} in your library\n",
-            bar(summary.done, summary.total),
-            summary.done,
-            summary.total
+            "{} of {} in your library\n",
+            summary.done, summary.total
         ));
     } else if summary.done == 1 {
         text.push_str(if view.newly_filed > 0 {
@@ -563,6 +625,15 @@ mod tests {
         let done = status(&summary("playlist", 4, 4, 0, 0, 0), &view);
         assert!(done.starts_with("✅"));
         assert!(done.ends_with("4 of 4 in your library"));
+        // A card's caption has the same words, without the bar.
+        let caption = caption(&summary("playlist", 4, 1, 2, 0, 1), &view);
+        assert!(caption.contains("\n1 of 4 in your library\n2 on the way · 1 failed"));
+        assert!(!caption.contains('▓'));
+        let party = celebrate(&summary("playlist", 4, 4, 0, 0, 0), &view);
+        assert_eq!(
+            party,
+            "🎉 <b>Road &lt;Trip&gt;</b> is in your library: 4 of 4 songs."
+        );
     }
 
     #[test]

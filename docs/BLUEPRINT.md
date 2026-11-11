@@ -190,8 +190,11 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
   bot's menu button, "📱 Open magpie-fi" on `/start`, or "🎵 Open in the app" on a status message
   (`?view=review` when a song waits there). Only owners get these buttons; guests can't open the page.
-- The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
-  Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
+- The bot: one live **card** per request (a Bot API 10.4 widget): a progress ring, one dot per
+  song, the song being worked on, cover colours, and Stop / Retry failed / Details inside the card.
+  It updates silently; a finished album or playlist of 5+ songs gets one 🎉 message. Where
+  Telegram can't show cards (or with `MAGPIE_TELEGRAM_CARDS=false`) it is a text status message
+  instead, edited as songs arrive, with Stop / Retry failed / Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
   out so the row doesn't jump). Details is an ephemeral answer, seen only by whoever pressed it.
   "Not sure which song this is" questions have one button that opens the Mini App on that song for
   owners; guests, and chats without an HTTPS address, get up to three candidate buttons (green)
@@ -418,7 +421,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 | Songs on their way | `tracks` (deleted once filed), `candidates`, `artwork_overrides`, `automatic_scan_files` |
 | The library | `library_items` (permanent index), `canonical_names` |
 | Getting music | `requests`, `wanted` (the download queue, with retries after 30 s, 2 min, 10 min), `playlists` |
-| Telegram and login | `telegram_guests`, `telegram_invites`, `telegram_state`, `login_links`, `sessions` |
+| Telegram and login | `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats`, `login_links`, `sessions` |
 | Caches | `provider_cache`, `fingerprint_cache`, `integrity_cache`, `content_hash_cache` |
 | Bookkeeping | `maintenance` |
 
