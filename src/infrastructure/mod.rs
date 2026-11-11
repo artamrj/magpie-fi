@@ -1,3 +1,4 @@
+pub mod cover_files;
 pub mod db;
 pub mod file_stamp;
 pub mod fingerprint_cache;

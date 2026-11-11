@@ -62,7 +62,9 @@ These come from `docs/BLUEPRINT.md` §2. Breaking one loses or corrupts someone'
    the match, so it only sends the song to Review as a possible duplicate.
 5. **One of everything.** One tag writer (`infrastructure/media/tag_writer.rs`), one queue (the
    `wanted` table), one HTTP client (`AppState.client`; only Telegram's long polling has its own),
-   one place for settings (`src/config.rs`). Extend these; don't add a second one.
+   one place for settings (`src/config.rs`). Extend these; don't add a second one. The database
+   holds small things only: images and other large data are files (`infrastructure/cover_files.rs`)
+   with a short note in the database.
 6. **No Navidrome API.** magpie-fi only writes files and `.m3u8` playlists.
 7. **Free and public only.** No paid APIs, no borrowed or scraped tokens, no DRM circumvention:
    Spotify, Apple and Deezer links give the song list only, and audio comes from YouTube.

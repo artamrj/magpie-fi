@@ -313,7 +313,7 @@ MUSIC_ROOT/                         one filesystem: every move is an atomic rena
 └── .magpie-fi/                     hidden work area
     ├── staging/                    downloads and Telegram files on their way
     └── trash/<date>/               originals and replaced files, kept MAGPIE_TRASH_DAYS (30)
-DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a local SSD)
+DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp, covers/ (keep on a local SSD)
 ```
 
 - `inbox/` is only for you; magpie-fi's own downloads go to `.magpie-fi/staging/`.
@@ -439,7 +439,9 @@ change it. Worker counts are fixed in `src/config.rs`.
 
 - Source answers and downloaded covers (`provider_cache`) keep a lifetime per source, from 7 to
   90 days. Expired rows are removed at start and once a day. Failed lookups are not cached.
-  Downloaded covers are capped at 200 MiB together; the ones kept the shortest time go first.
+  Downloaded covers are files in `DATA_ROOT/magpie-fi/covers/`, not rows: the database keeps a
+  short note per cover. They are capped at 200 MiB together (the ones kept the shortest time go
+  first), every read is checked, and the folder may be deleted at any time.
 - File analysis (fingerprint, integrity, content hash) is keyed by path, size and mtime, and
   capped at 100 MiB together; the oldest rows go first.
 

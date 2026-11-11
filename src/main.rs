@@ -39,6 +39,18 @@ async fn main() -> Result<()> {
     resolve_folders(&mut config)?;
     let pool = infrastructure::db::connect(&config.db_path).await?;
     infrastructure::db::cleanup(&pool).await?;
+    // Covers used to be kept inside the database; an install from before
+    // that changed gets them moved out once, and its database shrinks.
+    match infrastructure::cover_files::move_out_of_database(&pool).await {
+        Ok(0) => {}
+        Ok(moved) => {
+            tracing::info!(moved, "moved cached covers out of the database into files");
+            if let Err(error) = infrastructure::db::compact(&pool).await {
+                tracing::warn!(%error, "could not compact the database after moving covers");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not move cached covers out of the database"),
+    }
     infrastructure::db::run_daily_cache_cleanup_if_due(&pool).await?;
     purge_trash(&config).await;
     infrastructure::db::enforce_media_cache_limit(&pool).await?;

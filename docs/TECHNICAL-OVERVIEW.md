@@ -608,7 +608,8 @@ Fixed limits (`src/config.rs`, `scan::PipelineLimits`):
 
 | Cache | Key | Lifetime |
 |---|---|---|
-| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily (index on `expires_at`). Cover images (`artwork-url`) are capped at **200 MiB** together: when a new cover goes over, the ones kept the shortest time are removed down to 160 MiB. |
+| `provider_cache` | source + query/ID/URL | per source, 7–90 days (e.g. AcoustID 90, MusicBrainz recordings and covers 30, catalog searches 7–14). Failed lookups are not cached. Expired rows are removed at start and daily (index on `expires_at`). |
+| Cover files (`infrastructure::cover_files`) | cover address → a note in `provider_cache` (`artwork-url`: SHA-256, size, dimensions, check result) + the image as a file `DATA_DIR/covers/<2 letters>/<SHA-256>` | 30 days. Written under a temporary name and renamed; every read is checked against the SHA-256, and a missing or damaged file is forgotten and downloaded again. Capped at **200 MiB** together: when a new cover goes over, the ones kept the shortest time are removed down to 160 MiB. Files nothing points to are removed daily. Covers an older version kept inside the database are moved out at the first start, and the database is compacted. The folder is only a cache and may be deleted. |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | path + size + mtime | until the file changes; together capped at **100 MiB**, oldest first (at start, daily and hourly when idle) |
 | `artwork_overrides` | path | until you choose another cover |
 

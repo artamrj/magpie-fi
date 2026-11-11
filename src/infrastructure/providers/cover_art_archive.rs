@@ -1,20 +1,17 @@
-//! Downloading and checking cover images. Checked covers are cached by URL for
-//! 30 days, so every track of an album shares one download.
+//! Downloading and checking cover images. Checked covers are kept for 30 days
+//! as files (`infrastructure::cover_files`), so every track of an album shares
+//! one download.
 
 use crate::infrastructure::{
+    cover_files,
     media::tag_writer::{
         ArtworkCheck, ArtworkInfo, MAX_ARTWORK_BYTES, check_artwork, check_own_cover, read_artwork,
     },
-    provider_cache::{self, url_key},
+    provider_cache::url_key,
 };
 use anyhow::{Context, Result, bail};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use chrono::{Duration, Utc};
 use reqwest::Client;
-use serde_json::{Value, json};
 use sqlx::SqlitePool;
-
-const CACHE: &str = "artwork-url";
 
 /// The front cover of a MusicBrainz release group: the album across all its
 /// editions. Used when the chosen edition has no image of its own; another
@@ -86,43 +83,33 @@ pub async fn fetch_verified_url_cached(
         return file_cover(path).await;
     }
     let key = url_key(url);
-    if let Some(value) = provider_cache::get(pool, CACHE, &key).await?
-        && let Some(encoded) = value["data_base64"].as_str()
-    {
-        let data = STANDARD.decode(encoded)?;
-        // Images cached with their check result are not decoded again.
-        if let Some(check) = cached_check(&value)
+    if let Some(stored) = cover_files::load(pool, &key).await? {
+        // Images kept with their check result are not decoded again.
+        if let Some(check) = stored.check
             && (trusted_exact_release || !check.single_colour)
         {
-            return Ok((data, check.info));
+            return Ok((stored.data, check.info));
         }
-        match check_in_background(data, trusted_exact_release).await {
-            Ok((data, check)) => return Ok((data, check.info)),
-            Err(_) => provider_cache::delete(pool, CACHE, &key).await?,
+        match check_in_background(stored.data, trusted_exact_release).await {
+            Ok((data, check)) => {
+                keep(pool, &key, &data, &check).await;
+                return Ok((data, check.info));
+            }
+            Err(_) => cover_files::forget(pool, &key).await?,
         }
     }
     let data = fetch(client, url).await?;
     let (data, check) = check_in_background(data, trusted_exact_release).await?;
-    provider_cache::put(
-        pool,
-        CACHE,
-        &key,
-        &json!({
-            "data_base64": STANDARD.encode(&data),
-            "sha256": check.info.sha256,
-            "width": check.info.width,
-            "height": check.info.height,
-            "mime": check.info.mime,
-            "single_colour": check.single_colour,
-        }),
-        Utc::now() + Duration::days(30),
-    )
-    .await?;
-    // Covers are the bulk of the database; see `enforce_cover_cache_limit`.
-    if let Err(error) = crate::infrastructure::db::enforce_cover_cache_limit(pool).await {
-        tracing::warn!(%error, "could not enforce the cover cache limit");
-    }
+    keep(pool, &key, &data, &check).await;
     Ok((data, check.info))
+}
+
+/// Keeps a checked cover for the other songs of its album. A cover that
+/// cannot be kept (a full disk) is still used for this song.
+async fn keep(pool: &SqlitePool, key: &str, data: &[u8], check: &ArtworkCheck) {
+    if let Err(error) = cover_files::store(pool, key, data, check).await {
+        tracing::warn!("could not keep a cover for later: {error:#}");
+    }
 }
 
 /// Decoding a large image takes a while; keep it off the async workers.
@@ -141,28 +128,13 @@ async fn check_in_background(
     .context("cover check stopped")?
 }
 
-fn cached_check(value: &Value) -> Option<ArtworkCheck> {
-    let mime = match value["mime"].as_str()? {
-        "image/jpeg" => "image/jpeg",
-        "image/png" => "image/png",
-        "image/gif" => "image/gif",
-        "image/webp" => "image/webp",
-        _ => return None,
-    };
-    Some(ArtworkCheck {
-        info: ArtworkInfo {
-            width: u32::try_from(value["width"].as_u64()?).ok()?,
-            height: u32::try_from(value["height"].as_u64()?).ok()?,
-            mime,
-            sha256: value["sha256"].as_str()?.to_owned(),
-        },
-        single_colour: value["single_colour"].as_bool()?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::{cover_files::CACHE, provider_cache};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use chrono::{Duration, Utc};
+    use serde_json::json;
 
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().unwrap();
@@ -193,11 +165,76 @@ mod tests {
             .unwrap();
         assert_eq!(data, expected);
         assert_eq!((info.width, info.height), (320, 320));
-        // A second read uses the stored check result.
-        let again = provider_cache::get(&pool, CACHE, &url_key(url))
+        // It was kept inside the database by an older version; after this
+        // first use it is a file with its check result, and reads the same.
+        let note = provider_cache::get(&pool, CACHE, &url_key(url))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(note["data_base64"].is_null(), "{note}");
+        assert_eq!(note["width"], 320);
+        let (again, _) = fetch_verified_url_cached(&pool, &Client::new(), url, false)
             .await
             .unwrap();
-        assert!(again.is_some());
+        assert_eq!(again, expected);
+    }
+
+    #[tokio::test]
+    async fn a_cover_is_downloaded_once_and_then_read_from_its_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (directory, pool) = test_pool().await;
+        let image = crate::infrastructure::media::tag_writer::test_artwork_png_sized(600, 600);
+        // A local server that answers exactly one request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = image.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+        let url = format!("http://{address}/cover.png");
+
+        let (first, info) = fetch_verified_url_cached(&pool, &Client::new(), &url, false)
+            .await
+            .unwrap();
+        assert_eq!(first, image);
+        assert_eq!((info.width, info.height), (600, 600));
+        // The image is a file next to the database; the database has a short note.
+        let file = directory
+            .path()
+            .join("covers")
+            .join(&info.sha256[..2])
+            .join(&info.sha256);
+        assert_eq!(std::fs::read(&file).unwrap(), image);
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT length(response_json) FROM provider_cache WHERE provider='artwork-url'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stored < 400, "{stored}");
+
+        // The server is gone: the second song of the album reads the file.
+        let (second, _) = fetch_verified_url_cached(&pool, &Client::new(), &url, false)
+            .await
+            .unwrap();
+        assert_eq!(second, image);
+
+        // A file damaged on disk is not used: the cover is asked for again,
+        // and with the server gone that fails instead of filing a broken image.
+        std::fs::write(&file, vec![0_u8; image.len()]).unwrap();
+        assert!(
+            fetch_verified_url_cached(&pool, &Client::new(), &url, false)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
