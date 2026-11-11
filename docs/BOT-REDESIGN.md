@@ -1,6 +1,6 @@
 # magpie-fi — Telegram bot redesign (Bot API 10.4)
 
-> Status: **agreed, being built step by step** (Nov 2026). Steps A to E are built. Written against
+> Status: **agreed, being built step by step** (Nov 2026). Steps A to E and the main part of F are built. Written against
 > Bot API 10.4 (9 Nov 2026).
 > Once a phase is built, [BLUEPRINT.md](BLUEPRINT.md) and
 > [TECHNICAL-OVERVIEW.md](TECHNICAL-OVERVIEW.md) are updated in the same commit.
@@ -110,7 +110,8 @@ Sent as a reply when a link or file arrives. `chat_data` is updated by the exist
 
 ### 2.5 New: 📲 Send me the file
 
-A button on a finished single song (and in the app) that sends the filed song with `sendAudio`:
+Built in step F for the bot (the web page button is still to do). A button on a finished single
+song that sends the filed song with `sendAudio`:
 title, artist, cover as thumbnail, under 50 MB. The file is read from the library and never
 changed. This was already on the roadmap (BLUEPRINT Phase 5).
 
@@ -211,7 +212,7 @@ Each step ships on its own and keeps the bot working.
 | **C. Request card** ✅ built | `widgets/request.html`, `cards.rs`, the loop edits card state and caption, text fallback for a day after a refusal, `MAGPIE_TELEGRAM_CARDS` off switch, 🎉 at the end | The big one |
 | **D. Review card** ✅ built | `review.html`, choices with score bars, length difference, audio match and sources; taps choose or remove; the card shows how it ended, also after a choice in the app | Choosing in the chat |
 | **E. Library card** ✅ built | Shared widget, `/library` (owners only for now), pinned quietly, refreshed every 10 s on a change, a new shared card when its code changes | Live library at a glance |
-| **F. Extras** | 📲 Send me the file, optional clip preview, optional topics | — |
+| **F. Extras** | ✅ 📲 Send me the file (bot; a web page button is still to do). Not built: optional clip preview, optional topics | — |
 
 Docs: BLUEPRINT §3.3/§3.4 and decision #3, TECHNICAL-OVERVIEW §6/§7 and the settings list
 (`MAGPIE_TELEGRAM_CARDS`) are updated with each step. Known drift to fix along the way: the

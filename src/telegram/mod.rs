@@ -7,6 +7,7 @@
 //! - `actions.rs`: every button and card tap, its permission check and what it does.
 //! - `cards.rs`: requests as live cards (Bot API 10.4 widgets) and their state.
 //! - `library.rs`: `/library`, one shared card with the library at a glance.
+//! - `files.rs`: "📲 Send me the file", a filed song sent into the chat.
 //! - `status.rs`: the loop that updates status messages and asks about Review.
 //! - `texts.rs`: everything the bot says.
 
@@ -14,6 +15,7 @@ mod actions;
 pub mod api;
 mod cards;
 mod commands;
+mod files;
 mod intake;
 mod library;
 mod status;
@@ -600,8 +602,12 @@ mod tests {
     async fn fake_api(
         AxumState(fake): AxumState<Arc<FakeTelegram>>,
         axum::extract::Path((_, method)): axum::extract::Path<(String, String)>,
-        Json(params): Json<Value>,
+        body: axum::body::Bytes,
     ) -> Json<Value> {
+        // JSON calls are kept as they are; uploads (multipart forms) as their
+        // text, which is enough to see the fields and file names.
+        let params: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({ "form": String::from_utf8_lossy(&body) }));
         fake.calls
             .lock()
             .unwrap()
@@ -633,7 +639,7 @@ mod tests {
             "getFile" => {
                 json!({"file_id": params["file_id"], "file_unique_id": "u", "file_path": "music/a.mp3"})
             }
-            "sendMessage" | "sendRichMessage" | "sendWidget" | "sendSharedWidget"
+            "sendMessage" | "sendRichMessage" | "sendWidget" | "sendSharedWidget" | "sendAudio"
             | "editMessageText" => {
                 let mut next = fake.next_message.lock().unwrap();
                 *next += 1;
@@ -1640,5 +1646,123 @@ mod tests {
         .unwrap();
         fake.push(message(2, FRIEND, "/library"));
         wait_for(&fake, "sendMessage", "don't know that command").await;
+    }
+
+    /// A finished one-song request whose song was filed at `file`.
+    async fn filed_song(state: &AppState, file: &std::path::Path, requested_by: &str) -> i64 {
+        let pool = &state.pool;
+        let url = format!("https://x/track/{requested_by}");
+        let request = store::create_request(
+            pool,
+            &url,
+            links::Scope::Track,
+            "telegram",
+            Some(requested_by),
+        )
+        .await
+        .unwrap();
+        let collection = links::Collection {
+            title: None,
+            owner: None,
+            songs: vec![links::Wanted {
+                title: "One More Time".into(),
+                artist: Some("Daft Punk".into()),
+                ..links::Wanted::default()
+            }],
+        };
+        store::save_collection(pool, request, &url, links::Scope::Track, &collection)
+            .await
+            .unwrap();
+        let chat: i64 = requested_by.parse().unwrap();
+        store::attach_telegram(pool, request, chat, 5, 900)
+            .await
+            .unwrap();
+        let song = store::claim_next(pool).await.unwrap().unwrap();
+        store::mark_in_library(pool, song.id, file.to_str().unwrap())
+            .await
+            .unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn a_filed_song_can_be_sent_into_the_chat() {
+        let (_directory, fake, state) = start().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        let library = std::path::Path::new(&state.config.output_dir).join("Daft Punk");
+        tokio::fs::create_dir_all(&library).await.unwrap();
+        let file = library.join("One More Time.m4a");
+        tokio::fs::write(&file, b"not really audio").await.unwrap();
+        let file = tokio::fs::canonicalize(&file).await.unwrap();
+        sqlx::query(
+            "INSERT INTO library_items(path,file_size,file_mtime_ns,duration,title,artist,source,
+               added_at,checked_at) VALUES(?,1,1,320.4,'One More Time','Daft Punk','inbox','now','now')",
+        )
+        .bind(file.to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let request = filed_song(&state, &file, "100").await;
+
+        // The finished status message offers the file.
+        let done = wait_for(&fake, "editMessageText", &format!("file:{request}")).await;
+        assert!(done.to_string().contains(texts::SEND_FILE));
+
+        fake.push(button(1, OWNER, &format!("file:{request}")));
+        wait_for(&fake, "answerCallbackQuery", texts::SENDING_FILE).await;
+        let sent = wait_for(&fake, "sendAudio", "One More Time.m4a").await;
+        let form = sent["form"].as_str().unwrap();
+        for field in [
+            "name=\"title\"\r\n\r\nOne More Time",
+            "name=\"performer\"\r\n\r\nDaft Punk",
+            "name=\"duration\"\r\n\r\n320",
+            "not really audio",
+            "\"message_id\":900",
+        ] {
+            assert!(form.contains(field), "{field:?} missing in {form}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_library_songs_go_out_and_only_to_their_people() {
+        let (directory, fake, state) = start().await;
+        wait_for(&fake, "setMyCommands", "queue").await;
+        sqlx::query(
+            "INSERT INTO telegram_guests(user_id,name,invited_by,created_at) VALUES(?,?,?,?)",
+        )
+        .bind(FRIEND as i64)
+        .bind("Friend")
+        .bind(OWNER as i64)
+        .bind("now")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // A "library path" outside the library folder.
+        let outside = directory.path().join("secret.m4a");
+        tokio::fs::write(&outside, b"secret").await.unwrap();
+        let request = filed_song(&state, &outside, "100").await;
+
+        fake.push(button(1, FRIEND, &format!("file:{request}")));
+        wait_for(&fake, "answerCallbackQuery", texts::NOT_ALLOWED).await;
+        fake.push(button(2, OWNER, &format!("file:{request}")));
+        wait_for(&fake, "sendMessage", texts::FILE_GONE).await;
+        assert!(fake.calls("sendAudio").is_empty());
+
+        // Too big for Telegram: a sparse 60 MB file costs no disk space.
+        let library = std::path::Path::new(&state.config.output_dir);
+        tokio::fs::create_dir_all(library).await.unwrap();
+        let big = library.join("Long Mix.flac");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(60 * 1024 * 1024)
+            .unwrap();
+        sqlx::query("UPDATE wanted SET library_path=? WHERE request_id=?")
+            .bind(big.to_str().unwrap())
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        fake.push(button(3, OWNER, &format!("file:{request}")));
+        wait_for(&fake, "sendMessage", "60 MB").await;
+        assert!(fake.calls("sendAudio").is_empty());
     }
 }

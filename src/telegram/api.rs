@@ -13,6 +13,19 @@ use std::{path::Path, time::Duration};
 /// (<https://core.telegram.org/bots/api#getfile>).
 pub const DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
 
+/// Telegram lets bots send files up to 50 MB
+/// (<https://core.telegram.org/bots/api#sending-files>).
+pub const UPLOAD_LIMIT: u64 = 50 * 1024 * 1024;
+
+/// A file sent with a Bot API call (multipart upload).
+pub struct Upload {
+    /// The form field: the method's file parameter (`audio`), or a name that
+    /// another parameter points to with `attach://<name>` (a thumbnail).
+    pub field: &'static str,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
 pub const TOO_BIG: &str = "Telegram only lets bots receive files up to 20 MB";
 
 const API_URL: &str = "https://api.telegram.org";
@@ -84,6 +97,73 @@ impl Bot {
                 Ok(response) => response,
                 Err(error) if attempt < 3 && (repeatable || error.is_connect()) => {
                     tracing::debug!(%error, method, "Telegram request failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let body = response
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            let answer: Response<R> = serde_json::from_slice(&body)
+                .with_context(|| format!("unexpected answer from Telegram for {method}"))?;
+            if answer.ok
+                && let Some(result) = answer.result
+            {
+                return Ok(result);
+            }
+            if let Some(wait) = answer.parameters.and_then(|p| p.retry_after) {
+                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
+                continue;
+            }
+            return Err(TelegramError {
+                code: answer.error_code,
+                description: answer.description,
+            }
+            .into());
+        }
+        bail!("Telegram kept asking to slow down ({method})")
+    }
+
+    /// Sends files with a Bot API method (`sendAudio`), as a multipart form.
+    /// `params` are the method's other parameters; objects (reply parameters,
+    /// keyboards) are sent as JSON text, as Telegram expects in a form. Like
+    /// every `send…` call it is only repeated when it surely did not arrive,
+    /// and it waits when Telegram asks to slow down.
+    pub async fn upload<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        files: &[Upload],
+    ) -> Result<R> {
+        let url = format!("{}/bot{}/{method}", self.api_url, self.token);
+        for attempt in 0..4 {
+            let mut form = reqwest::multipart::Form::new();
+            for (name, value) in params.as_object().into_iter().flatten() {
+                let text = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                form = form.text(name.clone(), text);
+            }
+            for file in files {
+                let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                    .file_name(file.file_name.clone());
+                form = form.part(file.field, part);
+            }
+            let response = match self
+                .client
+                .post(&url)
+                .multipart(form)
+                // 50 MB on a slow home connection takes a while.
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+            {
+                Ok(response) => response,
+                Err(error) if attempt < 3 && error.is_connect() => {
                     tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
                     continue;
                 }

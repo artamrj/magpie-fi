@@ -66,6 +66,9 @@ pub fn request_state(
     if summary.failed > 0 || summary.review > 0 {
         buttons.push('d');
     }
+    if wants_file_button(summary, finished) {
+        buttons.push('f');
+    }
     let dots: String = songs
         .iter()
         .take(MAX_DOTS)
@@ -108,6 +111,11 @@ fn name(summary: &RequestSummary, view: &StatusView) -> String {
     } else {
         name
     }
+}
+
+/// "📲 Send me the file" is offered for one song that is in the library.
+pub fn wants_file_button(summary: &RequestSummary, finished: bool) -> bool {
+    finished && summary.total == 1 && summary.done == 1
 }
 
 fn letter(status: &str) -> char {
@@ -463,6 +471,11 @@ mod tests {
         assert_eq!(state["b"], "sd");
         assert_eq!(state["n"], json!([1, 4, 2, 0, 1, 0]));
         assert!(state.get("c").is_none() && state.get("v").is_none());
+
+        let mut one = summary(1, 1, 0, 0);
+        one.kind = "track".into();
+        let single = request_state(&one, &StatusView::default(), &songs[..1], None);
+        assert_eq!(single["b"], "f");
 
         let done = request_state(&summary(4, 3, 0, 1), &StatusView::default(), &songs, None);
         assert_eq!(

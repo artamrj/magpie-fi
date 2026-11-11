@@ -203,6 +203,10 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   the app. Owners also get "Choose in the app" below it. Without cards, owners get one button that
   opens the Mini App on that song; guests, and chats without an HTTPS address, get up to three
   candidate buttons (green) and "None of these" (red) in the chat.
+- A finished single song offers **📲 Send me the file**: the filed song is sent into the chat
+  (`sendAudio`, with title, artist, length and cover thumbnail) so it plays in Telegram. The file is
+  only read, only from inside `library/`, and only up to Telegram's 50 MB limit for bots; a bigger
+  file gets a clear answer. Guests can do this only for their own requests.
 - `/library` (owners) shows one shared **library card**, pinned quietly: songs, artists, hours of
   music, the last songs magpie-fi filed, what's on the way, what waits in Review, and health. Every
   copy in every owner's chat updates at once when the numbers change.
@@ -507,7 +511,8 @@ change it. Worker counts are fixed in `src/config.rs`.
 - **Discovery:** weekly "New for you" from ListenBrainz/Last.fm listening, missing songs fetched,
   a note on Telegram.
 - **Play links:** "▶ Play" buttons and guest share links (needs Navidrome's own public address).
-- **"📲 Send me the file"** from the library into Telegram's player.
+- **"📲 Send me the file"** from the library into Telegram's player: ✅ built in the bot for a
+  finished single song (see §3.4); a button in the web page is still to do.
 - **Sonic radio** through a Navidrome plugin (e.g. AudioMuse-AI) — on Navidrome's side.
 - **More tags:** original release date, album version (Deluxe, Remaster) to keep editions apart,
   sort names for Persian artists, word-synced `.elrc` lyrics when LRCLIB has them.
