@@ -257,6 +257,7 @@ export function App() {
               <BrandMark size={24} />
             </i>
             magpie-fi
+            <small className="brand-version">{__APP_VERSION__}</small>
           </div>
           <nav aria-label="Sections">
             {tabs.map((item) => (
