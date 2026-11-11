@@ -22,6 +22,10 @@ pub struct Entry {
     pub artists: Vec<String>,
     pub album: Option<String>,
     pub duration: Option<f64>,
+    /// A label's studio upload (what YouTube Music lists as a "song"), not a
+    /// music video. Only known from [`details`]; search and playlist results
+    /// leave it false.
+    pub music_track: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -330,7 +334,19 @@ fn entry(value: &Value) -> Entry {
         duration: value["duration"]
             .as_f64()
             .filter(|duration| *duration > 0.0),
+        music_track: is_music_track(value),
     }
+}
+
+/// Studio uploads carry the song, album and singers as data, and their
+/// description starts with the label's "Provided to YouTube by …" line.
+/// Music videos have neither.
+fn is_music_track(value: &Value) -> bool {
+    let tagged = text(value, "track").is_some() && text(value, "album").is_some();
+    tagged
+        || value["description"]
+            .as_str()
+            .is_some_and(|description| description.starts_with("Provided to YouTube by"))
 }
 
 #[cfg(test)]
@@ -356,9 +372,27 @@ mod tests {
         let found = entry(&details);
         assert_eq!(found.artists, vec!["The Weeknd"]);
         assert_eq!(found.duration, Some(202.0));
+        assert!(found.music_track);
 
         let video = serde_json::json!({"id": "x", "title": "Song", "channel": "Artist - Topic"});
         assert_eq!(entry(&video).artists, vec!["Artist"]);
+        assert!(!entry(&video).music_track);
+    }
+
+    #[test]
+    fn tells_a_studio_track_from_a_music_video() {
+        let music_video = serde_json::json!({
+            "id": "4NRXx6U8ABQ", "title": "The Weeknd - Blinding Lights (Official Video)",
+            "channel": "The Weeknd", "duration": 263,
+            "description": "Official music video for The Weeknd \"Blinding Lights\""
+        });
+        assert!(!entry(&music_video).music_track);
+
+        let described_only = serde_json::json!({
+            "id": "a", "title": "Song", "channel": "Artist",
+            "description": "Provided to YouTube by Some Label\n\nSong · Artist"
+        });
+        assert!(entry(&described_only).music_track);
     }
 
     #[test]
