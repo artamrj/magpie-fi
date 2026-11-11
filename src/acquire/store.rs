@@ -460,6 +460,10 @@ pub struct OpenStatus {
     pub status_message_id: i64,
     pub user_message_id: Option<i64>,
     pub status_text: Option<String>,
+    /// "text" or "card" (a live Bot API widget).
+    pub card_kind: String,
+    /// The card's caption as last sent.
+    pub card_caption: Option<String>,
     /// "Artist – Title" of the first song.
     pub first_song: Option<String>,
     /// Songs filed now (not counting ones that were already in the library).
@@ -471,7 +475,7 @@ pub async fn open_telegram_requests(pool: &SqlitePool) -> Result<Vec<OpenStatus>
     let sql = summary_sql(
         &format!(
             ",r.chat_id,r.status_message_id,r.user_message_id,r.status_text,
-              {FIRST_SONG} AS first_song,
+              r.card_kind,r.card_caption,{FIRST_SONG} AS first_song,
               coalesce(sum(w.status='filed'),0) AS newly_filed"
         ),
         "r.chat_id IS NOT NULL AND r.status_message_id IS NOT NULL AND r.closed=0",
@@ -494,6 +498,54 @@ pub async fn set_status_text(
         .bind(request_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// The request's status message is a live card, last sent with this caption.
+pub async fn set_card(pool: &SqlitePool, request_id: i64, caption: &str) -> Result<()> {
+    sqlx::query("UPDATE requests SET card_kind='card',card_caption=? WHERE id=?")
+        .bind(caption)
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The library file of the first song this request filed, if any. Filed songs
+/// passed the cover gate, so their embedded cover is a verified one.
+pub async fn first_filed_song(pool: &SqlitePool, request_id: i64) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT library_path FROM wanted
+         WHERE request_id=? AND status='filed' AND library_path IS NOT NULL
+         ORDER BY position LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// May this chat get cards now? Not while an earlier refusal is fresh.
+pub async fn cards_allowed(pool: &SqlitePool, chat_id: i64) -> Result<bool> {
+    let until: Option<String> =
+        sqlx::query_scalar("SELECT cards_off_until FROM telegram_chats WHERE chat_id=?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    Ok(until.is_none_or(|until| until.as_str() <= now().as_str()))
+}
+
+/// Telegram refused a card in this chat: use text for a day.
+pub async fn cards_refused(pool: &SqlitePool, chat_id: i64) -> Result<()> {
+    let until = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO telegram_chats(chat_id,cards_off_until) VALUES(?,?)
+         ON CONFLICT(chat_id) DO UPDATE SET cards_off_until=excluded.cards_off_until",
+    )
+    .bind(chat_id)
+    .bind(until)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

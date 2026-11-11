@@ -1,9 +1,10 @@
 //! What people send: links become requests, audio files become uploads.
 //! Both go into the same queue the web page uses.
 
-use super::{Context, api, react, send, texts, types::Message, types::User};
+use super::{Context, api, cards, react, send, texts, types::Message, types::User};
 use crate::acquire::{links, store, worker};
 use anyhow::Result;
+use serde_json::json;
 use std::{
     path::Path,
     sync::Arc,
@@ -46,7 +47,7 @@ pub async fn on_links(
             if queued > 0 {
                 context.state.notify_acquire();
             }
-            attach_status_message(context, request, message).await?;
+            attach_status_message(context, request, link.scope.as_str(), message).await?;
             continue;
         }
         let request = store::create_request(
@@ -57,33 +58,85 @@ pub async fn on_links(
             Some(&user.id.to_string()),
         )
         .await?;
-        attach_status_message(context, request, message).await?;
+        attach_status_message(context, request, link.scope.as_str(), message).await?;
         tokio::spawn(worker::read_request(context.state.clone(), request, link));
     }
     react(context, chat, message.message_id, "👀").await;
     Ok(())
 }
 
-/// Sends the first version of a request's status message and remembers it.
-async fn attach_status_message(context: &Context, request: i64, message: &Message) -> Result<()> {
-    let sent = send(
-        context,
-        message.chat.id,
-        texts::READING_LINK,
-        Some(message.message_id),
-    )
-    .await;
+/// Sends the first version of a request's status message and remembers it:
+/// a live card when this chat can show one, otherwise text.
+async fn attach_status_message(
+    context: &Context,
+    request: i64,
+    kind: &str,
+    message: &Message,
+) -> Result<()> {
+    let chat = message.chat.id;
+    let pool = &context.state.pool;
+    if context.config.cards && store::cards_allowed(pool, chat).await? {
+        match send_card(context, request, kind, message).await {
+            Card::Sent(card) => {
+                store::attach_telegram(pool, request, chat, message.message_id, card).await?;
+                store::set_card(pool, request, texts::READING_LINK).await?;
+                return Ok(());
+            }
+            // It may have arrived: sending text too could show the request twice.
+            Card::Lost => return Ok(()),
+            Card::Refused => store::cards_refused(pool, chat).await?,
+        }
+    }
+    let sent = send(context, chat, texts::READING_LINK, Some(message.message_id)).await;
     if let Some(sent) = sent {
-        store::attach_telegram(
-            &context.state.pool,
-            request,
-            message.chat.id,
-            message.message_id,
-            sent.message_id,
-        )
-        .await?;
+        store::attach_telegram(pool, request, chat, message.message_id, sent.message_id).await?;
     }
     Ok(())
+}
+
+enum Card {
+    Sent(i32),
+    Refused,
+    Lost,
+}
+
+/// Sends a request card. Owners also get a button that opens the app; if
+/// Telegram refuses the card with that button, it is tried once without.
+async fn send_card(context: &Context, request: i64, kind: &str, message: &Message) -> Card {
+    let chat = message.chat.id;
+    let mut params = json!({
+        "chat_id": chat,
+        "html": cards::REQUEST_HTML,
+        "chat_data": cards::with_revision(cards::reading(request, kind), super::revision()),
+        "caption": texts::READING_LINK,
+        "parse_mode": "HTML",
+        "allow_queries": true,
+        "reply_parameters": {"message_id": message.message_id, "allow_sending_without_reply": true},
+    });
+    if let Some(keyboard) = super::status::app_keyboard(context, chat, false) {
+        params["reply_markup"] = keyboard;
+    }
+    loop {
+        match context.bot.call::<_, Message>("sendWidget", &params).await {
+            Ok(sent) => return Card::Sent(sent.message_id),
+            Err(error) if api::is_refusal(&error) => {
+                if params
+                    .as_object_mut()
+                    .and_then(|p| p.remove("reply_markup"))
+                    .is_some()
+                {
+                    tracing::info!(%error, "Telegram refused a card with an app button; trying without");
+                    continue;
+                }
+                tracing::info!(%error, "Telegram refused a request card; using text in this chat for a day");
+                return Card::Refused;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "sending a request card failed");
+                return Card::Lost;
+            }
+        }
+    }
 }
 
 /// An audio file in a message, as an audio message or as a document.
@@ -168,7 +221,7 @@ pub async fn on_upload(
                 let request =
                     store::create_upload_request(&context.state.pool, &user.id.to_string()).await?;
                 uploads.insert(key, (request, Instant::now()));
-                attach_status_message(context, request, message).await?;
+                attach_status_message(context, request, "upload", message).await?;
                 react(context, chat, message.message_id, "👀").await;
                 request
             }

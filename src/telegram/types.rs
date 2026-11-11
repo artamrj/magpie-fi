@@ -30,6 +30,7 @@ pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
+    pub widget_query: Option<WidgetQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +106,17 @@ pub struct CallbackQuery {
     pub from: User,
     pub message: Option<Message>,
     pub data: Option<String>,
+}
+
+/// A tap in a widget (Bot API 10.4) that called `TelegramWidget.request`.
+/// Must be answered with `answerWidgetQuery` within 15 seconds.
+#[derive(Debug, Deserialize)]
+pub struct WidgetQuery {
+    pub id: String,
+    pub from: User,
+    /// What the widget sent, 1-64 bytes. Untrusted, like button data.
+    #[serde(default)]
+    pub data: String,
 }
 
 /// The answer to `getFile`.

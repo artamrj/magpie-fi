@@ -26,6 +26,11 @@ pub struct TelegramConfig {
     pub token: String,
     /// Telegram user IDs that may use the bot and invite guests.
     pub owners: Vec<i64>,
+    /// Show each request as a live card (a Bot API 10.4 widget) instead of a
+    /// text status message (`MAGPIE_TELEGRAM_CARDS`, default on). Widgets are
+    /// new; when Telegram refuses one the bot falls back to text by itself,
+    /// so this is only an off switch.
+    pub cards: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +200,11 @@ impl Config {
                          (send /id to the bot to see yours)"
                     );
                 }
-                Some(TelegramConfig { token, owners })
+                Some(TelegramConfig {
+                    token,
+                    owners,
+                    cards: flag("MAGPIE_TELEGRAM_CARDS", true)?,
+                })
             }
         };
         config.public_url =
@@ -346,6 +355,14 @@ mod tests {
         .unwrap();
         let telegram = config.telegram.unwrap();
         assert_eq!(telegram.owners, vec![123, 456, 789]);
+        assert!(telegram.cards);
+        let plain = from(&[
+            ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),
+            ("MAGPIE_TELEGRAM_OWNERS", "1"),
+            ("MAGPIE_TELEGRAM_CARDS", "off"),
+        ])
+        .unwrap();
+        assert!(!plain.telegram.unwrap().cards);
         assert!(
             from(&[
                 ("MAGPIE_TELEGRAM_BOT_TOKEN", "1:abc"),

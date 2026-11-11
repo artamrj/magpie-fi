@@ -64,10 +64,10 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `canonical_names` | Preferred spelling of artist/album names (aliases, Latin vs. original script) |
 | `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
-| `requests` | One row per link someone asked for; Telegram status message ids |
+| `requests` | One row per link someone asked for; its Telegram status message: id, `card_kind` (`card` or `text`) and the card's last caption |
 | `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
 | `playlists` | One row per playlist link → one `.m3u8` file |
-| `telegram_guests`, `telegram_invites`, `telegram_state` | Invited guests, one-time invite tokens, the update offset |
+| `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats` | Invited guests, one-time invite tokens, the update offset, chats whose Telegram refused a card (text until `cards_off_until`) |
 | `login_links`, `sessions` | Web login: one-time links and 30-day sessions (SHA-256 hashes only) |
 | `provider_cache` | Source answers and downloaded cover bytes, each with an expiry (§14) |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | Per-file analysis results keyed by path + size + mtime |
@@ -213,8 +213,9 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 | Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners, guests and strangers, sends a message to the right handler, Mini App links. `say` sends a message to the chat, or ephemerally to whoever pressed a button or sent an ephemeral command; as a rich message (`sendRichMessage` with its `html` form) when there is one. When Telegram clearly refuses an ephemeral or rich message, it sends the plain text to the chat instead; after a network error it doesn't, so nothing arrives twice. |
 | Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
 | Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
-| Buttons | `actions.rs` | One `Action` type for every button: its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
-| Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
+| Buttons | `actions.rs` | One `Action` type for every button and card tap (`widget_query`, answered with `answerWidgetQuery` within 15 s): its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
+| Cards | `cards.rs`, `widgets/request.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. |
+| Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message (card state with `editMessageWidgetData` and its caption, or text) only when what it shows changed, closes it when nothing is left, and asks about songs waiting in Review. A finished album or playlist of 5+ songs gets one short 🎉 message, because edits don't notify. |
 | Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. Rich messages carry their plain text too, for the fallback. The command list (`COMMANDS`) marks `/queue`, `/health` and `/id` as `is_ephemeral`. |
 
 ## 7. Web page login (`src/http/auth.rs`)

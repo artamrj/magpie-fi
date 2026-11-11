@@ -1,8 +1,11 @@
 //! Everything a person can press. Button `callback_data` is written and read
 //! here only, so a button and the code that handles it can't drift apart.
-//! Widget taps (Bot API 10.4) will send the same short codes.
+//! Taps on a request card (a Bot API 10.4 widget) send the same short codes
+//! and go through the same permission check.
 
-use super::{Context, Role, To, answer, edit, edit_rich, role, say, send, texts};
+use super::{
+    Context, Role, To, answer, edit, edit_rich, role, say, send, texts, types::WidgetQuery,
+};
 use crate::{
     acquire::store,
     types::{CandidateId, TrackId},
@@ -138,14 +141,10 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
     let pool = &context.state.pool;
     match action {
         Action::Stop(request) => {
-            let stopped = store::stop_request(pool, request).await?;
-            answer(context, &query.id, &texts::stopped(stopped)).await;
+            answer(context, &query.id, &stop(context, request).await?).await;
         }
         Action::Retry(request) => {
-            let queued = store::retry_failed(pool, request).await?;
-            store::reopen(pool, request).await?;
-            context.state.notify_acquire();
-            answer(context, &query.id, &texts::retrying(queued)).await;
+            answer(context, &query.id, &retry(context, request).await?).await;
         }
         Action::Details(request) => {
             // Only the person who pressed sees it, so the chat stays tidy; it
@@ -205,6 +204,62 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
         }
     }
     Ok(())
+}
+
+/// Stops a request's songs that have not started; returns the reply.
+async fn stop(context: &Context, request: i64) -> Result<String> {
+    let stopped = store::stop_request(&context.state.pool, request).await?;
+    Ok(texts::stopped(stopped))
+}
+
+/// Tries a request's failed songs again; returns the reply.
+async fn retry(context: &Context, request: i64) -> Result<String> {
+    let pool = &context.state.pool;
+    let queued = store::retry_failed(pool, request).await?;
+    store::reopen(pool, request).await?;
+    context.state.notify_acquire();
+    Ok(texts::retrying(queued))
+}
+
+/// A tap on a request card. The card shows the answer itself (`m` a short
+/// message, `d` rows for Details), and the status loop redraws the card. Every
+/// tap is answered, even a refused or failed one, or the card waits 15 s.
+pub async fn on_card_tap(context: &Arc<Context>, query: &WidgetQuery) -> Result<()> {
+    let reply = match card_reply(context, query).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            tracing::warn!(%error, "handling a card tap failed");
+            json!({ "m": texts::TAP_FAILED }).to_string()
+        }
+    };
+    let _: Option<bool> = context
+        .bot
+        .try_call(
+            "answerWidgetQuery",
+            &json!({"widget_query_id": query.id, "data": reply}),
+        )
+        .await;
+    Ok(())
+}
+
+async fn card_reply(context: &Context, query: &WidgetQuery) -> Result<String> {
+    let message = |text: &str| json!({ "m": text }).to_string();
+    let Some(action) = Action::parse(&query.data) else {
+        return Ok(message(""));
+    };
+    if !action.allowed(context, query.from.id).await? {
+        return Ok(message(texts::NOT_ALLOWED));
+    }
+    Ok(match action {
+        Action::Stop(request) => message(&stop(context, request).await?),
+        Action::Retry(request) => message(&retry(context, request).await?),
+        Action::Details(request) => {
+            let songs = store::request_songs(&context.state.pool, request).await?;
+            super::cards::details_answer(&songs)
+        }
+        // A request card only offers the buttons above.
+        _ => message(""),
+    })
 }
 
 /// Selects a candidate for a song waiting in review; returns the reply.

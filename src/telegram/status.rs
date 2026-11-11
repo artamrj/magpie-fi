@@ -1,12 +1,13 @@
 //! Keeps every Telegram request's status message up to date, and asks the
 //! sender when a song waits in review. Reads the same tables as the web page,
-//! every few seconds; a message is only edited when its text changed.
+//! every few seconds; a message is only edited when what it shows changed.
+//! A status message is a live card (`cards.rs`) or, as a fallback, text.
 
-use super::{Context, actions::Action, api, edit_params, react, send_with, texts};
+use super::{Context, actions::Action, api, cards, edit_params, react, send_with, texts};
 use crate::acquire::store;
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 const INTERVAL: Duration = Duration::from_secs(3);
 
@@ -22,36 +23,56 @@ pub async fn run(context: Arc<Context>) {
     }
 }
 
+/// Telegram's 🎉 message effect (private chats only).
+const CONFETTI: &str = "5046509860389126442";
+
 async fn refresh(context: &Context) -> Result<()> {
-    for open in store::open_telegram_requests(&context.state.pool).await? {
+    let pool = &context.state.pool;
+    for open in store::open_telegram_requests(pool).await? {
         let summary = &open.summary;
         let view = texts::StatusView {
             song: open.first_song.clone(),
             newly_filed: open.newly_filed,
         };
-        let text = texts::status(summary, &view);
         let finished = texts::is_final(summary);
-        if open.status_text.as_deref() == Some(text.as_str()) && !finished {
+        let card = open.card_kind == "card";
+        // What the message shows, to compare with what it showed last time.
+        let (shown, card_state) = if card {
+            let songs = store::request_songs(pool, summary.id).await?;
+            let colours = colours(context, summary.id).await;
+            let state = cards::request_state(summary, &view, &songs, colours.as_ref());
+            (state.to_string(), Some(state))
+        } else {
+            (texts::status(summary, &view), None)
+        };
+        if open.status_text.as_deref() == Some(shown.as_str()) && !finished {
             continue;
         }
         let message = i32::try_from(open.status_message_id).unwrap_or_default();
-        let app = app_url(context, open.chat_id, summary.review > 0);
-        let params = edit_params(
-            open.chat_id,
-            message,
-            &text,
-            keyboard(summary, finished, app),
-        );
-        match context
-            .bot
-            .call::<_, Value>("editMessageText", &params)
-            .await
-        {
+        let (method, params) = match card_state {
+            Some(state) => (
+                "editMessageWidgetData",
+                json!({
+                    "chat_id": open.chat_id,
+                    "message_id": message,
+                    "chat_data": cards::with_revision(state, super::revision()),
+                }),
+            ),
+            None => {
+                let app = app_url(context, open.chat_id, summary.review > 0);
+                let keyboard = keyboard(summary, finished, app);
+                (
+                    "editMessageText",
+                    edit_params(open.chat_id, message, &shown, keyboard),
+                )
+            }
+        };
+        match context.bot.call::<_, Value>(method, &params).await {
             Ok(_) => {}
             Err(error) if api::is_not_modified(&error) => {}
             Err(error) if api::is_gone(&error) => {
                 // The status message was deleted: stop updating it.
-                store::set_status_text(&context.state.pool, summary.id, &text, true).await?;
+                store::set_status_text(pool, summary.id, &shown, true).await?;
                 continue;
             }
             Err(error) => {
@@ -59,19 +80,105 @@ async fn refresh(context: &Context) -> Result<()> {
                 continue;
             }
         }
-        store::set_status_text(&context.state.pool, summary.id, &text, finished).await?;
-        if finished && let Some(user_message) = open.user_message_id {
-            let emoji = if summary.done > 0 { "👌" } else { "🤷" };
-            react(
-                context,
-                open.chat_id,
-                i32::try_from(user_message).unwrap_or_default(),
-                emoji,
-            )
-            .await;
+        if card {
+            update_caption(context, &open, &view, message).await?;
+        }
+        store::set_status_text(pool, summary.id, &shown, finished).await?;
+        if finished {
+            context.colours.lock().await.remove(&summary.id);
+            if let Some(user_message) = open.user_message_id {
+                let emoji = if summary.done > 0 { "👌" } else { "🤷" };
+                let user_message = i32::try_from(user_message).unwrap_or_default();
+                react(context, open.chat_id, user_message, emoji).await;
+            }
+            if matches!(summary.kind.as_str(), "album" | "playlist")
+                && summary.total >= 5
+                && summary.done > 0
+            {
+                celebrate(
+                    context,
+                    open.chat_id,
+                    message,
+                    &texts::celebrate(summary, &view),
+                )
+                .await;
+            }
         }
     }
     Ok(())
+}
+
+/// A card's caption: what the chat list, notifications and apps without
+/// widgets show. Editing it keeps the app button, which an edit would drop.
+async fn update_caption(
+    context: &Context,
+    open: &store::OpenStatus,
+    view: &texts::StatusView,
+    message: i32,
+) -> Result<()> {
+    let summary = &open.summary;
+    let caption = texts::caption(summary, view);
+    if open.card_caption.as_deref() == Some(caption.as_str()) {
+        return Ok(());
+    }
+    let mut params = json!({
+        "chat_id": open.chat_id,
+        "message_id": message,
+        "caption": caption,
+        "parse_mode": "HTML",
+    });
+    if let Some(keyboard) = app_keyboard(context, open.chat_id, summary.review > 0) {
+        params["reply_markup"] = keyboard;
+    }
+    let _: Option<Value> = context.bot.try_call("editMessageCaption", &params).await;
+    // Remembered even when it failed, so a refused edit isn't repeated every time.
+    store::set_card(&context.state.pool, summary.id, &caption).await
+}
+
+/// Edits are silent, so a finished album or playlist gets one short message
+/// that does notify, with confetti where Telegram allows it.
+async fn celebrate(context: &Context, chat: i64, status_message: i32, text: &str) {
+    let mut params = json!({
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_parameters": {"message_id": status_message, "allow_sending_without_reply": true},
+        "message_effect_id": CONFETTI,
+    });
+    match context.bot.call::<_, Value>("sendMessage", &params).await {
+        Err(error) if api::is_refusal(&error) => {
+            params
+                .as_object_mut()
+                .map(|params| params.remove("message_effect_id"));
+            let _: Option<Value> = context.bot.try_call("sendMessage", &params).await;
+        }
+        Err(error) => tracing::warn!(%error, "sending the finished note failed"),
+        Ok(_) => {}
+    }
+}
+
+/// Colours for a request's card from its first filed song's cover. Looked up
+/// once per request: the first filed song doesn't change.
+async fn colours(context: &Context, request: i64) -> Option<cards::Colours> {
+    if let Some(known) = context.colours.lock().await.get(&request) {
+        return known.clone();
+    }
+    let path = store::first_filed_song(&context.state.pool, request)
+        .await
+        .ok()
+        .flatten()?;
+    let found = tokio::task::spawn_blocking(move || cards::cover_colours(Path::new(&path)))
+        .await
+        .ok()
+        .flatten();
+    context.colours.lock().await.insert(request, found.clone());
+    found
+}
+
+/// The "Open in the app" button alone, for owners with an HTTPS address.
+pub fn app_keyboard(context: &Context, chat: i64, review: bool) -> Option<Value> {
+    let url = app_url(context, chat, review)?;
+    Some(json!({"inline_keyboard": [[super::mini_app_button(texts::OPEN_IN_APP, &url)]]}))
 }
 
 /// The Mini App for this chat: only owners may open the web page, and only
