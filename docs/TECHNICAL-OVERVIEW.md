@@ -66,10 +66,10 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `canonical_names` | Preferred spelling of artist/album names (aliases, Latin vs. original script) |
 | `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed; `second_look` marks a song that already had its one extra look |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
-| `requests` | One row per link someone asked for; Telegram status message ids |
-| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
+| `requests` | One row per link someone asked for; its Telegram status message: id, `card_kind` (`card` or `text`) and the card's last caption |
+| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path; its Telegram review question (`review_message_id`, `review_card`: 0 text or none, 1 card waiting for a choice, 2 card showing how it ended) |
 | `playlists` | One row per playlist link → one `.m3u8` file |
-| `telegram_guests`, `telegram_invites`, `telegram_state` | Invited guests, one-time invite tokens, the update offset |
+| `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats` | Invited guests, one-time invite tokens, small bot values (update offset, the shared library card's ID), per chat: when cards may be tried again after a refusal (`cards_off_until`) and the pinned library card (`library_message_id`) |
 | `login_links`, `sessions` | Web login: one-time links and 30-day sessions (SHA-256 hashes only) |
 | `provider_cache` | Source answers and downloaded cover bytes, each with an expiry (§14) |
 | `fingerprint_cache`, `integrity_cache`, `content_hash_cache` | Per-file analysis results keyed by path + size + mtime |
@@ -192,8 +192,10 @@ In Review you can:
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
 
-The Telegram bot asks about Telegram songs in Review with up to three candidates and calls the
-same choose/remove logic.
+The Telegram bot asks about Telegram songs in Review with a review card (up to three choices to
+tap, with score, length difference, audio match and sources). Without cards, owners get a button
+that opens the Mini App on that song; guests and chats without HTTPS get up to three candidate
+buttons in the chat. All of them call the same choose/remove logic.
 
 ### Phase 4 — File into the library
 
@@ -249,10 +251,17 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 
 | Part | File | Job |
 |---|---|---|
-| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client and frankenstein's types. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
-| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners and guests, random one-time invite tokens, links → `requests`, audio files → `wanted` rows downloaded into staging, commands, buttons. |
-| Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
-| Texts | `texts.rs` | Every message the bot sends, and the progress bar. |
+| Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB and send files up to 50 MB; bigger files get a clear answer. `upload` sends files as a multipart form (`sendAudio`). |
+| Types | `types.rs` | The Bot API types the bot reads, written by hand (Bot API 10.4). Only the fields in use; unknown fields are ignored, so a new API version never breaks reading updates. |
+| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners, guests and strangers, sends a message to the right handler, Mini App links. `say` sends a message to the chat, or ephemerally to whoever pressed a button or sent an ephemeral command; as a rich message (`sendRichMessage` with its `html` form) when there is one. When Telegram clearly refuses an ephemeral or rich message, it sends the plain text to the chat instead; after a network error it doesn't, so nothing arrives twice. |
+| Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
+| Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
+| Buttons | `actions.rs` | One `Action` type for every button and card tap (`widget_query`, answered with `answerWidgetQuery` within 15 s): its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
+| Cards | `cards.rs`, `widgets/request.html`, `widgets/review.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. Review cards (`review.html`) show a song in Review and up to three choices; their badges come from the same rules as smart approval (`breakdown_has_audio_recognition`, `breakdown_sources`). A pick is answered at once (choosing can take longer than the 15 s a card waits) and the card then shows how it ended. Review cards whose song was sorted out in the app are updated by the status loop. |
+| Library card | `library.rs`, `widgets/library.html` | `/library` (owners): one **shared** widget with songs, artists, hours of music, the last 3 songs magpie-fi filed, songs on the way, songs in Review and health. The first `/library` makes it (`sendWidget` with `is_shared`); later ones send the same card (`sendSharedWidget`) and move the quiet pin to the newest. Its ID is kept in `telegram_state` (`library_widget`) with a fingerprint of the card's code, so a changed card makes a new shared widget. The status loop checks the numbers every 10 s and updates every copy with one `editSharedWidgetData` when they changed. Without cards it is a rich message. |
+| Files | `files.rs` | "📲 Send me the file" (`file:<request>`, on a finished single song's card or status message): sends the request's song from the library with `sendAudio`, with title, artist and length from `library_items` and a JPEG thumbnail (≤ 320 px, ≤ 200 kB) of its embedded cover. The path must resolve to a file inside `library/` (links followed), it is only read, and files over 50 MB get an answer instead. The tap is answered at once and the upload runs in the background. |
+| Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message (card state with `editMessageWidgetData` and its caption, or text) only when what it shows changed, closes it when nothing is left, and asks about songs waiting in Review. A finished album or playlist of 5+ songs gets one short 🎉 message, because edits don't notify. |
+| Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. Rich messages carry their plain text too, for the fallback. The command list (`COMMANDS`) marks `/queue`, `/health` and `/id` as `is_ephemeral`. |
 
 ## 7. Web page login (`src/http/auth.rs`)
 

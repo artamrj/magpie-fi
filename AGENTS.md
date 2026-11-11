@@ -77,7 +77,7 @@ These come from `docs/BLUEPRINT.md` §2. Breaking one loses or corrupts someone'
 - **New setting**: add `MAGPIE_*` to `src/config.rs` (with a doc comment), `.env.example`,
   `compose.yaml` `environment:`, `src/http/handlers/settings.rs` (if the page should show it),
   and the docs.
-- **Schema change**: add the next numbered file in `migrations/` (`0015_…sql`). Never edit a
+- **Schema change**: add the next numbered file in `migrations/` (`0018_…sql`). Never edit a
   migration that already exists: sqlx checksums applied ones, and an edit breaks startup for
   every existing install. Queries use runtime `sqlx::query*` functions, not macros, so no
   `DATABASE_URL` is needed.

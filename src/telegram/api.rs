@@ -1,17 +1,30 @@
-//! A small Telegram Bot API client: frankenstein's typed parameters and
-//! results, sent with magpie-fi's own HTTP client.
+//! A small Telegram Bot API client: JSON parameters and our own result types
+//! (`types.rs`), sent with magpie-fi's own HTTP client.
 //!
 //! Bot API URLs contain the bot token, so every HTTP error drops its URL
 //! before it can reach a log, the database or a message.
 
+use super::types::{File, Response};
 use anyhow::{Context, Result, bail};
-use frankenstein::response::{ErrorResponse, MethodResponse};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, time::Duration};
 
 /// Telegram lets bots download files up to 20 MB
 /// (<https://core.telegram.org/bots/api#getfile>).
 pub const DOWNLOAD_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// Telegram lets bots send files up to 50 MB
+/// (<https://core.telegram.org/bots/api#sending-files>).
+pub const UPLOAD_LIMIT: u64 = 50 * 1024 * 1024;
+
+/// A file sent with a Bot API call (multipart upload).
+pub struct Upload {
+    /// The form field: the method's file parameter (`audio`), or a name that
+    /// another parameter points to with `attach://<name>` (a thumbnail).
+    pub field: &'static str,
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
 
 pub const TOO_BIG: &str = "Telegram only lets bots receive files up to 20 MB";
 
@@ -93,18 +106,87 @@ impl Bot {
                 .bytes()
                 .await
                 .map_err(reqwest::Error::without_url)?;
-            if let Ok(ok) = serde_json::from_slice::<MethodResponse<R>>(&body) {
-                return Ok(ok.result);
-            }
-            let error: ErrorResponse = serde_json::from_slice(&body)
+            let answer: Response<R> = serde_json::from_slice(&body)
                 .with_context(|| format!("unexpected answer from Telegram for {method}"))?;
-            if let Some(wait) = error.parameters.as_ref().and_then(|p| p.retry_after) {
-                tokio::time::sleep(Duration::from_secs(u64::from(wait) + 1)).await;
+            if answer.ok
+                && let Some(result) = answer.result
+            {
+                return Ok(result);
+            }
+            if let Some(wait) = answer.parameters.and_then(|p| p.retry_after) {
+                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
                 continue;
             }
             return Err(TelegramError {
-                code: error.error_code,
-                description: error.description,
+                code: answer.error_code,
+                description: answer.description,
+            }
+            .into());
+        }
+        bail!("Telegram kept asking to slow down ({method})")
+    }
+
+    /// Sends files with a Bot API method (`sendAudio`), as a multipart form.
+    /// `params` are the method's other parameters; objects (reply parameters,
+    /// keyboards) are sent as JSON text, as Telegram expects in a form. Like
+    /// every `send…` call it is only repeated when it surely did not arrive,
+    /// and it waits when Telegram asks to slow down.
+    pub async fn upload<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+        files: &[Upload],
+    ) -> Result<R> {
+        let url = format!("{}/bot{}/{method}", self.api_url, self.token);
+        for attempt in 0..4 {
+            let mut form = reqwest::multipart::Form::new();
+            for (name, value) in params.as_object().into_iter().flatten() {
+                let text = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                form = form.text(name.clone(), text);
+            }
+            for file in files {
+                let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+                    .file_name(file.file_name.clone());
+                form = form.part(file.field, part);
+            }
+            let response = match self
+                .client
+                .post(&url)
+                .multipart(form)
+                // 50 MB on a slow home connection takes a while.
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+            {
+                Ok(response) => response,
+                Err(error) if attempt < 3 && error.is_connect() => {
+                    tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let body = response
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            let answer: Response<R> = serde_json::from_slice(&body)
+                .with_context(|| format!("unexpected answer from Telegram for {method}"))?;
+            if answer.ok
+                && let Some(result) = answer.result
+            {
+                return Ok(result);
+            }
+            if let Some(wait) = answer.parameters.and_then(|p| p.retry_after) {
+                tokio::time::sleep(Duration::from_secs(wait + 1)).await;
+                continue;
+            }
+            return Err(TelegramError {
+                code: answer.error_code,
+                description: answer.description,
             }
             .into());
         }
@@ -129,7 +211,7 @@ impl Bot {
 
     /// Saves a file sent to the bot (at most [`DOWNLOAD_LIMIT`]).
     pub async fn download(&self, file_id: &str, target: &Path) -> Result<()> {
-        let file: frankenstein::types::File = match self
+        let file: File = match self
             .call("getFile", &serde_json::json!({"file_id": file_id}))
             .await
         {
@@ -163,6 +245,12 @@ pub fn is_not_modified(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<TelegramError>()
         .is_some_and(|error| error.description.contains("message is not modified"))
+}
+
+/// Telegram answered and said no (as opposed to a network problem, where the
+/// request may have arrived).
+pub fn is_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TelegramError>().is_some()
 }
 
 /// The message to edit no longer exists (deleted by the user).

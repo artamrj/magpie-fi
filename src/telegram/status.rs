@@ -1,51 +1,91 @@
 //! Keeps every Telegram request's status message up to date, and asks the
 //! sender when a song waits in review. Reads the same tables as the web page,
-//! every few seconds; a message is only edited when its text changed.
+//! every few seconds; a message is only edited when what it shows changed.
+//! A status message is a live card (`cards.rs`) or, as a fallback, text.
 
-use super::{Context, api, edit_params, react, send_with, texts};
+use super::{Context, actions::Action, api, cards, edit_params, react, send_with, texts};
 use crate::acquire::store;
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 const INTERVAL: Duration = Duration::from_secs(3);
 
+/// The library card's numbers take a few table scans: not every round.
+const LIBRARY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+
 pub async fn run(context: Arc<Context>) {
+    let mut library_checked: Option<std::time::Instant> = None;
     loop {
+        if library_checked.is_none_or(|checked| checked.elapsed() >= LIBRARY_INTERVAL) {
+            library_checked = Some(std::time::Instant::now());
+            if let Err(error) = super::library::refresh(&context).await {
+                tracing::warn!(%error, "updating the library card failed");
+            }
+        }
         if let Err(error) = refresh(&context).await {
             tracing::warn!(%error, "updating Telegram status messages failed");
         }
         if let Err(error) = ask_reviews(&context).await {
             tracing::warn!(%error, "asking about review songs failed");
         }
+        if let Err(error) = settle_review_cards(&context).await {
+            tracing::warn!(%error, "updating answered review cards failed");
+        }
         tokio::time::sleep(INTERVAL).await;
     }
 }
 
+/// Telegram's 🎉 message effect (private chats only).
+const CONFETTI: &str = "5046509860389126442";
+
 async fn refresh(context: &Context) -> Result<()> {
-    for open in store::open_telegram_requests(&context.state.pool).await? {
+    let pool = &context.state.pool;
+    for open in store::open_telegram_requests(pool).await? {
         let summary = &open.summary;
         let view = texts::StatusView {
             song: open.first_song.clone(),
             newly_filed: open.newly_filed,
         };
-        let text = texts::status(summary, &view);
         let finished = texts::is_final(summary);
-        if open.status_text.as_deref() == Some(text.as_str()) && !finished {
+        let card = open.card_kind == "card";
+        // What the message shows, to compare with what it showed last time.
+        let (shown, card_state) = if card {
+            let songs = store::request_songs(pool, summary.id).await?;
+            let colours = colours(context, summary.id).await;
+            let state = cards::request_state(summary, &view, &songs, colours.as_ref());
+            (state.to_string(), Some(state))
+        } else {
+            (texts::status(summary, &view), None)
+        };
+        if open.status_text.as_deref() == Some(shown.as_str()) && !finished {
             continue;
         }
         let message = i32::try_from(open.status_message_id).unwrap_or_default();
-        let params = edit_params(open.chat_id, message, &text, keyboard(summary, finished));
-        match context
-            .bot
-            .call::<_, Value>("editMessageText", &params)
-            .await
-        {
+        let (method, params) = match card_state {
+            Some(state) => (
+                "editMessageWidgetData",
+                json!({
+                    "chat_id": open.chat_id,
+                    "message_id": message,
+                    "chat_data": cards::with_revision(state, super::revision()),
+                }),
+            ),
+            None => {
+                let app = app_url(context, open.chat_id, summary.review > 0);
+                let keyboard = keyboard(summary, finished, app);
+                (
+                    "editMessageText",
+                    edit_params(open.chat_id, message, &shown, keyboard),
+                )
+            }
+        };
+        match context.bot.call::<_, Value>(method, &params).await {
             Ok(_) => {}
             Err(error) if api::is_not_modified(&error) => {}
             Err(error) if api::is_gone(&error) => {
                 // The status message was deleted: stop updating it.
-                store::set_status_text(&context.state.pool, summary.id, &text, true).await?;
+                store::set_status_text(pool, summary.id, &shown, true).await?;
                 continue;
             }
             Err(error) => {
@@ -53,62 +93,187 @@ async fn refresh(context: &Context) -> Result<()> {
                 continue;
             }
         }
-        store::set_status_text(&context.state.pool, summary.id, &text, finished).await?;
-        if finished && let Some(user_message) = open.user_message_id {
-            let emoji = if summary.done > 0 { "👌" } else { "🤷" };
-            react(
-                context,
-                open.chat_id,
-                i32::try_from(user_message).unwrap_or_default(),
-                emoji,
-            )
-            .await;
+        if card {
+            update_caption(context, &open, &view, message).await?;
+        }
+        store::set_status_text(pool, summary.id, &shown, finished).await?;
+        if finished {
+            context.colours.lock().await.remove(&summary.id);
+            if let Some(user_message) = open.user_message_id {
+                let emoji = if summary.done > 0 { "👌" } else { "🤷" };
+                let user_message = i32::try_from(user_message).unwrap_or_default();
+                react(context, open.chat_id, user_message, emoji).await;
+            }
+            if matches!(summary.kind.as_str(), "album" | "playlist")
+                && summary.total >= 5
+                && summary.done > 0
+            {
+                celebrate(
+                    context,
+                    open.chat_id,
+                    message,
+                    &texts::celebrate(summary, &view),
+                )
+                .await;
+            }
         }
     }
     Ok(())
 }
 
+/// A card's caption: what the chat list, notifications and apps without
+/// widgets show. Editing it keeps the app button, which an edit would drop.
+async fn update_caption(
+    context: &Context,
+    open: &store::OpenStatus,
+    view: &texts::StatusView,
+    message: i32,
+) -> Result<()> {
+    let summary = &open.summary;
+    let caption = texts::caption(summary, view);
+    if open.card_caption.as_deref() == Some(caption.as_str()) {
+        return Ok(());
+    }
+    let mut params = json!({
+        "chat_id": open.chat_id,
+        "message_id": message,
+        "caption": caption,
+        "parse_mode": "HTML",
+    });
+    if let Some(keyboard) = app_keyboard(context, open.chat_id, summary.review > 0) {
+        params["reply_markup"] = keyboard;
+    }
+    let _: Option<Value> = context.bot.try_call("editMessageCaption", &params).await;
+    // Remembered even when it failed, so a refused edit isn't repeated every time.
+    store::set_card(&context.state.pool, summary.id, &caption).await
+}
+
+/// Edits are silent, so a finished album or playlist gets one short message
+/// that does notify, with confetti where Telegram allows it.
+async fn celebrate(context: &Context, chat: i64, status_message: i32, text: &str) {
+    let mut params = json!({
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_parameters": {"message_id": status_message, "allow_sending_without_reply": true},
+        "message_effect_id": CONFETTI,
+    });
+    match context.bot.call::<_, Value>("sendMessage", &params).await {
+        Err(error) if api::is_refusal(&error) => {
+            params
+                .as_object_mut()
+                .map(|params| params.remove("message_effect_id"));
+            let _: Option<Value> = context.bot.try_call("sendMessage", &params).await;
+        }
+        Err(error) => tracing::warn!(%error, "sending the finished note failed"),
+        Ok(_) => {}
+    }
+}
+
+/// Colours for a request's card from its first filed song's cover. Looked up
+/// once per request: the first filed song doesn't change.
+async fn colours(context: &Context, request: i64) -> Option<cards::Colours> {
+    if let Some(known) = context.colours.lock().await.get(&request) {
+        return known.clone();
+    }
+    let path = store::first_filed_song(&context.state.pool, request)
+        .await
+        .ok()
+        .flatten()?;
+    let found = tokio::task::spawn_blocking(move || cards::cover_colours(Path::new(&path)))
+        .await
+        .ok()
+        .flatten();
+    context.colours.lock().await.insert(request, found.clone());
+    found
+}
+
+/// The "Open in the app" button alone, for owners with an HTTPS address.
+pub fn app_keyboard(context: &Context, chat: i64, review: bool) -> Option<Value> {
+    let url = app_url(context, chat, review)?;
+    Some(json!({"inline_keyboard": [[super::mini_app_button(texts::OPEN_IN_APP, &url)]]}))
+}
+
+/// The Mini App for this chat: only owners may open the web page, and only
+/// over HTTPS. It opens on Review when a song there waits for them.
+fn app_url(context: &Context, chat: i64, review: bool) -> Option<String> {
+    if !context.config.owners.contains(&chat) {
+        return None;
+    }
+    let view = if review { "review" } else { "" };
+    super::mini_app_url(&context.state.config.public_url, view)
+}
+
 /// Stop while songs are waiting; Retry and Details when something failed.
-fn keyboard(summary: &store::RequestSummary, finished: bool) -> Option<Value> {
+/// While a playlist is busy the row keeps its shape: Retry and Details stay
+/// greyed out until they can do something, so buttons don't jump around.
+fn keyboard(summary: &store::RequestSummary, finished: bool, app: Option<String>) -> Option<Value> {
+    let problems = summary.failed > 0 || summary.review > 0;
     let mut row = Vec::new();
     if !finished && summary.working > 0 && summary.total > 1 {
-        row.push(json!({"text": "⏹ Stop", "callback_data": format!("stop:{}", summary.id)}));
+        row.push(Action::Stop(summary.id).button(texts::STOP));
+        row.push(Action::disabled_button(texts::RETRY_FAILED));
+        row.push(if problems {
+            Action::Details(summary.id).button(texts::DETAILS)
+        } else {
+            Action::disabled_button(texts::DETAILS)
+        });
+    } else {
+        if finished && summary.failed > 0 {
+            row.push(Action::Retry(summary.id).button(texts::RETRY_FAILED));
+        }
+        if problems {
+            row.push(Action::Details(summary.id).button(texts::DETAILS));
+        }
+        if cards::wants_file_button(summary, finished) {
+            row.push(Action::SendFile(summary.id).button(texts::SEND_FILE));
+        }
     }
-    if finished && summary.failed > 0 {
-        row.push(
-            json!({"text": "🔁 Retry failed", "callback_data": format!("retry:{}", summary.id)}),
-        );
+    let mut rows = Vec::new();
+    if !row.is_empty() {
+        rows.push(row);
     }
-    if summary.failed > 0 || summary.review > 0 {
-        row.push(json!({"text": "ℹ️ Details", "callback_data": format!("details:{}", summary.id)}));
+    if let Some(url) = app {
+        rows.push(vec![super::mini_app_button(texts::OPEN_IN_APP, &url)]);
     }
-    Some(json!({"inline_keyboard": if row.is_empty() { vec![] } else { vec![row] }}))
+    Some(json!({ "inline_keyboard": rows }))
 }
 
 /// "Which song is this?" for songs sent from Telegram that wait in review.
-/// With a Mini App the question has one button that opens the app on that song;
-/// without one (no HTTPS address) up to three candidates are offered in chat.
+/// Where the chat can show cards, it is a review card with up to three choices
+/// to tap. Otherwise owners with a Mini App get one button that opens the app
+/// on that song, and guests (who can't open the web page) and chats without an
+/// HTTPS address get up to three candidate buttons in the chat.
 async fn ask_reviews(context: &Context) -> Result<()> {
-    for question in store::unasked_reviews(&context.state.pool).await? {
+    let pool = &context.state.pool;
+    for question in store::unasked_reviews(pool).await? {
         let song = match &question.artist {
             Some(artist) => format!("{artist} – {}", question.title),
             None => question.title.clone(),
         };
-        let mut text = format!(
-            "🤔 Not sure which song this is:\n<b>{}</b>",
-            texts::escape(&song)
-        );
-        if let Some(reason) = question.reason.as_deref() {
-            text.push_str(&format!("\n<i>{}</i>", texts::escape(reason)));
-        }
-        let rows =
-            match super::mini_app_track_url(&context.state.config.public_url, question.track_id) {
-                Some(url) => {
-                    text.push_str("\n\nChoose the right one in the app.");
-                    vec![vec![super::mini_app_button("🎵 Choose in the app", &url)]]
+        let app = super::mini_app_track_url(&context.state.config.public_url, question.track_id)
+            .filter(|_| context.config.owners.contains(&question.chat_id));
+        if context.config.cards && store::cards_allowed(pool, question.chat_id).await? {
+            match send_review_card(context, &question, &song, app.as_deref()).await? {
+                super::Card::Sent(message) => {
+                    store::set_review_card(pool, question.wanted_id, message.message_id).await?;
+                    continue;
                 }
-                None => chat_choices(context, &question, &mut text).await?,
-            };
+                super::Card::Lost => {
+                    store::set_review_message(pool, question.wanted_id, 0).await?;
+                    continue;
+                }
+                super::Card::Refused => store::cards_refused(pool, question.chat_id).await?,
+            }
+        }
+        let (answer, rows) = match app {
+            Some(url) => (
+                texts::ReviewAnswer::InApp,
+                vec![vec![super::mini_app_button(texts::CHOOSE_IN_APP, &url)]],
+            ),
+            None => chat_choices(context, &question).await?,
+        };
+        let text = texts::review_question(&song, question.reason.as_deref(), &answer);
         let sent = send_with(
             context,
             question.chat_id,
@@ -119,17 +284,112 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         .await;
         // Remember the question even if sending failed, so it is not repeated forever.
         let message = sent.map_or(0, |message| message.message_id);
-        store::set_review_message(&context.state.pool, question.wanted_id, message).await?;
+        store::set_review_message(pool, question.wanted_id, message).await?;
     }
     Ok(())
+}
+
+/// A review card for one song: what the file is, why magpie-fi is unsure, and
+/// the three best choices with what supports each.
+async fn send_review_card(
+    context: &Context,
+    question: &store::ReviewQuestion,
+    song: &str,
+    app: Option<&str>,
+) -> Result<super::Card> {
+    let pool = &context.state.pool;
+    let seconds: Option<f64> = sqlx::query_scalar("SELECT duration FROM tracks WHERE id=?")
+        .bind(question.track_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    let choices: Vec<cards::ReviewChoice> = sqlx::query_as(
+        "SELECT id,coalesce(title,'') AS title,coalesce(artist,'') AS artist,album,year,score,
+           duration_delta,score_breakdown
+         FROM candidates WHERE track_id=? ORDER BY score DESC LIMIT 3",
+    )
+    .bind(question.track_id)
+    .fetch_all(pool)
+    .await?;
+    let file = cards::ReviewFile {
+        song: song.to_owned(),
+        seconds,
+        reason: question.reason.clone(),
+    };
+    let state = cards::review_state(question.track_id, &file, &choices);
+    let caption = texts::review_question(
+        song,
+        question.reason.as_deref(),
+        &texts::ReviewAnswer::InCard,
+    );
+    let mut params = json!({
+        "chat_id": question.chat_id,
+        "html": cards::REVIEW_HTML,
+        "chat_data": cards::with_revision(state, super::revision()),
+        "caption": caption,
+        "parse_mode": "HTML",
+        "allow_queries": true,
+    });
+    if let Some(url) = app {
+        params["reply_markup"] =
+            json!({"inline_keyboard": [[super::mini_app_button(texts::CHOOSE_IN_APP, url)]]});
+    }
+    Ok(super::send_widget(context, "sendWidget", params).await)
+}
+
+/// Review cards whose song was sorted out somewhere else (in the app, or in
+/// the chat's own buttons) say so, instead of offering choices that are gone.
+async fn settle_review_cards(context: &Context) -> Result<()> {
+    for card in store::settled_review_cards(&context.state.pool).await? {
+        let (state, words) = match card.status.as_str() {
+            "removed" => ("removed", texts::REVIEW_REMOVED),
+            "failed" => ("gone", texts::REVIEW_GONE),
+            _ => ("app", texts::REVIEW_DONE_IN_APP),
+        };
+        end_review_card(context, &card, state, words, None).await?;
+    }
+    Ok(())
+}
+
+/// Shows how a review card ended, and stops updating it. `app` keeps the
+/// "Choose in the app" button (when something is left to do there).
+pub async fn end_review_card(
+    context: &Context,
+    card: &store::ReviewCard,
+    state: &str,
+    words: &str,
+    app: Option<String>,
+) -> Result<()> {
+    let track = card.track_id.unwrap_or_default();
+    let outcome = cards::review_outcome(track, &card.song, state, words);
+    let data = cards::with_revision(outcome, super::revision());
+    let _: Option<Value> = context
+        .bot
+        .try_call(
+            "editMessageWidgetData",
+            &json!({"chat_id": card.chat_id, "message_id": card.message_id, "chat_data": data}),
+        )
+        .await;
+    // The caption says the same; without a keyboard the app button goes away.
+    let mut params = json!({
+        "chat_id": card.chat_id,
+        "message_id": card.message_id,
+        "caption": texts::escape(words),
+        "parse_mode": "HTML",
+    });
+    if let Some(url) = app {
+        params["reply_markup"] =
+            json!({"inline_keyboard": [[super::mini_app_button(texts::CHOOSE_IN_APP, &url)]]});
+    }
+    let _: Option<Value> = context.bot.try_call("editMessageCaption", &params).await;
+    store::close_review_card(&context.state.pool, card.wanted_id).await
 }
 
 /// Candidate buttons for chats without a Mini App.
 async fn chat_choices(
     context: &Context,
     question: &store::ReviewQuestion,
-    text: &mut String,
-) -> Result<Vec<Vec<Value>>> {
+) -> Result<(texts::ReviewAnswer, Vec<Vec<Value>>)> {
     let candidates: Vec<Choice> = sqlx::query_as(
         "SELECT id,title,artist,album,year FROM candidates WHERE track_id=?
          ORDER BY score DESC LIMIT 3",
@@ -140,22 +400,22 @@ async fn chat_choices(
     let mut rows: Vec<Vec<Value>> = candidates
         .iter()
         .map(|choice| {
-            vec![json!({
-                "text": shorten(&choice.label(), 60),
-                "callback_data": format!("pick:{}:{}", question.track_id, choice.id),
-            })]
+            let pick = Action::Pick {
+                track: question.track_id,
+                candidate: choice.id,
+            };
+            vec![pick.button(&shorten(&choice.label(), 60))]
         })
         .collect();
-    rows.push(vec![json!({
-        "text": "🗑 None of these",
-        "callback_data": format!("drop:{}", question.track_id),
-    })]);
-    text.push_str(if candidates.is_empty() {
-        "\n\nI found nothing that fits. Open Review on the web page to type it in."
+    rows.push(vec![
+        Action::Drop(question.track_id).button(texts::NONE_OF_THESE),
+    ]);
+    let answer = if candidates.is_empty() {
+        texts::ReviewAnswer::NothingFound
     } else {
-        "\n\nIs it one of these?"
-    });
-    Ok(rows)
+        texts::ReviewAnswer::InChat
+    };
+    Ok((answer, rows))
 }
 
 /// A candidate offered as an answer button.
@@ -203,12 +463,26 @@ mod tests {
             working: 2,
             ..store::RequestSummary::default()
         };
-        let busy = keyboard(&summary, false).unwrap().to_string();
-        assert!(busy.contains("stop:7") && !busy.contains("retry"));
+        // Busy: Stop works, Retry and Details are greyed out.
+        let busy = keyboard(&summary, false, None).unwrap();
+        let row = &busy["inline_keyboard"][0];
+        assert_eq!(row[0]["callback_data"], "stop:7");
+        assert_eq!(row[0]["style"], "danger");
+        assert!(row[1]["disabled"].is_object() && row[2]["disabled"].is_object());
+        // Done with a failure: Retry and Details work, Stop is gone.
         summary.working = 0;
         summary.failed = 1;
-        let done = keyboard(&summary, true).unwrap().to_string();
+        let done = keyboard(&summary, true, None).unwrap().to_string();
         assert!(done.contains("retry:7") && done.contains("details:7") && !done.contains("stop"));
+        assert!(!done.contains("disabled"));
+        // All fine, with the app: only the app button.
+        summary.failed = 0;
+        let app = keyboard(&summary, true, Some("https://m.example/".into())).unwrap();
+        assert_eq!(app["inline_keyboard"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            app["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://m.example/"
+        );
     }
 
     #[test]

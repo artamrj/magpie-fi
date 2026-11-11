@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      magpie-fi review card ("which song is this?"): a Bot API 10.4 widget. It
+      only draws the state the bot keeps in chat_data (keys: src/telegram/cards.rs)
+      and sends the bot's own button codes ("pick:12:5", "drop:12").
+      Budget: 32 KB, and 4 KB after zlib -9 (web/scripts/check-widgets.mjs).
+    -->
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      body {
+        font:
+          15px/1.35 system-ui,
+          sans-serif;
+        color: var(--tg-theme-text-color);
+      }
+      #k {
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--tg-theme-secondary-bg-color);
+      }
+      .h {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      #e {
+        flex: none;
+        width: 46px;
+        height: 46px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 24px;
+        background: var(--tg-theme-bg-color);
+      }
+      .t {
+        flex: 1;
+        min-width: 0;
+      }
+      #y,
+      .q {
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--tg-theme-hint-color);
+      }
+      #f,
+      .o b,
+      .o p {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #f {
+        font-size: 17px;
+        font-weight: 700;
+      }
+      #r,
+      .o p,
+      #m {
+        font-size: 13px;
+        color: var(--tg-theme-hint-color);
+      }
+      #r {
+        margin-top: 2px;
+        font-style: italic;
+      }
+      #o {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .o {
+        padding: 10px;
+        border-radius: 12px;
+        background: var(--tg-theme-bg-color);
+      }
+      .o .top {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+      }
+      .o b {
+        flex: 1;
+      }
+      .o .n {
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      .bar {
+        height: 4px;
+        margin: 6px 0;
+        border-radius: 2px;
+        background: var(--tg-theme-secondary-bg-color);
+      }
+      .bar i {
+        display: block;
+        height: 100%;
+        border-radius: 2px;
+        background: #f5a623;
+        transition: width 0.6s;
+      }
+      .sure .bar i {
+        background: #31b545;
+      }
+      .c {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .c span {
+        padding: 1px 8px;
+        border-radius: 99px;
+        font-size: 12px;
+        background: var(--tg-theme-secondary-bg-color);
+      }
+      .c .good {
+        color: #31b545;
+      }
+      .c .bad {
+        color: var(--tg-theme-destructive-text-color);
+      }
+      button {
+        width: 100%;
+        margin-top: 8px;
+        padding: 6px;
+        border: 0;
+        border-radius: 10px;
+        font:
+          600 14px system-ui,
+          sans-serif;
+        color: #fff;
+        background: #31b545;
+      }
+      button:active {
+        opacity: 0.6;
+      }
+      #x {
+        color: var(--tg-theme-destructive-text-color);
+        background: transparent;
+        border: 1px solid var(--tg-theme-destructive-text-color);
+      }
+      #m {
+        margin-top: 8px;
+        text-align: center;
+      }
+      .end #o,
+      .end #x {
+        display: none;
+      }
+      .end #r {
+        font-style: normal;
+        color: var(--tg-theme-text-color);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="k">
+      <div class="h">
+        <div id="e">🤔</div>
+        <div class="t">
+          <div id="y">Which song is this?</div>
+          <div id="f" dir="auto"></div>
+          <div id="r" dir="auto"></div>
+        </div>
+      </div>
+      <div id="o"></div>
+      <button id="x" onclick="ask('drop:' + S.id)">🗑 None of these</button>
+      <div id="m"></div>
+    </div>
+    <script>
+      var T = window.TelegramWidget,
+        S = {},
+        SHOWN = "";
+      var END = {
+        filed: "✅",
+        cover: "🖼",
+        removed: "🗑",
+        gone: "🤷",
+        app: "✅",
+      };
+      function $(i) {
+        return document.getElementById(i);
+      }
+      function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = text;
+        return e;
+      }
+      function time(seconds) {
+        var s = Math.round(seconds % 60);
+        return Math.floor(seconds / 60) + ":" + (s < 10 ? "0" : "") + s;
+      }
+      function draw() {
+        var s = null;
+        try {
+          s = JSON.parse(T.chatData);
+        } catch (e) {}
+        if (!s || (s.v || 0) < (S.v || 0)) return;
+        S = s;
+        var ended = s.s != "ask";
+        $("k").className = ended ? "end" : "";
+        $("e").textContent = ended ? END[s.s] || "✅" : "🤔";
+        if (s.f) $("f").textContent = s.f;
+        $("r").textContent = ended
+          ? s.m || ""
+          : [s.l ? time(s.l) : "", s.r || ""].filter(Boolean).join(" · ");
+        if (ended) {
+          $("m").textContent = "";
+          if (s.s == "filed") buzz("success");
+          return;
+        }
+        var options = JSON.stringify(s.o || []);
+        if (options == SHOWN) return;
+        SHOWN = options;
+        var list = $("o");
+        list.textContent = "";
+        if (!(s.o || []).length)
+          list.appendChild(el("p", "q", "Nothing fits. Choose in the app."));
+        (s.o || []).forEach(function (o) {
+          var card = el("div", "o" + (o[4] >= 68 ? " sure" : ""));
+          var top = el("div", "top");
+          var title = el("b", "", o[1]);
+          title.dir = "auto";
+          top.appendChild(title);
+          top.appendChild(el("span", "n", o[4]));
+          card.appendChild(top);
+          var who = el("p", "", o[2] + (o[3] ? " · " + o[3] : ""));
+          who.dir = "auto";
+          card.appendChild(who);
+          var bar = el("div", "bar"),
+            fill = el("i");
+          fill.style.width = o[4] + "%";
+          bar.appendChild(fill);
+          card.appendChild(bar);
+          var chips = el("div", "c");
+          if (o[6]) chips.appendChild(el("span", "good", "🎧 Audio match"));
+          if (o[5] != null)
+            chips.appendChild(
+              el(
+                "span",
+                o[5] <= 3 ? "good" : o[5] > 15 ? "bad" : "",
+                o[5] <= 1 ? "Same length" : "±" + o[5] + " s",
+              ),
+            );
+          if (o[7]) chips.appendChild(el("span", "", o[7]));
+          card.appendChild(chips);
+          var pick = el("button", "", "✓ This one");
+          pick.onclick = function () {
+            ask("pick:" + s.id + ":" + o[0]);
+          };
+          card.appendChild(pick);
+          list.appendChild(card);
+        });
+      }
+      function buzz(kind) {
+        try {
+          T.HapticFeedback.notificationOccurred(kind);
+        } catch (e) {}
+      }
+      // Must run straight from the tap: Telegram allows one request per tap.
+      function ask(code) {
+        $("m").textContent = "…";
+        T.request(code).then(
+          function (answer) {
+            var a = null;
+            try {
+              a = JSON.parse(answer.result);
+            } catch (e) {}
+            $("m").textContent = (a && a.m) || "";
+          },
+          function (error) {
+            $("m").textContent =
+              error.code == "NOT_ALLOWED"
+                ? "Only the person who sent this song can choose."
+                : "That didn't work. Try again.";
+            buzz("error");
+          },
+        );
+      }
+      if (T) {
+        T.onEvent("chatDataChanged", draw);
+        draw();
+        if (T.ready) T.ready();
+      }
+    </script>
+  </body>
+</html>

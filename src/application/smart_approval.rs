@@ -519,9 +519,20 @@ fn candidates_agree(left: &Candidate, right: &Candidate) -> bool {
 }
 
 pub(crate) fn has_audio_recognition(candidate: &Candidate) -> bool {
-    candidate
-        .score_breakdown
-        .as_deref()
+    breakdown_has_audio_recognition(candidate.score_breakdown.as_deref())
+}
+
+pub(crate) fn source_count(candidate: &Candidate) -> usize {
+    breakdown_sources(candidate.score_breakdown.as_deref())
+        .len()
+        .max(1)
+}
+
+/// Was the song recognised from its audio (fingerprint or SongRec)? Read from
+/// a stored candidate's `score_breakdown`, so the bot's review card shows the
+/// same support the approval rules count.
+pub(crate) fn breakdown_has_audio_recognition(score_breakdown: Option<&str>) -> bool {
+    score_breakdown
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .is_some_and(|value| {
             value["audio_recognition"].as_bool() == Some(true)
@@ -529,22 +540,22 @@ pub(crate) fn has_audio_recognition(candidate: &Candidate) -> bool {
         })
 }
 
-pub(crate) fn source_count(candidate: &Candidate) -> usize {
-    candidate
-        .score_breakdown
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|value| {
-            value["sources"].as_array().map(|sources| {
-                sources
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<HashSet<_>>()
-                    .len()
-            })
-        })
-        .unwrap_or(1)
-        .max(1)
+/// The different sources that found this match, in the order stored.
+pub(crate) fn breakdown_sources(score_breakdown: Option<&str>) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    let value = score_breakdown.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    for source in value
+        .as_ref()
+        .and_then(|value| value["sources"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !sources.iter().any(|known| known == source) {
+            sources.push(source.to_owned());
+        }
+    }
+    sources
 }
 
 fn is_album_release(candidate: &Candidate) -> bool {

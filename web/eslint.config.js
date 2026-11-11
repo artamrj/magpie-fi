@@ -15,5 +15,12 @@ export default tseslint.config(
       "react-hooks/set-state-in-effect": "off",
     },
   },
+  {
+    // Small Node scripts (no extra package for Node's globals).
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: { console: "readonly", process: "readonly", URL: "readonly" },
+    },
+  },
   prettier,
 );

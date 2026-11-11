@@ -369,7 +369,7 @@ pub async fn retry_failed(pool: &SqlitePool, request_id: i64) -> Result<u64> {
 pub async fn ask_again(pool: &SqlitePool, request_id: i64) -> Result<u64> {
     Ok(sqlx::query(
         "UPDATE wanted SET status='pending',attempts=0,not_before=NULL,error=NULL,
-           review_message_id=NULL,updated_at=?
+           review_message_id=NULL,review_card=0,updated_at=?
          WHERE request_id=? AND (status='failed' OR (status='removed' AND NOT EXISTS
            (SELECT 1 FROM wanted other
              WHERE other.request_id=wanted.request_id AND other.status!='removed')))",
@@ -516,6 +516,10 @@ pub struct OpenStatus {
     pub status_message_id: i64,
     pub user_message_id: Option<i64>,
     pub status_text: Option<String>,
+    /// "text" or "card" (a live Bot API widget).
+    pub card_kind: String,
+    /// The card's caption as last sent.
+    pub card_caption: Option<String>,
     /// "Artist – Title" of the first song.
     pub first_song: Option<String>,
     /// Songs filed now (not counting ones that were already in the library).
@@ -527,7 +531,7 @@ pub async fn open_telegram_requests(pool: &SqlitePool) -> Result<Vec<OpenStatus>
     let sql = summary_sql(
         &format!(
             ",r.chat_id,r.status_message_id,r.user_message_id,r.status_text,
-              {FIRST_SONG} AS first_song,
+              r.card_kind,r.card_caption,{FIRST_SONG} AS first_song,
               coalesce(sum(w.status='filed'),0) AS newly_filed"
         ),
         "r.chat_id IS NOT NULL AND r.status_message_id IS NOT NULL AND r.closed=0",
@@ -550,6 +554,90 @@ pub async fn set_status_text(
         .bind(request_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// The request's status message is a live card, last sent with this caption.
+pub async fn set_card(pool: &SqlitePool, request_id: i64, caption: &str) -> Result<()> {
+    sqlx::query("UPDATE requests SET card_kind='card',card_caption=? WHERE id=?")
+        .bind(caption)
+        .bind(request_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The library file of the first song this request filed, if any. Filed songs
+/// passed the cover gate, so their embedded cover is a verified one.
+pub async fn first_filed_song(pool: &SqlitePool, request_id: i64) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT library_path FROM wanted
+         WHERE request_id=? AND status='filed' AND library_path IS NOT NULL
+         ORDER BY position LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The library file of the request's first song that is in the library
+/// (filed now, or already there).
+pub async fn first_library_song(pool: &SqlitePool, request_id: i64) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT library_path FROM wanted
+         WHERE request_id=? AND status IN ('filed','in_library') AND library_path IS NOT NULL
+         ORDER BY position LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// May this chat get cards now? Not while an earlier refusal is fresh.
+pub async fn cards_allowed(pool: &SqlitePool, chat_id: i64) -> Result<bool> {
+    let until: Option<String> =
+        sqlx::query_scalar("SELECT cards_off_until FROM telegram_chats WHERE chat_id=?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    Ok(until.is_none_or(|until| until.as_str() <= now().as_str()))
+}
+
+/// Telegram refused a card in this chat: use text for a day.
+pub async fn cards_refused(pool: &SqlitePool, chat_id: i64) -> Result<()> {
+    let until = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO telegram_chats(chat_id,cards_off_until) VALUES(?,?)
+         ON CONFLICT(chat_id) DO UPDATE SET cards_off_until=excluded.cards_off_until",
+    )
+    .bind(chat_id)
+    .bind(until)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The library card pinned in this chat, if any.
+pub async fn library_message(pool: &SqlitePool, chat_id: i64) -> Result<Option<i32>> {
+    Ok(
+        sqlx::query_scalar("SELECT library_message_id FROM telegram_chats WHERE chat_id=?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
+pub async fn set_library_message(pool: &SqlitePool, chat_id: i64, message_id: i32) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO telegram_chats(chat_id,library_message_id) VALUES(?,?)
+         ON CONFLICT(chat_id) DO UPDATE SET library_message_id=excluded.library_message_id",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -596,6 +684,66 @@ pub async fn set_review_message(pool: &SqlitePool, wanted_id: i64, message_id: i
 }
 
 /// Who asked for the song in this review track, and in which chat.
+/// A review question sent as a card, still waiting for a choice.
+pub async fn set_review_card(pool: &SqlitePool, wanted_id: i64, message_id: i32) -> Result<()> {
+    sqlx::query("UPDATE wanted SET review_message_id=?,review_card=1 WHERE id=?")
+        .bind(message_id)
+        .bind(wanted_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Where a song's review card is: (wanted ID, chat, message, still waiting).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReviewCard {
+    pub wanted_id: i64,
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub track_id: Option<i64>,
+    /// The song's status now ("filed", "removed", "identifying", …).
+    pub status: String,
+    /// "Artist – Title", as the card showed it.
+    pub song: String,
+}
+
+const REVIEW_CARD: &str = "SELECT w.id AS wanted_id,r.chat_id,w.review_message_id AS message_id,
+       t.id AS track_id,w.status,
+       CASE WHEN w.artist IS NULL THEN w.title ELSE w.artist||' – '||w.title END AS song
+     FROM wanted w JOIN requests r ON r.id=w.request_id
+     LEFT JOIN tracks t ON t.path=w.staging_path";
+
+/// The open review card for a Review song, if it was asked about with one.
+pub async fn review_card_of_track(pool: &SqlitePool, track_id: i64) -> Result<Option<ReviewCard>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{REVIEW_CARD} WHERE t.id=? AND w.review_card=1 AND r.chat_id IS NOT NULL
+           AND w.review_message_id>0 LIMIT 1"
+    )))
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Open review cards whose song left Review some other way (chosen or removed
+/// in the app, or filed by itself), so the card can say so.
+pub async fn settled_review_cards(pool: &SqlitePool) -> Result<Vec<ReviewCard>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{REVIEW_CARD} WHERE w.review_card=1 AND r.chat_id IS NOT NULL AND w.review_message_id>0
+           AND (w.status<>'identifying' OR t.id IS NULL OR t.stage<>'review')"
+    )))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The review card now shows its outcome and is not updated again.
+pub async fn close_review_card(pool: &SqlitePool, wanted_id: i64) -> Result<()> {
+    sqlx::query("UPDATE wanted SET review_card=2 WHERE id=?")
+        .bind(wanted_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn requester_of_track(pool: &SqlitePool, track_id: i64) -> Result<Option<(i64, String)>> {
     Ok(sqlx::query_as(
         "SELECT r.id,coalesce(r.requested_by,'') FROM tracks t

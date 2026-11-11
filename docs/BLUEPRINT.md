@@ -196,12 +196,32 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   1360 px (a 15–16" laptop or a desktop screen) the song also puts the release list and "what
   changes in your file" next to each other, so both are in view without scrolling.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
-  bot's menu button or "📱 Open review" (`?view=review`).
-- The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
-  Details buttons; "Not sure which song this is" questions with one button that opens the Mini
-  App on that song (up to three candidate buttons in chat only when there is no HTTPS address);
-  `/start`,
-  `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`.
+  bot's menu button, "📱 Open magpie-fi" on `/start`, or "🎵 Open in the app" on a status message
+  (`?view=review` when a song waits there). Only owners get these buttons; guests can't open the page.
+- The bot: one live **card** per request (a Bot API 10.4 widget): a progress ring, one dot per
+  song, the song being worked on, cover colours, and Stop / Retry failed / Details inside the card.
+  It updates silently; a finished album or playlist of 5+ songs gets one 🎉 message. Where
+  Telegram can't show cards (or with `MAGPIE_TELEGRAM_CARDS=false`) it is a text status message
+  instead, edited as songs arrive, with Stop / Retry failed / Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
+  out so the row doesn't jump). Details is an ephemeral answer, seen only by whoever pressed it.
+  "Not sure which song this is" questions are **review cards**: the file, why magpie-fi is unsure,
+  and up to three choices, each with its score, length difference, "Audio match" and the sources
+  that found it, a "This one" button, and "None of these". A tap uses the same choose/remove
+  logic as the web page; the card then shows how it ended, also when the song was sorted out in
+  the app. Owners also get "Choose in the app" below it. Without cards, owners get one button that
+  opens the Mini App on that song; guests, and chats without an HTTPS address, get up to three
+  candidate buttons (green) and "None of these" (red) in the chat.
+- A finished single song offers **📲 Send me the file**: the filed song is sent into the chat
+  (`sendAudio`, with title, artist, length and cover thumbnail) so it plays in Telegram. The file is
+  only read, only from inside `library/`, and only up to Telegram's 50 MB limit for bots; a bigger
+  file gets a clear answer. Guests can do this only for their own requests.
+- `/library` (owners) shows one shared **library card**, pinned quietly: songs, artists, hours of
+  music, the last songs magpie-fi filed, what's on the way, what waits in Review, and health. Every
+  copy in every owner's chat updates at once when the numbers change.
+- Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/library`, `/guests`, `/web`. `/start`, `/help`
+  and `/guests` are rich messages (headings, tables, an expandable "How it works"); `/queue`,
+  `/health` and `/id` answer ephemerally when Telegram sends them as ephemeral commands. If
+  Telegram refuses a rich or ephemeral message, the bot sends the plain text to the chat instead.
 
 ### 3.5 The image and deployment
 
@@ -431,7 +451,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 | Songs on their way | `tracks` (deleted once filed), `candidates`, `artwork_overrides`, `automatic_scan_files` |
 | The library | `library_items` (permanent index), `canonical_names` |
 | Getting music | `requests`, `wanted` (the download queue, with retries after 30 s, 2 min, 10 min), `playlists` |
-| Telegram and login | `telegram_guests`, `telegram_invites`, `telegram_state`, `login_links`, `sessions` |
+| Telegram and login | `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats`, `login_links`, `sessions` |
 | Caches | `provider_cache`, `fingerprint_cache`, `integrity_cache`, `content_hash_cache` |
 | Bookkeeping | `maintenance` |
 
@@ -470,7 +490,7 @@ change it. Worker counts are fixed in `src/config.rs`.
 |---|---|---|
 | 1 | One language or two? | **One Rust program, one image.** The Python bot was ported and deleted: one queue, one database, one set of tests. |
 | 2 | Navidrome in the stack? | **No.** First planned as part of `compose.yaml` with API calls (scan, search, share links); dropped: the file watcher is enough, and users already run Navidrome their own way. |
-| 3 | Telegram library | **`frankenstein` for types only**, requests through magpie-fi's own HTTP client (one reqwest version), own small router. |
+| 3 | Telegram library | **No library.** Our own Bot API types (`src/telegram/types.rs`, only the fields in use), requests through magpie-fi's own HTTP client (one reqwest version), own small router. `frankenstein` was dropped in Nov 2026: it did not know Bot API 10.x (widgets, rich messages, ephemeral replies, button styles). |
 | 4 | Self-hosted Bot API server for files over 20 MB? | **No.** One more container and Telegram app keys for little gain; the bot explains the limit. |
 | 5 | Base image | **Debian trixie slim**, because yt-dlp and Deno need glibc. |
 | 6 | Where settings live | **Environment only.** One place to look; the page shows, doesn't edit. |
@@ -523,7 +543,8 @@ change it. Worker counts are fixed in `src/config.rs`.
 - **Discovery:** weekly "New for you" from ListenBrainz/Last.fm listening, missing songs fetched,
   a note on Telegram.
 - **Play links:** "▶ Play" buttons and guest share links (needs Navidrome's own public address).
-- **"📲 Send me the file"** from the library into Telegram's player.
+- **"📲 Send me the file"** from the library into Telegram's player: ✅ built in the bot for a
+  finished single song (see §3.4); a button in the web page is still to do.
 - **Sonic radio** through a Navidrome plugin (e.g. AudioMuse-AI) — on Navidrome's side.
 - **More tags:** original release date, album version (Deluxe, Remaster) to keep editions apart,
   sort names for Persian artists, word-synced `.elrc` lyrics when LRCLIB has them.
