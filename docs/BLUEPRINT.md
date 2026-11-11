@@ -46,7 +46,9 @@ verified covers, *wi-fi* because it lives on your own network.
 
 **Non-goals:** not a Navidrome fork, plugin or API client; not a public multi-tenant service (one
 household and a few guests); no DRM circumvention (Spotify, Apple Music and Deezer links are read
-only for the song list, the audio comes from YouTube); not Lidarr (no "monitor every album").
+only for the song list, the audio comes from YouTube; the one exception is a free Radio Javan
+podcast episode, which Radio Javan serves as a public MP3 without DRM and is downloaded from
+there, while Premium-only episodes are refused); not Lidarr (no "monitor every album").
 
 ---
 
@@ -194,9 +196,13 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   Telegram can't show cards (or with `MAGPIE_TELEGRAM_CARDS=false`) it is a text status message
   instead, edited as songs arrive, with Stop / Retry failed / Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
   out so the row doesn't jump). Details is an ephemeral answer, seen only by whoever pressed it.
-  "Not sure which song this is" questions have one button that opens the Mini App on that song for
-  owners; guests, and chats without an HTTPS address, get up to three candidate buttons (green)
-  and "None of these" (red) in the chat.
+  "Not sure which song this is" questions are **review cards**: the file, why magpie-fi is unsure,
+  and up to three choices, each with its score, length difference, "Audio match" and the sources
+  that found it, a "This one" button, and "None of these". A tap uses the same choose/remove
+  logic as the web page; the card then shows how it ended, also when the song was sorted out in
+  the app. Owners also get "Choose in the app" below it. Without cards, owners get one button that
+  opens the Mini App on that song; guests, and chats without an HTTPS address, get up to three
+  candidate buttons (green) and "None of these" (red) in the chat.
 - Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`. `/start`, `/help`
   and `/guests` are rich messages (headings, tables, an expandable "How it works"); `/queue`,
   `/health` and `/id` answer ephemerally when Telegram sends them as ephemeral commands. If
@@ -230,7 +236,8 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
 - **Only free sources, cheap first.** AcoustID (by fingerprint) and MusicBrainz; YouTube (video
   ID in the filename); Apple Music, Deezer and the Persian catalogs Radio Javan, Audiomack and
   Navahang; Genius; SongRec (Shazam) for audio recognition when nothing else matched or the text
-  sources could not decide; SoundCloud,
+  sources could not decide, never on a file longer than 20 minutes (Shazam hears a slice, so
+  on a DJ mix it names one song in it); SoundCloud,
   Discogs and Last.fm. Sources that need a (free) key are off without it. Cover Art Archive
   supplies covers, Wikidata artist genres, LRCLIB lyrics.
 - **Smart approval.** Every candidate gets a weighted score (title, artist, length, album,
@@ -255,6 +262,10 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   singer is put back first. A single's album artist follows. Such a match is also not an exact
   artist match: it is filed on its own only with the audio or a second source agreeing. Review
   shows "Lists X first" or "Leaves out X" on such a match.
+- **DJ mixes are podcast episodes.** Radio Javan lists DJ mixes as podcasts. A podcast
+  episode is filed as one track of its show: "Dor Dor 8 (Old School)" by Deejay Al is track 8
+  of the album "Dor Dor", release type broadcast with the "dj-mix" secondary type, as
+  MusicBrainz files mixes. A file of such a mix is found by its tags and length.
 - **A stage name alone is the same person.** Sources spell singers shorter: Shazam gives "MJ
   feat. Tataloo & Orchid" and Deezer "MJ" for a file tagged "Amir Tataloo feat. Sohrab MJ &
   Orchid". A name that is the end of another one ("Tataloo" of "Amir Tataloo") is that person;

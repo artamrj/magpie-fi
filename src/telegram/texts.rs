@@ -411,6 +411,27 @@ pub fn details(songs: &[WantedView]) -> Rich {
 // ── Review questions ────────────────────────────────────────────────────────
 
 pub const CHOOSE_IN_APP: &str = "🎵 Choose in the app";
+pub const SAVING_CHOICE: &str = "Saving your choice…";
+pub const REVIEW_DONE_IN_APP: &str = "Sorted out in the app. 🐦";
+pub const REVIEW_REMOVED: &str = "🗑 Removed. It won't be added.";
+pub const REVIEW_GONE: &str = "This song is no longer waiting in Review.";
+
+/// A source's name as people know it (stored names are sometimes IDs).
+pub fn source_name(source: &str) -> String {
+    match source {
+        "musicbrainz" => "MusicBrainz",
+        "deezer" => "Deezer",
+        "itunes" => "iTunes",
+        "discogs" => "Discogs",
+        "lastfm" => "Last.fm",
+        "songrec" => "SongRec / Shazam",
+        "youtube" => "YouTube",
+        "soundcloud" => "SoundCloud",
+        "acoustid" => "AcoustID",
+        other => other,
+    }
+    .to_owned()
+}
 pub const NONE_OF_THESE: &str = "🗑 None of these";
 
 /// How a review question can be answered.
@@ -421,6 +442,8 @@ pub enum ReviewAnswer {
     InChat,
     /// Nothing fits; only the web page can help.
     NothingFound,
+    /// On a review card, which shows the choices itself.
+    InCard,
 }
 
 /// "🤔 Not sure which song this is" for a song waiting in Review.
@@ -432,6 +455,7 @@ pub fn review_question(song: &str, reason: Option<&str>, answer: &ReviewAnswer) 
     text.push_str(match answer {
         ReviewAnswer::InApp => "\n\nChoose the right one in the app.",
         ReviewAnswer::InChat => "\n\nIs it one of these?",
+        ReviewAnswer::InCard => "",
         ReviewAnswer::NothingFound => {
             "\n\nI found nothing that fits. Open Review on the web page to type it in."
         }

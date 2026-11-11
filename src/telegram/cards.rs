@@ -21,6 +21,9 @@ use std::path::Path;
 /// The request card's code, sent once per request.
 pub const REQUEST_HTML: &str = include_str!("widgets/request.html");
 
+/// The review card's code ("which song is this?"), sent once per song in Review.
+pub const REVIEW_HTML: &str = include_str!("widgets/review.html");
+
 /// Telegram's limit for a widget's state and for an answer to a tap.
 pub const MAX_DATA: usize = 1024;
 
@@ -193,6 +196,121 @@ pub fn details_answer(songs: &[WantedView]) -> String {
     }
 }
 
+// ── Review cards ────────────────────────────────────────────────────────────
+//
+// State keys: `id` track ID; `s` "ask", or how it ended: "filed", "cover"
+// (chosen, but finish in the app), "removed", "gone" (no longer in Review),
+// "app" (sorted out in the app); `f` the file as "Artist – Title"; `l` its
+// length in seconds; `r` why magpie-fi is unsure; `m` the outcome's words;
+// `o` up to three choices, each [candidate ID, title, artist, "album · year",
+// score 0-100, length difference in seconds or null, 1 if recognised from the
+// audio, "the sources that found it"].
+
+/// One possible match offered on a review card.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReviewChoice {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub year: Option<String>,
+    pub score: f64,
+    pub duration_delta: Option<f64>,
+    pub score_breakdown: Option<String>,
+}
+
+/// What the review card says about the file itself.
+#[derive(Debug, Default)]
+pub struct ReviewFile {
+    pub song: String,
+    pub seconds: Option<f64>,
+    pub reason: Option<String>,
+}
+
+pub fn review_state(track: i64, file: &ReviewFile, choices: &[ReviewChoice]) -> Value {
+    let options: Vec<Value> = choices
+        .iter()
+        .take(3)
+        .map(|choice| {
+            let mut release = choice
+                .album
+                .clone()
+                .filter(|album| !album.trim().is_empty());
+            if let Some(year) = choice.year.as_deref().and_then(|year| year.get(..4)) {
+                release = Some(match release {
+                    Some(album) => format!("{album} · {year}"),
+                    None => year.to_owned(),
+                });
+            }
+            let support = crate::application::smart_approval::breakdown_sources(
+                choice.score_breakdown.as_deref(),
+            );
+            let audio = crate::application::smart_approval::breakdown_has_audio_recognition(
+                choice.score_breakdown.as_deref(),
+            );
+            json!([
+                choice.id,
+                choice.title,
+                choice.artist,
+                release.unwrap_or_default(),
+                choice.score.clamp(0.0, 100.0).round() as i64,
+                choice.duration_delta.map(|delta| delta.round() as i64),
+                i64::from(audio),
+                support
+                    .iter()
+                    .map(|source| texts::source_name(source))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ])
+        })
+        .collect();
+    let mut card = json!({"id": track, "s": "ask", "f": file.song, "o": options});
+    if let Some(seconds) = file.seconds.filter(|seconds| *seconds > 0.0) {
+        card["l"] = json!(seconds.round() as i64);
+    }
+    if let Some(reason) = &file.reason {
+        card["r"] = json!(reason);
+    }
+    fit_review(card)
+}
+
+/// How a review card ended: `state` is one of the outcome states above. The
+/// card shows its own icon, so a leading emoji in `words` is left out.
+pub fn review_outcome(track: i64, song: &str, state: &str, words: &str) -> Value {
+    let words = words.trim_start_matches(|letter: char| !letter.is_alphanumeric());
+    json!({"id": track, "s": state, "f": shorten(song, 120), "m": shorten(words, 300)})
+}
+
+/// Shortens the names, then drops the last choices, until the state fits.
+fn fit_review(mut card: Value) -> Value {
+    for limit in [80, 48, 28] {
+        if with_revision(card.clone(), i64::MAX).len() <= MAX_DATA {
+            return card;
+        }
+        for key in ["f", "r"] {
+            if let Some(text) = card[key].as_str() {
+                card[key] = json!(shorten(text, limit));
+            }
+        }
+        for option in card["o"].as_array_mut().into_iter().flatten() {
+            for index in [1, 2, 3, 7] {
+                if let Some(text) = option[index].as_str() {
+                    option[index] = json!(shorten(text, limit));
+                }
+            }
+        }
+    }
+    while with_revision(card.clone(), i64::MAX).len() > MAX_DATA {
+        match card["o"].as_array_mut() {
+            Some(options) if !options.is_empty() => {
+                options.pop();
+            }
+            _ => break,
+        }
+    }
+    card
+}
+
 /// Three colours for the card from a song's embedded cover: the top-left, the
 /// middle and the bottom-right of the picture, darkened when very light so
 /// white text stays readable. `None` when the file has no valid cover.
@@ -359,8 +477,84 @@ mod tests {
         assert!(colours_of(b"not an image").is_none());
     }
 
+    fn choice(id: i64, title: &str, breakdown: serde_json::Value) -> ReviewChoice {
+        ReviewChoice {
+            id,
+            title: title.into(),
+            artist: "Daft Punk".into(),
+            album: Some("Discovery".into()),
+            year: Some("2001-03-12".into()),
+            score: 104.6,
+            duration_delta: Some(2.4),
+            score_breakdown: Some(breakdown.to_string()),
+        }
+    }
+
+    #[test]
+    fn review_cards_show_what_supports_each_choice() {
+        let file = ReviewFile {
+            song: "Daft Punk – One More Time".into(),
+            seconds: Some(320.4),
+            reason: Some("Two songs fit".into()),
+        };
+        let choices = [
+            choice(
+                5,
+                "One More Time",
+                json!({"audio_recognition": true, "sources": ["SongRec / Shazam", "deezer", "deezer"]}),
+            ),
+            choice(
+                6,
+                "One More Time (Radio Edit)",
+                json!({"sources": ["itunes"]}),
+            ),
+        ];
+        let state = review_state(12, &file, &choices);
+        assert_eq!(
+            (state["s"].as_str(), state["l"].as_i64()),
+            (Some("ask"), Some(320))
+        );
+        assert_eq!(
+            state["o"][0],
+            json!([
+                5,
+                "One More Time",
+                "Daft Punk",
+                "Discovery · 2001",
+                100,
+                2,
+                1,
+                "SongRec / Shazam · Deezer"
+            ])
+        );
+        assert_eq!(state["o"][1][6], 0);
+        assert_eq!(state["o"][1][7], "iTunes");
+        let ended = review_outcome(12, "Daft Punk – One More Time", "filed", texts::PICKED);
+        assert_eq!(ended["s"], "filed");
+        assert_eq!(ended["m"], "Got it. Filing it now.");
+        assert_eq!(ended["f"], "Daft Punk – One More Time");
+    }
+
+    #[test]
+    fn long_review_cards_still_fit() {
+        let long = "Une chanson avec un titre vraiment beaucoup trop long ".repeat(8);
+        let file = ReviewFile {
+            song: long.clone(),
+            seconds: None,
+            reason: Some(long.clone()),
+        };
+        let choices: Vec<ReviewChoice> = (0..3)
+            .map(|id| choice(id, &long, json!({"sources": [long.clone(), long.clone()]})))
+            .collect();
+        let sent = with_revision(review_state(1, &file, &choices), i64::MAX);
+        assert!(sent.len() <= MAX_DATA, "{} bytes", sent.len());
+        let sent: Value = serde_json::from_str(&sent).unwrap();
+        assert!(!sent["o"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn the_card_code_is_within_telegram_limits() {
+        assert!(REVIEW_HTML.len() <= 32768 && !REVIEW_HTML.contains('\0'));
         // The compressed limit (4096 bytes) is checked by web/scripts/check-widgets.mjs.
         assert!(REQUEST_HTML.len() <= 32768);
         assert!(!REQUEST_HTML.contains('\0'));

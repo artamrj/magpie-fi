@@ -65,7 +65,7 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
 | `requests` | One row per link someone asked for; its Telegram status message: id, `card_kind` (`card` or `text`) and the card's last caption |
-| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
+| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path; its Telegram review question (`review_message_id`, `review_card`: 0 text or none, 1 card waiting for a choice, 2 card showing how it ended) |
 | `playlists` | One row per playlist link → one `.m3u8` file |
 | `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats` | Invited guests, one-time invite tokens, the update offset, chats whose Telegram refused a card (text until `cards_off_until`) |
 | `login_links`, `sessions` | Web login: one-time links and 30-day sessions (SHA-256 hashes only) |
@@ -158,9 +158,10 @@ In Review you can:
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
 
-The Telegram bot asks about Telegram songs in Review: owners get a button that opens the Mini
-App on that song; guests and chats without HTTPS get up to three candidates in the chat, which
-call the same choose/remove logic.
+The Telegram bot asks about Telegram songs in Review with a review card (up to three choices to
+tap, with score, length difference, audio match and sources). Without cards, owners get a button
+that opens the Mini App on that song; guests and chats without HTTPS get up to three candidate
+buttons in the chat. All of them call the same choose/remove logic.
 
 ### Phase 4 — File into the library
 
@@ -194,11 +195,12 @@ step now. `src/application/apply.rs`:
 
 | Part | File | Job |
 |---|---|---|
-| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube; Shazam `/song/<n>/` links through the iTunes Lookup API (the number is the Apple Music ID; Shazam's pages refuse automated requests), the Shazam page only as a fallback. Only public pages and documented APIs. |
+| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube; Shazam `/song/<n>/` links through the iTunes Lookup API (the number is the Apple Music ID; Shazam's pages refuse automated requests), the Shazam page only as a fallback; Radio Javan `/podcast/<slug>` links through Radio Javan's public API (one episode; Premium-only episodes are refused). Only public pages and documented APIs. |
 | Queue | `store.rs` | `requests`, `wanted`, `playlists`. Retries after 30 s, 2 min, 10 min; then failed. A request's `title` falls back to its first song. |
 | Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first, ordinary videos only as a strict fallback. |
 | yt-dlp | `ytdlp.rs` | YouTube Music search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
 | Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie-fi/staging/` → write the link's title/artist/album/ISRC as tags. |
+| Podcasts | `podcast.rs` | A Radio Javan podcast episode is downloaded from Radio Javan's own MP3 (free, no DRM, stored as sent) with the shared client and a 30-minute limit for that request, at most 1 GB, into `staging/.part/` first. Not from YouTube: a one-hour mix is rarely there in one piece. |
 
 Downloads are then identified and filed by the normal inbox cycle. When a download is filed, or
 found to be in the library already, `acquire::downloaded_file_done` records the library path and
@@ -214,7 +216,7 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 | Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
 | Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
 | Buttons | `actions.rs` | One `Action` type for every button and card tap (`widget_query`, answered with `answerWidgetQuery` within 15 s): its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
-| Cards | `cards.rs`, `widgets/request.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. |
+| Cards | `cards.rs`, `widgets/request.html`, `widgets/review.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. Review cards (`review.html`) show a song in Review and up to three choices; their badges come from the same rules as smart approval (`breakdown_has_audio_recognition`, `breakdown_sources`). A pick is answered at once (choosing can take longer than the 15 s a card waits) and the card then shows how it ended. Review cards whose song was sorted out in the app are updated by the status loop. |
 | Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message (card state with `editMessageWidgetData` and its caption, or text) only when what it shows changed, closes it when nothing is left, and asks about songs waiting in Review. A finished album or playlist of 5+ songs gets one short 🎉 message, because edits don't notify. |
 | Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. Rich messages carry their plain text too, for the fallback. The command list (`COMMANDS`) marks `/queue`, `/health` and `/id` as `is_ephemeral`. |
 
@@ -392,12 +394,16 @@ cheap and free ones first:
 3. **MusicBrainz** text search.
 4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack** (an upload site),
    **Navahang** — free
-   catalogs, good for Persian and international music.
+   catalogs, good for Persian and international music. Radio Javan's search also returns
+   podcast episodes (DJ mixes): artist = the DJ, album = the show, track = the episode
+   number, release type `broadcast` with secondary type `dj-mix`.
 5. **Genius**, only when the results still lack details.
 6. **Deezer by ISRC** (`track/isrc:…`, free), when the file has an ISRC tag and no source
    returned that code yet. Finds songs whose names are spelled differently in the catalogs.
 7. **SongRec** (Shazam recognition), when AcoustID found nothing and no candidate scores ≥ 90,
    or on the second pass when the text sources could not decide (§9); at most two at a time.
+   Never for a file longer than 20 minutes (`scan::providers::is_long_mix`): Shazam hears a
+   slice, so on a DJ mix it names one song in it.
    Its artist/title is fed back through the catalogs of step 3–5.
 8. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
    service is used.

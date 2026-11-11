@@ -259,6 +259,41 @@ pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
 
 // ── Small helpers ───────────────────────────────────────────────────────────
 
+/// How sending a card (a widget) went.
+pub enum Card {
+    Sent(i32),
+    /// Telegram said no: use text in this chat for a while.
+    Refused,
+    /// Unknown: it may have arrived, so nothing else is sent.
+    Lost,
+}
+
+/// Sends a widget. If Telegram refuses it with a Mini App button below, it is
+/// tried once without, since widgets are new and the rules may differ.
+async fn send_widget(context: &Context, mut params: Value) -> Card {
+    loop {
+        match context.bot.call::<_, Message>("sendWidget", &params).await {
+            Ok(sent) => return Card::Sent(sent.message_id),
+            Err(error) if api::is_refusal(&error) => {
+                let dropped = params
+                    .as_object_mut()
+                    .and_then(|params| params.remove("reply_markup"))
+                    .is_some();
+                if dropped {
+                    tracing::info!(%error, "Telegram refused a card with an app button; trying without");
+                    continue;
+                }
+                tracing::info!(%error, "Telegram refused a card; using text in this chat for a day");
+                return Card::Refused;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "sending a card failed");
+                return Card::Lost;
+            }
+        }
+    }
+}
+
 /// A card state's revision: the card ignores states older than the one it shows.
 fn revision() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -1380,5 +1415,118 @@ mod tests {
             .filter(|params| params.to_string().contains("🎉"))
             .count();
         assert_eq!(parties, 1);
+    }
+
+    #[tokio::test]
+    async fn review_questions_become_cards_to_tap() {
+        let (directory, fake, state) = start_cards().await;
+        let (track, candidate) = song_in_review(&directory, &state, OWNER).await;
+
+        let card = wait_for(&fake, "sendWidget", "review card").await;
+        assert!(
+            card["caption"]
+                .as_str()
+                .unwrap()
+                .contains("Not sure which song")
+        );
+        assert_eq!(card["allow_queries"], true);
+        let choices = card_state(&card);
+        assert_eq!(choices["s"], "ask");
+        assert_eq!(choices["r"], "Two songs fit");
+        assert_eq!(choices["o"][0][0], candidate);
+        assert_eq!(choices["o"][0][1], "Song");
+        assert!(
+            card["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("track={track}"))
+        );
+        // No text question as well.
+        assert!(
+            !fake
+                .calls("sendMessage")
+                .iter()
+                .any(|params| params.to_string().contains("Not sure which song"))
+        );
+    }
+
+    #[tokio::test]
+    async fn review_card_taps_choose_or_remove() {
+        let (directory, fake, state) = start_cards().await;
+        sqlx::query(
+            "INSERT INTO telegram_guests(user_id,name,invited_by,created_at) VALUES(?,?,?,?)",
+        )
+        .bind(FRIEND as i64)
+        .bind("Friend")
+        .bind(OWNER as i64)
+        .bind("now")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let (track, candidate) = song_in_review(&directory, &state, FRIEND).await;
+        let card = wait_for(&fake, "sendWidget", "review card").await;
+        // Guests can't open the web page, so their card has no app button.
+        assert!(card.get("reply_markup").is_none());
+
+        // Someone else can't choose for the guest.
+        fake.push(card_tap(1, 300, &format!("pick:{track}:{candidate}")));
+        let refused = wait_for(&fake, "answerWidgetQuery", "w1").await;
+        assert!(
+            refused["data"]
+                .as_str()
+                .unwrap()
+                .contains(texts::NOT_ALLOWED)
+        );
+
+        // The guest picks: the card answers at once, then shows the outcome.
+        // (A choice that no longer exists, so the test stays off the network:
+        // a real choice looks up missing details online.) The card says the
+        // song is gone instead of hanging.
+        fake.push(card_tap(2, FRIEND, &format!("pick:{track}:999999")));
+        let answer = wait_for(&fake, "answerWidgetQuery", "w2").await;
+        assert!(
+            answer["data"]
+                .as_str()
+                .unwrap()
+                .contains(texts::SAVING_CHOICE)
+        );
+        let ended = wait_for(&fake, "editMessageWidgetData", r#"\"s\":\"gone\""#).await;
+        assert_eq!(card_state(&ended)["id"], track);
+        let caption = wait_for(&fake, "editMessageCaption", "no longer available").await;
+        assert!(caption.get("reply_markup").is_none());
+        let closed: i64 = sqlx::query_scalar("SELECT review_card FROM wanted LIMIT 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(closed, 2);
+    }
+
+    #[tokio::test]
+    async fn review_cards_follow_choices_made_in_the_app() {
+        let (directory, fake, state) = start_cards().await;
+        song_in_review(&directory, &state, OWNER).await;
+        wait_for(&fake, "sendWidget", "review card").await;
+
+        // The owner removes the song on the web page.
+        sqlx::query("UPDATE wanted SET status='removed'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let ended = wait_for(&fake, "editMessageWidgetData", r#"\"s\":\"removed\""#).await;
+        assert!(
+            card_state(&ended)["m"]
+                .as_str()
+                .unwrap()
+                .contains("Removed")
+        );
+        wait_for(&fake, "editMessageCaption", "Removed").await;
+        // Only once.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let edits = fake
+            .calls("editMessageWidgetData")
+            .iter()
+            .filter(|params| params.to_string().contains("removed"))
+            .count();
+        assert_eq!(edits, 1);
     }
 }
