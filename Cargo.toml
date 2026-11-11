@@ -3,7 +3,7 @@ name = "magpie-fi"
 version = "0.10.0"
 edition = "2024"
 license = "MIT"
-description = "Your own music service: identifies, tags and files every song for Navidrome"
+description = "Turns any music link or file into a clean, tagged music library that you own"
 repository = "https://github.com/artamrj/magpie-fi"
 
 [[bin]]

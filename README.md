@@ -2,7 +2,7 @@
 
 # 🐦 magpie-fi
 
-**Your own music service. Send a link, get a clean library.**
+**Turn any music link or file into a clean, tagged music library that you own.**
 
 [![CI](https://github.com/artamrj/magpie-fi/actions/workflows/magpie-fi.yml/badge.svg)](https://github.com/artamrj/magpie-fi/actions/workflows/magpie-fi.yml)
 [![Release](https://img.shields.io/github/v/release/artamrj/magpie-fi)](https://github.com/artamrj/magpie-fi/releases)
@@ -13,10 +13,23 @@
 
 </div>
 
-Send a Spotify, Apple Music, Deezer, YouTube or Shazam link to your Telegram bot, paste it in
-the web page, or drop files into a folder. magpie-fi gets the songs, finds out what they are,
-fixes their tags, cover, lyrics and loudness, and files them into a tidy library.
-[Navidrome](https://www.navidrome.org) plays that library on every device. No subscription.
+## The goal
+
+**One job: every song you want ends up as one correct file in one tidy folder.**
+
+You send a Spotify, Apple Music, Deezer, YouTube or Shazam link to your Telegram bot, paste it
+in the web page, or drop files into a folder. magpie-fi then does the work that people do by
+hand for hours:
+
+1. **Gets the song** as an audio file.
+2. **Finds out what it really is**, by listening to it and by checking free music catalogs.
+3. **Fixes the file**: right title, artists, album, cover, lyrics and loudness.
+4. **Files it** as `Artist/Album (Year)/01 - Title.ext`, once, without duplicates.
+
+The result is a plain folder of music files. Nothing is locked in: any music server or player
+that reads a folder can play it, for example [Navidrome](https://www.navidrome.org),
+[Jellyfin](https://jellyfin.org), [Plex](https://www.plex.tv), Emby, Lyrion or a phone app.
+No subscription.
 
 It is made for one household: you and a few guests.
 
@@ -30,7 +43,7 @@ It is made for one household: you and a few guests.
 | **Files it once** | `Artist/Album (Year)/01 - Title.ext`. Duplicates are found by proof (same audio, ISRC or MusicBrainz ID), never by title alone. |
 | **Asks when unsure** | A sure match is filed on its own. Everything else waits in **Review** until you pick. A wrong guess never enters the library silently. |
 | **Keeps your files safe** | Nothing is overwritten. Originals go to a trash folder for 30 days. Lossy audio is never re-encoded. |
-| **Playlists** | A playlist link also becomes an `.m3u8` playlist that Navidrome imports. |
+| **Playlists** | A playlist link also becomes an `.m3u8` playlist that music servers can import. |
 
 ## How it works
 
@@ -44,7 +57,7 @@ flowchart LR
     I -->|unsure| R["Review<br/>you pick"]
     R --> F
     F --> L[("library/")]
-    L --> N["Navidrome<br/>your apps"]
+    L --> N["Any music server<br/>or player"]
 ```
 
 Spotify, Apple Music and Deezer links are read only for the song list. The audio comes from
@@ -72,7 +85,8 @@ The web page is also a Telegram Mini App, so it works the same on a phone and on
 
 ## Quick start
 
-You need Docker and a running [Navidrome](https://www.navidrome.org/docs/installation/docker/).
+You need Docker. To listen, use any music server or player that reads a folder, such as
+[Navidrome](https://www.navidrome.org/docs/installation/docker/), Jellyfin or Plex.
 The image runs on amd64 and arm64 (NAS, Raspberry Pi, VPS).
 
 **1. Get the two files**
@@ -108,9 +122,9 @@ docker compose pull && docker compose up -d --no-build
 
 Open `http://<your-server>:7331`.
 
-**4. Point Navidrome at the library**
+**4. Point your music server at the library**
 
-Set Navidrome's music folder to `MUSIC_ROOT/library`. Recommended Navidrome settings: file
+Set its music folder to `MUSIC_ROOT/library`. For Navidrome, the recommended settings are: file
 watcher on, playlists imported from `Playlists`, and `Scanner.PurgeMissing = "never"`.
 
 That is all. Paste a link on the **Add music** page, or copy files into `MUSIC_ROOT/inbox`.
@@ -164,7 +178,7 @@ If YouTube asks you to sign in, put a Netscape-format `cookies.txt` into `config
 ```text
 MUSIC_ROOT/
 ├── inbox/                     drop new music here
-├── library/                   Navidrome's music folder
+├── library/                   your music server's folder
 │   ├── Radiohead/
 │   │   └── OK Computer (1997)/
 │   │       ├── 01 - Airbag.flac
