@@ -117,10 +117,14 @@ When code and docs disagree, trust the code, fix the doc you touch, and mention 
 - You may commit locally once every check above passes. **Ask before** pushing, tagging, opening
   a PR, force-pushing or rewriting history.
 - **Releases** (only when asked):
-  - Bump the version in `Cargo.toml`, `Cargo.lock`, `web/package.json`, `web/package-lock.json`
-    and the `MAGPIE_TAG=` example in `.env.example`.
-  - Commit it as `chore: release X.Y.Z`.
-  - A pushed `vX.Y.Z` tag builds and publishes the image. Ask first.
+  - Run `scripts/release.sh X.Y.Z` (needs `git-cliff`: `brew install git-cliff`). It bumps
+    `Cargo.toml`, `Cargo.lock`, `web/package.json`, `web/package-lock.json` and the
+    `MAGPIE_TAG=` example, writes `CHANGELOG.md`, runs the checks, commits
+    `chore: release X.Y.Z` and tags locally. It never pushes.
+  - The commit subjects become the release notes, so write them for the user to read.
+    Preview the next notes with `git cliff --unreleased --tag vX.Y.Z`.
+  - `git push --atomic origin main vX.Y.Z` builds and publishes the image and the GitHub
+    release. Ask first.
 
 ## Ask first
 

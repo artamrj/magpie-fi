@@ -1,0 +1,49 @@
+# Release notes and CHANGELOG.md, written by git-cliff (https://git-cliff.org)
+# from the Conventional Commit subjects. The subjects already say what changed
+# in plain words, so the notes are the subjects, grouped and linked.
+#
+#   git cliff --unreleased --tag v0.9.0   # preview the next release's notes
+#   scripts/release.sh 0.9.0              # bump, write CHANGELOG.md, commit, tag
+
+[changelog]
+header = """
+# Changelog
+
+What changed in each magpie-fi release. The newest is first.
+"""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/artamrj/magpie-fi/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## Not released yet
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first | trim }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/artamrj/magpie-fi/commit/{{ commit.id }}))
+{% endfor -%}
+{% endfor %}
+"""
+footer = ""
+trim = false
+
+[git]
+conventional_commits = true
+# Keep commits that don't follow the format instead of dropping them silently.
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+sort_commits = "oldest"
+# The <!-- n --> prefixes only fix the order of the groups; they are not shown.
+commit_parsers = [
+  { message = "^chore: release", skip = true },
+  { message = "^Merge ", skip = true },
+  { message = "^feat", group = "<!-- 0 -->✨ New" },
+  { message = "^fix", group = "<!-- 1 -->🐛 Fixes" },
+  { message = "^perf", group = "<!-- 2 -->⚡ Faster" },
+  { message = "^(chore|build)\\(deps\\)", group = "<!-- 4 -->📦 Updated tools and libraries" },
+  { message = "^(docs)", group = "<!-- 3 -->📖 Docs" },
+  { message = ".*", group = "<!-- 5 -->🔧 Behind the scenes" },
+]

@@ -206,8 +206,12 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   optional `cookies.txt`.
 - The entrypoint creates magpie-fi's folders, fixes their owner to `PUID:PGID` (never your existing
   music files) and drops to that user.
-- Releases: a `v*` tag builds and pushes the image (Trivy scan included). Dependabot updates
-  Cargo, npm, GitHub Actions and Docker base images monthly.
+- Releases: `scripts/release.sh X.Y.Z` bumps the version everywhere, writes `CHANGELOG.md` from
+  the commit subjects (git-cliff, `cliff.toml`), runs the CI checks, commits and tags locally. A
+  pushed `v*` tag builds and pushes the image (Trivy scan included) and makes the GitHub release
+  with that version's CHANGELOG section as its notes. The Docker build cache lives in the registry
+  (`magpie-fi:buildcache-amd64` / `-arm64`); the Debian update layer is refreshed weekly.
+  Dependabot updates Cargo, npm, GitHub Actions and Docker base images monthly.
 
 ---
 

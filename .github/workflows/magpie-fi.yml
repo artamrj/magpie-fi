@@ -49,6 +49,15 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # Key on the dependencies only. The hash leaves out magpie-fi's own
+      # version line, so a release bump doesn't add another ~450 MB cache and
+      # push the older ones out of GitHub's 10 GB limit.
+      - name: Rust cache key
+        id: rust-key
+        run: |
+          hash="$(sed '/^name = "magpie-fi"$/{n;d;}' Cargo.lock | sha256sum | cut -c1-32)"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust dependencies and build output
         uses: actions/cache@v6
         with:
@@ -57,7 +66,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-rust-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-rust-${{ steps.rust-key.outputs.hash }}
           restore-keys: |
             ${{ runner.os }}-rust-
 

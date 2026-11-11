@@ -89,7 +89,12 @@ LABEL org.opencontainers.image.title="magpie-fi" \
       org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.licenses="MIT"
 
-RUN apt-get update && \
+# Releases reuse cached layers, which would also reuse old Debian security
+# updates. The release workflow passes the current week here, so this layer
+# is rebuilt with fresh updates once a week and cached in between.
+ARG APT_REFRESH=none
+RUN echo "Debian updates: ${APT_REFRESH}" && \
+    apt-get update && \
     apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
       ca-certificates ffmpeg libasound2t64 libchromaprint-tools python3 rsgain tini util-linux wget && \
