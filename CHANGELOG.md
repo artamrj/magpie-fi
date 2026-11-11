@@ -2,6 +2,19 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.8.3](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.3) - 2026-11-11
+
+### ✨ New
+- **web:** The sidebar shows which version is running, next to the name ([d24d240](https://github.com/artamrj/magpie-fi/commit/d24d240abe46818a8a6b0c50371fb91d8c3a7f20))
+- **web:** The Song page shows each artist a song is credited to ([fb22363](https://github.com/artamrj/magpie-fi/commit/fb22363bc6edaa074919a88e39b9cfd69d4d9101))
+
+### 🐛 Fixes
+- Sending a link again fetches a song you removed in Review ([6b62f19](https://github.com/artamrj/magpie-fi/commit/6b62f19c517134710b9ed92b1ef7c33b1ef6c6ce))
+- **web:** The web page's tools install with no security warnings ([cd56dff](https://github.com/artamrj/magpie-fi/commit/cd56dff7aa8c19bc3a71b4e92e7fd4660b448ff1))
+- Drop SoundCloud search, which needs a key SoundCloud no longer gives out ([90e7463](https://github.com/artamrj/magpie-fi/commit/90e74632a41210febeac32e079adf670e2fb28d5))
+- **web:** The favicon and app icons use the same blue as the logo in the sidebar ([dd63667](https://github.com/artamrj/magpie-fi/commit/dd636679de885faf221a51080253d0134d0904c1))
+- **web:** The magpie sits in the middle of its icon and fills it better ([75cfe8d](https://github.com/artamrj/magpie-fi/commit/75cfe8dcf1b1e5a8ae9b8230aa8ffb4cc7087f66))
+
 ## [0.8.2](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.2) - 2026-11-11
 
 ### ✨ New
