@@ -2,7 +2,9 @@
 //! 30 days, so every track of an album shares one download.
 
 use crate::infrastructure::{
-    media::tag_writer::{ArtworkCheck, ArtworkInfo, MAX_ARTWORK_BYTES, check_artwork},
+    media::tag_writer::{
+        ArtworkCheck, ArtworkInfo, MAX_ARTWORK_BYTES, check_artwork, check_own_cover, read_artwork,
+    },
     provider_cache::{self, url_key},
 };
 use anyhow::{Context, Result, bail};
@@ -19,6 +21,34 @@ const CACHE: &str = "artwork-url";
 /// edition of the same album usually does.
 pub fn release_group_front_url(release_group_id: &str) -> String {
     format!("https://coverartarchive.org/release-group/{release_group_id}/front-500")
+}
+
+/// Marks a cover that is not on the web: the picture inside one of your own
+/// files. Only "keep the file's own tags" in Review hands one out.
+const FILE_COVER: &str = "magpie-file-cover:";
+
+/// The cover address that stands for the picture inside the file at `path`.
+pub fn file_cover_url(path: &str) -> String {
+    format!("{FILE_COVER}{path}")
+}
+
+pub fn is_file_cover_url(url: &str) -> bool {
+    url.starts_with(FILE_COVER)
+}
+
+/// Reads and checks a file's own picture. Nothing is cached: the file is
+/// local, and another file may later sit at the same path.
+async fn file_cover(path: &str) -> Result<(Vec<u8>, ArtworkInfo)> {
+    let path = std::path::PathBuf::from(path);
+    tokio::task::spawn_blocking(move || {
+        let data = read_artwork(&path)
+            .context("the file could not be read for its own picture")?
+            .context("the file has no usable picture of its own")?;
+        let info = check_own_cover(&data)?;
+        Ok((data, info))
+    })
+    .await
+    .context("cover check stopped")?
 }
 
 /// Downloads an image, refusing anything over the size limit (also while it
@@ -52,6 +82,9 @@ pub async fn fetch_verified_url_cached(
     url: &str,
     trusted_exact_release: bool,
 ) -> Result<(Vec<u8>, ArtworkInfo)> {
+    if let Some(path) = url.strip_prefix(FILE_COVER) {
+        return file_cover(path).await;
+    }
     let key = url_key(url);
     if let Some(value) = provider_cache::get(pool, CACHE, &key).await?
         && let Some(encoded) = value["data_base64"].as_str()

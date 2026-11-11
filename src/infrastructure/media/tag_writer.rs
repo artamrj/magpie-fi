@@ -1233,13 +1233,33 @@ pub fn inspect_artwork(data: &[u8], trusted_exact_release: bool) -> Result<Artwo
     Ok(check.info)
 }
 
+/// The stricter bar for the picture inside one of your own files. Such
+/// pictures are often video frames or small thumbnails, so on top of the
+/// usual checks it must be square (within 2 %) and at least 500 px.
+pub fn check_own_cover(data: &[u8]) -> Result<ArtworkInfo> {
+    let info = inspect_artwork(data, false)?;
+    let (width, height) = (info.width, info.height);
+    if width < 500 || height < 500 {
+        bail!("the file's own picture is too small ({width}x{height}; a cover needs 500x500)");
+    }
+    if width.abs_diff(height) * 50 > width.max(height) {
+        bail!("the file's own picture is not square ({width}x{height})");
+    }
+    Ok(info)
+}
+
 pub fn validate_artwork(data: &[u8]) -> Result<()> {
     inspect_artwork(data, false).map(|_| ())
 }
 
 #[cfg(test)]
 pub fn test_artwork_png() -> Vec<u8> {
-    let image = image::RgbaImage::from_fn(320, 320, |x, y| {
+    test_artwork_png_sized(320, 320)
+}
+
+#[cfg(test)]
+pub fn test_artwork_png_sized(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_fn(width, height, |x, y| {
         if (x / 20 + y / 20) % 2 == 0 {
             image::Rgba([32, 96, 180, 255])
         } else {
@@ -1300,6 +1320,18 @@ mod tests {
     #[test]
     fn invalid_cover_data_is_rejected() {
         assert!(picture_from_bytes(vec![0; 12]).is_err());
+    }
+
+    #[test]
+    fn a_files_own_picture_must_be_square_and_at_least_500_px() {
+        assert!(check_own_cover(&test_artwork_png_sized(600, 600)).is_ok());
+        assert!(check_own_cover(&test_artwork_png_sized(600, 606)).is_ok());
+        // A fine catalog cover size, but too small to trust from a file.
+        let small = check_own_cover(&test_artwork_png()).unwrap_err();
+        assert!(small.to_string().contains("too small"));
+        // A video frame.
+        let frame = check_own_cover(&test_artwork_png_sized(800, 600)).unwrap_err();
+        assert!(frame.to_string().contains("not square"));
     }
 
     #[test]

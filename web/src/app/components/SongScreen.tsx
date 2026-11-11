@@ -106,16 +106,20 @@ export function SongScreen({
 
   const keepFileTags = () =>
     act("choose", async () => {
-      const result = await post<{ ready: boolean; cover_verified: boolean }>(
-        `/tracks/${track.id}/keep-tags`,
-      );
+      const result = await post<{
+        ready: boolean;
+        cover_verified: boolean;
+        own_cover_refused: string | null;
+      }>(`/tracks/${track.id}/keep-tags`);
       await feedback.refresh();
       haptic.success();
       if (result.ready) {
         feedback.notify("The file's own tags are kept", returnToReview);
         onNext();
       } else if (!result.cover_verified) {
-        feedback.notify("The file's own tags are kept. It still needs a cover.");
+        // Says why the file's own picture could not be the cover.
+        const why = result.own_cover_refused ? `: ${result.own_cover_refused}` : "";
+        feedback.notify(`The file's own tags are kept. It still needs a cover${why}.`);
         onCover();
       } else {
         feedback.notify("The file's own tags are kept, but some details are missing. Edit them.");

@@ -168,9 +168,10 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     opens as its own screen that asks one question: which release (a radio list with only the
     differences as chips, details on demand), pick a cover, file anyway, repair, or remove. The
     last choice in the release list is "keep the file's own tags", for a file that is more
-    correct than every match; it still needs a verified cover. The manual tag editor is a mode
-    of that screen. The screen's action is Telegram's native Main
-    Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
+    correct than every match. Its own picture counts as the cover only here, and only when it is
+    square and at least 500 px; otherwise the song still needs a verified cover. The manual tag
+    editor is a mode of that screen. The screen's action is Telegram's native Main Button
+    (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
   - **Artists**: song and artist counts, and the artists (rename, join, split a duet, make an
     album that Navidrome shows twice one album, from a bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
     log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar

@@ -606,7 +606,23 @@ pub async fn keep_file_tags(
         release_date: rest.release_date,
         cover_url: None,
     };
-    save_own_tags(&s, id, edit, "Kept the file's own tags").await
+    // You chose the file over every match, so its own picture may be its
+    // cover, but only one that looks like a real cover: see `check_own_cover`.
+    let own_cover = providers::cover_art_archive::file_cover_url(&track.path);
+    let refused = providers::cover_art_archive::fetch_verified_url_cached(
+        &s.pool, &s.client, &own_cover, false,
+    )
+    .await
+    .err()
+    .map(|error| format!("{error:#}"));
+    let edit = CandidateEdit {
+        cover_url: refused.is_none().then_some(own_cover),
+        ..edit
+    };
+    let Json(mut response) = save_own_tags(&s, id, edit, "Kept the file's own tags").await?;
+    // Why the file's own picture was not used, for the page to say.
+    response["own_cover_refused"] = serde_json::json!(refused);
+    Ok(Json(response))
 }
 
 /// Saves details that come from you and not from a catalog as the chosen
@@ -632,6 +648,16 @@ async fn save_own_tags(
         return Err(ApiError::validation(
             "Damaged audio cannot be marked ready; repair or replace the source file first",
         ));
+    }
+    // A file's own picture can only be the cover of that same file.
+    let own_cover = providers::cover_art_archive::file_cover_url(&track_path);
+    if value
+        .cover_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| providers::cover_art_archive::is_file_cover_url(url) && url != own_cover)
+    {
+        return Err(ApiError::validation("That cover belongs to another file"));
     }
     let mut candidate = Candidate {
         provider: "manual".into(),
@@ -676,8 +702,11 @@ async fn save_own_tags(
     }
     let completion = finalize_selection(s, &mut candidate, None, None).await?;
     let candidate_id = candidate_db::insert(&s.pool, id.0, &candidate).await?;
+    // A cover choice is remembered for the next scan, but not the file's own
+    // picture: that one is already in the file.
     if completion.core_complete
         && let Some(cover_url) = candidate.cover_url.as_deref()
+        && cover_url != own_cover
     {
         persist_artwork_override(
             &s.pool,
@@ -717,7 +746,9 @@ pub async fn update_artwork(
             "Enter a valid HTTPS image, Shazam, Spotify, SoundCloud, Audiomack, Navahang, Radio Javan, or Genius song URL",
         )
     })?;
-    if parsed.scheme() != "https" {
+    // The one address that is not a web link: this file's own picture.
+    let own_cover = providers::cover_art_archive::file_cover_url(&track.path);
+    if parsed.scheme() != "https" && supplied != own_cover {
         return Err(ApiError::validation("Cover URLs must use HTTPS"));
     }
     // A song page link stands for that song's cover.
@@ -764,14 +795,16 @@ pub async fn update_artwork(
             "Select metadata for this track before setting its cover",
         ));
     }
-    persist_artwork_override(
-        &s.pool,
-        &track.path,
-        &selected.title,
-        &selected.artist,
-        &cover_url,
-    )
-    .await?;
+    if cover_url != own_cover {
+        persist_artwork_override(
+            &s.pool,
+            &track.path,
+            &selected.title,
+            &selected.artist,
+            &cover_url,
+        )
+        .await?;
+    }
     selected.artwork_message = Some("Verified cover supplied by you".into());
     let completion = crate::application::metadata_completion::reassess(&mut selected);
     let (status, stage, message) = readiness_state(&selected, &completion, "Artwork updated");
@@ -1335,6 +1368,142 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A short MP3 with `cover` inside, or `None` without ffmpeg.
+    fn song_with_cover(directory: &std::path::Path, cover: Vec<u8>) -> Option<String> {
+        let path = directory.join("own-cover.mp3");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.1")
+            .args(["-q:a", "9"])
+            .arg(&path)
+            .status()
+            .ok()?;
+        assert!(made.success());
+        let tags = Candidate {
+            title: "Mano Bebakhsh (Nostalogy)".into(),
+            artist: "Marjan Kandi".into(),
+            ..Default::default()
+        };
+        tag_writer::write(&path, &tags, Some(cover), None).unwrap();
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    async fn keep_tags_of(path: &str, database: &str) -> (serde_json::Value, String, String) {
+        let pool = db::connect(database).await.unwrap();
+        let mut offline = AppState::new(Config::default(), pool.clone());
+        // Nothing here may reach the internet.
+        offline.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage,current_title,current_artist) VALUES(?,'own-cover.mp3','needs_review',0,'now','now','now','review','Mano Bebakhsh (Nostalogy)','Marjan Kandi')")
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let Json(response) = keep_file_tags(State(Arc::new(offline)), Path(TrackId(track_id)))
+            .await
+            .unwrap();
+        let row: (String, String) = sqlx::query_as(
+            "SELECT tracks.stage,candidates.artwork_status FROM tracks
+             JOIN candidates ON candidates.id=tracks.selected_candidate_id WHERE tracks.id=?",
+        )
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The file's own picture is never remembered as a cover choice for a later scan.
+        let remembered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artwork_overrides")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remembered, 0);
+        (response, row.0, row.1)
+    }
+
+    #[tokio::test]
+    async fn keeping_the_files_tags_uses_its_own_square_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(path) = song_with_cover(
+            directory.path(),
+            tag_writer::test_artwork_png_sized(600, 600),
+        ) else {
+            return;
+        };
+        let database = directory.path().join("own-cover.sqlite");
+        let (response, stage, artwork) = keep_tags_of(&path, database.to_str().unwrap()).await;
+
+        assert_eq!(response["ready"], true);
+        assert_eq!(response["cover_verified"], true);
+        assert!(response["own_cover_refused"].is_null());
+        assert_eq!(stage, "ready");
+        assert_eq!(artwork, "verified");
+    }
+
+    #[tokio::test]
+    async fn keeping_the_files_tags_refuses_a_video_frame_as_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(path) = song_with_cover(
+            directory.path(),
+            tag_writer::test_artwork_png_sized(800, 600),
+        ) else {
+            return;
+        };
+        let database = directory.path().join("video-frame.sqlite");
+        let (response, stage, artwork) = keep_tags_of(&path, database.to_str().unwrap()).await;
+
+        assert_eq!(response["ready"], false);
+        assert!(
+            response["own_cover_refused"]
+                .as_str()
+                .unwrap()
+                .contains("not square")
+        );
+        assert_eq!(stage, "review");
+        assert_ne!(artwork, "verified");
+    }
+
+    #[tokio::test]
+    async fn another_files_picture_cannot_be_typed_in_as_a_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("other-file.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool.clone()));
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage) VALUES('/music/mine.mp3','mine.mp3','needs_review',0,'now','now','now','review')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let result = manual_candidate(
+            State(state),
+            Path(TrackId(track_id)),
+            Json(CandidateEdit {
+                title: "Song".into(),
+                artist: "Artist".into(),
+                artist_credits: Vec::new(),
+                album: None,
+                album_artist: None,
+                album_artist_credits: Vec::new(),
+                track_number: None,
+                track_total: None,
+                disc_number: None,
+                disc_total: None,
+                year: None,
+                genre: None,
+                composer: None,
+                label: None,
+                isrc: None,
+                release_date: None,
+                cover_url: Some(providers::cover_art_archive::file_cover_url(
+                    "/music/someone-elses.mp3",
+                )),
+            }),
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

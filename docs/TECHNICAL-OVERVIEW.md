@@ -150,8 +150,11 @@ In Review you can:
   Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`).
 - **Keep the file's own tags** (`POST /api/tracks/{id}/keep-tags`): for when no match is right
   and the file is. The last choice in the release list, shown when the file has a title and an
-  artist. Its tags are saved like an edit by hand (a `manual` candidate), so the song still needs
-  a verified cover; the picture already inside the file does not count as one.
+  artist. Its tags are saved like an edit by hand (a `manual` candidate). The picture inside the
+  file becomes its cover when it is square (within 2 %) and at least 500 px; it is read from the
+  file again when the song is filed and is not cached or remembered for later scans. A video
+  frame or a small thumbnail is refused, the page says why, and the song waits for a cover like
+  any other. This is the only path on which a file's own picture counts as a verified cover.
 - **Change the cover** (`PUT /api/tracks/{id}/artwork`): a cover URL or a song link; the image is
   verified and remembered in `artwork_overrides`. **Search again**:
   `POST /api/tracks/{id}/artwork/search`.
