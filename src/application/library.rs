@@ -291,6 +291,46 @@ fn join_album(
     }
 }
 
+/// The same as joining an album in the library, for two songs filed in one batch: `song`
+/// takes the album details of `album_song`, another song of the same album that a catalog
+/// spelled or dated differently. A single joins an album (the title song), an album never
+/// joins a single. Returns whether the song joined.
+pub(crate) fn join_planned_album(song: &mut Candidate, album_song: &Candidate) -> bool {
+    let (kind, album_kind) = (release_kind(song), release_kind(album_song));
+    if kind != album_kind && album_kind != ReleaseKind::Album {
+        return false;
+    }
+    song.album = album_song.album.clone();
+    song.album_artist = album_song.album_artist.clone();
+    song.album_artist_credits = album_song.album_artist_credits.clone();
+    song.album_artist_sort = album_song.album_artist_sort.clone();
+    if song.release_id.as_deref().map(str::to_ascii_lowercase)
+        != album_song
+            .release_id
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+    {
+        // The track ID belongs to the other edition.
+        song.release_track_id = None;
+    }
+    song.release_id = album_song.release_id.clone();
+    song.release_group_id = album_song.release_group_id.clone();
+    song.release_date = album_song.release_date.clone();
+    song.original_date = album_song.original_date.clone();
+    song.year = album_song.year.clone();
+    song.release_type = album_song.release_type.clone();
+    song.is_compilation = album_song.is_compilation;
+    song.label = album_song.label.clone();
+    if kind != album_kind {
+        // A single's "track 1 of 1" is not its place on the album.
+        song.track_number = None;
+        song.track_total = None;
+        song.disc_number = None;
+        song.disc_total = None;
+    }
+    true
+}
+
 /// "Khalij (1999) [Single]" → (("Khalij", Some("1999")), Single).
 fn folder_release(name: &str) -> ((&str, Option<&str>), ReleaseKind) {
     let (rest, kind) = if let Some(rest) = name.strip_suffix(" [Single]") {

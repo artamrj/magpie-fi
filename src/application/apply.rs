@@ -264,10 +264,74 @@ pub(crate) async fn prepare_apply(s: &AppState) -> Result<PreparedApply> {
     Ok(prepared)
 }
 
+/// Songs of one new album filed in the same batch agree on the album before anything is
+/// written. Sources spell and date an album differently ("Khalij" on Apple Music and
+/// Spotify, "Khaleej" as a single on Radio Javan), and the library cannot settle it yet
+/// because none of the songs is there. The spelling most of the batch's songs of that album
+/// use wins, an album before a single of the same name; the others take its album details
+/// (see [`library::join_planned_album`]). Editions stay apart.
+fn join_planned_albums(library: &Path, items: &mut [PreviewItem]) {
+    let group_of = |item: &PreviewItem| {
+        let artist_folder = Path::new(&item.destination_path).parent()?.parent()?;
+        let album = item.candidate.album.as_deref()?;
+        Some((
+            artist_folder.to_path_buf(),
+            crate::domain::names::album_key(album),
+        ))
+    };
+    let groups = items.iter().map(group_of).collect::<Vec<_>>();
+    // How one song writes the album: its name as spelled, and whether it is a single or EP.
+    let spelling = |item: &PreviewItem| {
+        (
+            item.candidate.album.clone(),
+            library::release_suffix(&item.candidate),
+        )
+    };
+    for index in 0..items.len() {
+        let Some(group) = &groups[index] else {
+            continue;
+        };
+        let members = (0..items.len())
+            .filter(|other| groups[*other].as_ref() == Some(group))
+            .collect::<Vec<_>>();
+        let leader = members.iter().copied().max_by_key(|member| {
+            let same = members
+                .iter()
+                .filter(|other| spelling(&items[**other]) == spelling(&items[*member]))
+                .count();
+            (
+                library::release_suffix(&items[*member].candidate).is_empty(),
+                same,
+                // Among equals the first song of the batch decides.
+                std::cmp::Reverse(*member),
+            )
+        });
+        let Some(leader) =
+            leader.filter(|leader| spelling(&items[*leader]) != spelling(&items[index]))
+        else {
+            continue;
+        };
+        let album_song = items[leader].candidate.clone();
+        let item = &mut items[index];
+        if !library::join_planned_album(&mut item.candidate, &album_song) {
+            continue;
+        }
+        let extension = Path::new(&item.destination_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("mp3")
+            .to_owned();
+        item.destination_path = library::destination(library, &item.candidate, &extension)
+            .to_string_lossy()
+            .into_owned();
+    }
+}
+
 /// Songs of one new album filed in the same batch get the year of the first
 /// one, so they share one folder and Navidrome never splits the album.
 fn align_planned_albums(output_dir: &str, items: &mut [PreviewItem]) {
     let library = Path::new(output_dir);
+    join_planned_albums(library, items);
     let mut first_year = std::collections::HashMap::<(PathBuf, String, &str), String>::new();
     for item in items {
         let destination = PathBuf::from(&item.destination_path);
@@ -1420,6 +1484,71 @@ mod tests {
             "{}",
             items[1].destination_path
         );
+    }
+
+    #[test]
+    fn songs_of_one_new_album_agree_on_its_spelling() {
+        let item = |title: &str, album: &str, kind: Option<&str>, year: &str| {
+            let candidate = Candidate {
+                title: title.into(),
+                artist: "Ebi".into(),
+                album: Some(album.into()),
+                album_artist: Some("Ebi".into()),
+                release_type: kind.map(str::to_owned),
+                year: Some(year.into()),
+                track_number: Some(1),
+                ..Default::default()
+            };
+            PreviewItem {
+                track_id: TrackId(1),
+                filename: format!("{title}.mp3"),
+                current_path: format!("/inbox/{title}.mp3"),
+                destination_path: library::destination(Path::new("/lib"), &candidate, "mp3")
+                    .to_string_lossy()
+                    .into_owned(),
+                candidate,
+                evidence: RecordingEvidence::default(),
+                duplicates: Vec::new(),
+            }
+        };
+        // Radio Javan knows the title song as a single spelled "Khaleej"; the catalogs know
+        // the album as "Khalij". A remaster is another album.
+        let mut items = vec![
+            item("Khaleej", "Khaleej", Some("single"), "1990"),
+            item("Goriz", "Khalij", Some("album"), "1989"),
+            item("Kolbeh Man", "Khalij", Some("album"), "1989"),
+            item("Goriz", "Khalij (Remastered)", Some("album"), "2008"),
+        ];
+        align_planned_albums("/lib", &mut items);
+
+        let title_song = &items[0];
+        assert_eq!(title_song.candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(title_song.candidate.year.as_deref(), Some("1989"));
+        assert_eq!(title_song.candidate.release_type.as_deref(), Some("album"));
+        // A single's "track 1" is not its place on the album; the song keeps its own title.
+        assert_eq!(title_song.candidate.track_number, None);
+        assert_eq!(title_song.candidate.title, "Khaleej");
+        assert!(
+            title_song
+                .destination_path
+                .starts_with("/lib/Ebi/Khalij (1989)/"),
+            "{}",
+            title_song.destination_path
+        );
+        assert_eq!(items[1].candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(
+            items[3].candidate.album.as_deref(),
+            Some("Khalij (Remastered)")
+        );
+
+        // An album never joins a single of the same name.
+        let mut pair = vec![
+            item("Khaleej", "Khaleej", Some("single"), "1990"),
+            item("Goriz", "Khalij", Some("album"), "1989"),
+        ];
+        align_planned_albums("/lib", &mut pair);
+        assert_eq!(pair[1].candidate.album.as_deref(), Some("Khalij"));
+        assert_eq!(pair[0].candidate.album.as_deref(), Some("Khalij"));
     }
 
     #[tokio::test]

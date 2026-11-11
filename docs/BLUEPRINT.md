@@ -336,7 +336,10 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
 - Folder artist = **the first album artist's identity**, never the track artist and never a
   combined `A & B` name. Every spelling of an artist (`گوگوش`, `Googoosh`, `GOOGOOSH`) has one
   identity, so one folder (§5.4).
-- Songs of one new album filed together get one year, so the album never splits.
+- Songs of one new album filed together agree on the album first, so it never splits: the
+  spelling most of them use wins ("Khalij" on Apple Music and Spotify against a "Khaleej"
+  single on Radio Javan), an album before a single of the same name, and the others take its
+  name, album artist, year and release details. Editions stay apart.
 - **An album already in the library decides its details.** Navidrome tells albums apart by
   name, album artist (or its MusicBrainz ID), MusicBrainz album ID and release date, so songs
   of one album that disagree on any of them show up as two albums. A new song whose album the
