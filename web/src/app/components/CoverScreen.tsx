@@ -138,7 +138,7 @@ export function CoverScreen({
 
       <Section
         title="Or paste a link"
-        footer="An image, or a song page on Spotify, Shazam, Genius or Radio Javan."
+        footer="An image, or a song page on Spotify, Apple Music, Deezer, Shazam, Genius or Radio Javan."
       >
         <div style={{ padding: 6 }}>
           <Field

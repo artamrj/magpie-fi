@@ -526,7 +526,7 @@ function Explanation({
     return (
       <Callout tone="warn">
         <b>Nothing recognized this file.</b> Enter the title and artist yourself, or paste a link to
-        the song on Spotify, Shazam, Radio Javan or YouTube.
+        the song on Spotify, Apple Music, Radio Javan or YouTube.
       </Callout>
     );
   const why = reviewExplanation(track);

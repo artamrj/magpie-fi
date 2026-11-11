@@ -150,7 +150,12 @@ In Review you can:
 - **Auto-approve** (`POST /api/tracks/auto-approve`): the same rules as Phase 2 over all of
   Review; doubtful songs stay.
 - **Edit by hand** (`PUT /api/tracks/{id}/manual`): a `manual` candidate (score 100). Pasting a
-  Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`).
+  Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`). Every
+  service the Add page reads one song from (Spotify, Apple Music, Deezer, Shazam) goes through
+  the same reader (`acquire::links`), so a service added there works here too; SoundCloud,
+  Audiomack, Navahang, Radio Javan, Genius and YouTube have song page readers of their own.
+  The Artist line and the artist chips always say the same thing: typing in one rewrites the
+  other, and on save chips that name other people than the line are ignored.
 - **Keep the file's own tags** (`POST /api/tracks/{id}/keep-tags`): for when no match is right
   and the file is. The last choice in the release list, shown when the file has a title and an
   artist. Its tags are saved like an edit by hand (a `manual` candidate). The picture inside the
@@ -376,6 +381,15 @@ source gave a length at all). The Review screen shows this text. A release witho
   below the 0.82 of an exact match, so it needs the audio or a second source. Remixers named
   in the title don't trigger this. When such a match is used, the main singer is put back
   first (`credits::restore_missing_main`).
+- A match that names only some of the file's singers ("Alireza JJ feat. Hoomaan" for *Alireza
+  JJ, Sijal & Sepehr Khalse feat. Hoomaan*) gets the others back when it is used: everyone it
+  names must be in the file and it must start with the file's main singer
+  (`credits::restore_missing_singers`). A match naming someone the file does not is left alone.
+- An album artist that has to be filled in is the main singers only, without the "feat."
+  guests (`credits::main_credits`).
+- A year is written only as four digits, alone or at the start of a date. A day-first date
+  ("05.10.2020") is turned round; anything else is dropped for the release date's year
+  (`metadata_completion::clean_year`).
 - Two remix (live, acoustic…) titles match when the song and the remixer agree.
 - Artist lists are compared as sets of people: "A, B & C" = "A, C & B". A name that is the end
   of another one is the same person ("Tataloo" = "Amir Tataloo", "MJ" = "Sohrab MJ";

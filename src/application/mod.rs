@@ -78,6 +78,14 @@ fn follow_file_credit(candidate: &mut Candidate, file: FileTags<'_>, restore_mis
             }
         },
     };
+    // Co-singers the match left out come back too, once the main singer is in place.
+    let (artists, moved) = if restore_missing {
+        let (artists, restored) =
+            credits::restore_missing_singers(artists, file_artist, file_title);
+        (artists, moved || restored)
+    } else {
+        (artists, moved)
+    };
     candidate.artist_credits = artists;
     if !moved {
         return;
@@ -142,6 +150,48 @@ pub async fn finalize_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn singers_the_match_left_out_come_back_from_the_file() {
+        // Deezer credits only the first of three co-singers.
+        let file = FileTags {
+            artist: Some("Alireza JJ, Sijal & Sepehr Khalse feat. Hoomaan"),
+            title: Some("Boodi Yaram"),
+        };
+        let mut candidate = Candidate {
+            artist: "Alireza Jj".into(),
+            title: "Boodi Yaram (feat. Hoomaan)".into(),
+            album_artist: Some("Alireza Jj".into()),
+            ..Default::default()
+        };
+        keep_file_main_singer(&mut candidate, file);
+        assert_eq!(
+            candidate.artist,
+            "Alireza Jj, Sijal & Sepehr Khalse feat. Hoomaan"
+        );
+        assert_eq!(
+            candidate.album_artist.as_deref(),
+            Some("Alireza Jj, Sijal & Sepehr Khalse")
+        );
+
+        // Before a match is chosen nothing is added: it must still prove itself.
+        let mut unchosen = Candidate {
+            artist: "Alireza Jj".into(),
+            title: "Boodi Yaram (feat. Hoomaan)".into(),
+            ..Default::default()
+        };
+        align_with_file_credit(&mut unchosen, file);
+        assert_eq!(unchosen.artist, "Alireza Jj");
+
+        // A match naming someone the file does not is another credit, not a shorter one.
+        let mut other = Candidate {
+            artist: "Alireza Jj feat. Behzad Leito".into(),
+            title: "Boodi Yaram".into(),
+            ..Default::default()
+        };
+        keep_file_main_singer(&mut other, file);
+        assert_eq!(other.artist, "Alireza Jj feat. Behzad Leito");
+    }
 
     #[test]
     fn the_file_decides_who_is_the_main_singer() {

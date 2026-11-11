@@ -567,14 +567,28 @@ async fn save_own_tags(
     {
         return Err(ApiError::validation("That cover belongs to another file"));
     }
+    // The page sends the Artist line and one chip per artist. Chips that name other
+    // people than the line are stale, and would silently undo what you typed.
+    use crate::domain::credits::names_same_people;
+    let artist_credits = if names_same_people(&value.artist, &value.title, &value.artist_credits) {
+        value.artist_credits
+    } else {
+        Vec::new()
+    };
+    let album_artist_credits = match value.album_artist.as_deref() {
+        Some(album_artist) if names_same_people(album_artist, "", &value.album_artist_credits) => {
+            value.album_artist_credits
+        }
+        _ => Vec::new(),
+    };
     let mut candidate = Candidate {
         provider: "manual".into(),
         title: value.title,
         artist: value.artist,
-        artist_credits: value.artist_credits,
+        artist_credits,
         album: value.album,
         album_artist: value.album_artist,
-        album_artist_credits: value.album_artist_credits,
+        album_artist_credits,
         track_number: value.track_number,
         track_total: value.track_total,
         disc_number: value.disc_number,
@@ -651,7 +665,7 @@ pub async fn update_artwork(
     let supplied = value.cover_url.trim();
     let parsed = reqwest::Url::parse(supplied).map_err(|_| {
         ApiError::validation(
-            "Enter a valid HTTPS image, Shazam, Spotify, SoundCloud, Audiomack, Navahang, Radio Javan, or Genius song URL",
+            "Enter a valid HTTPS image, or a Spotify, Apple Music, Deezer, Shazam, SoundCloud, Audiomack, Navahang, Radio Javan, or Genius song URL",
         )
     })?;
     // The one address that is not a web link: this file's own picture.
@@ -848,7 +862,7 @@ pub async fn resolve_source(
     let url = value.url.trim();
     let parsed = reqwest::Url::parse(url).map_err(|_| {
         ApiError::validation(
-            "Enter a valid Shazam, Spotify, SoundCloud, Audiomack, Navahang, Radio Javan, Genius, or YouTube URL",
+            "Enter a valid Spotify, Apple Music, Deezer, Shazam, SoundCloud, Audiomack, Navahang, Radio Javan, Genius, or YouTube URL",
         )
     })?;
     let (_, found) = lookup_source(&s, url, &parsed).await.ok_or_else(|| {
@@ -867,16 +881,27 @@ async fn lookup_source(
     parsed: &reqwest::Url,
 ) -> Option<(&'static str, Result<Candidate>)> {
     let host = parsed.host_str()?.to_ascii_lowercase();
+    // Every service the Add page reads a song from works here too, through the
+    // same reader, so a site added there never has to be added here again.
+    use crate::acquire::links;
+    let expanded = match links::expand_short_link(&s.client, url).await {
+        Ok(expanded) => expanded,
+        Err(error) => return Some(("The short link", Err(error))),
+    };
+    if let Some((name, provider)) = links::classify(&expanded).and_then(|link| link_reader(&link)) {
+        return Some((name, lookup_link_source(s, &expanded, provider).await));
+    }
     let site = ["www.", "m.", "open.", "music.", "play."]
         .iter()
         .find_map(|prefix| host.strip_prefix(prefix))
         .unwrap_or(&host);
     let (pool, client) = (&s.pool, &s.client);
     Some(match site {
-        "spotify.com" | "spotify.link" | "spoti.fi" => {
-            ("Spotify", lookup_link_source(s, url, "spotify").await)
-        }
-        "shazam.com" => ("Shazam", lookup_link_source(s, url, "shazam").await),
+        // A Spotify, Apple Music, Deezer or Shazam link that is not a song.
+        "spotify.com" | "apple.com" | "deezer.com" | "shazam.com" => (
+            "This link",
+            Err(anyhow::anyhow!("this is not a link to one song")),
+        ),
         "soundcloud.com" => (
             "SoundCloud",
             providers::soundcloud::lookup_url(client, url).await,
@@ -904,13 +929,26 @@ async fn lookup_source(
     })
 }
 
-/// A Spotify or Shazam song link, read the free way the bot reads links:
+/// The name and source label of a link the Add page's reader fills the tags from, or
+/// `None` for a service with a song page reader of its own. Every service is listed, so
+/// adding one to the Add page does not compile until it is decided here too.
+fn link_reader(link: &crate::acquire::links::Link) -> Option<(&'static str, &'static str)> {
+    use crate::acquire::links::Service;
+    match link.service {
+        Service::Spotify => Some(("Spotify", "spotify")),
+        Service::Apple => Some(("Apple Music", "itunes")),
+        Service::Deezer => Some(("Deezer", "deezer")),
+        Service::Shazam => Some(("Shazam", "shazam")),
+        Service::YouTube | Service::RadioJavan => None,
+    }
+}
+
+/// A Spotify, Apple Music, Deezer or Shazam song link, read the free way the bot reads links:
 /// Spotify's public embed page, and Apple's lookup for Shazam (the Shazam
 /// number is the Apple Music ID).
 async fn lookup_link_source(s: &AppState, url: &str, provider: &str) -> Result<Candidate> {
     use crate::acquire::links;
-    let expanded = links::expand_short_link(&s.client, url).await?;
-    let link = links::classify(&expanded)
+    let link = links::classify(url)
         .filter(|link| link.scope == links::Scope::Track)
         .ok_or_else(|| anyhow::anyhow!("this is not a song link"))?;
     let song = links::read(&s.client, &s.pool, &s.config, &link)
@@ -1122,6 +1160,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// One song as four sites show it. Run with
+    /// `cargo test --locked every_supported_song_link -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live link probe"]
+    async fn every_supported_song_link_fills_in_the_tags() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("links.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(Config::default(), pool));
+        for url in [
+            "https://music.apple.com/de/song/boodi-yaram-feat-hoomaan/1618435063",
+            "https://play.radiojavan.com/song/alireza-jj-sijal-sepehr-khalse-boodi-yaram-(ft-hoomaan)",
+            "https://www.youtube.com/watch?v=nRWpJZRkTrk",
+            "https://open.spotify.com/track/1aFllLRJyLxIriyOL2g8Ww",
+        ] {
+            let found = resolve_source(
+                State(state.clone()),
+                Json(SourceLookupRequest { url: url.into() }),
+            )
+            .await;
+            match found {
+                Ok(Json(song)) => {
+                    println!(
+                        "{url}\n  title={:?} artist={:?} album={:?} year={:?} date={:?} cover={:?} credits={:?}",
+                        song.title,
+                        song.artist,
+                        song.album,
+                        song.year,
+                        song.release_date,
+                        song.cover_url,
+                        song.artist_credits
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect::<Vec<_>>()
+                    );
+                    assert!(song.title.contains("Boodi Yaram"), "{url}: {}", song.title);
+                }
+                Err(_) => panic!("{url} could not be read"),
+            }
+        }
+    }
+
+    #[test]
+    fn song_links_the_add_page_reads_also_fill_in_the_tags() {
+        use crate::acquire::links::classify;
+        for (url, name) in [
+            (
+                "https://music.apple.com/de/song/boodi-yaram-feat-hoomaan/1618435063",
+                "Apple Music",
+            ),
+            (
+                "https://open.spotify.com/track/1aFllLRJyLxIriyOL2g8Ww",
+                "Spotify",
+            ),
+            ("https://www.deezer.com/en/track/1109731", "Deezer"),
+            (
+                "https://www.shazam.com/song/1845811123/donyaye-movazi",
+                "Shazam",
+            ),
+        ] {
+            let link = classify(url).unwrap_or_else(|| panic!("{url} is not recognised"));
+            assert_eq!(
+                link_reader(&link).map(|(site, _)| site),
+                Some(name),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_artist_chips_do_not_undo_the_artist_you_typed() {
+        use crate::domain::credits::{ArtistCredit, names_same_people};
+        let chips = [
+            ArtistCredit::new("Alireza Jj", " feat. "),
+            ArtistCredit::new("Hoomaan", ""),
+        ];
+        assert!(names_same_people(
+            "Alireza JJ feat. Hoomaan",
+            "Boodi Yaram",
+            &chips
+        ));
+        assert!(names_same_people(
+            "Alireza JJ",
+            "Boodi Yaram (feat. Hoomaan)",
+            &chips
+        ));
+        assert!(!names_same_people(
+            "Alireza JJ, Sijal, Sepehr Khalse ft. Hoomaan",
+            "Boodi Yaram",
+            &chips
+        ));
     }
 
     #[tokio::test]

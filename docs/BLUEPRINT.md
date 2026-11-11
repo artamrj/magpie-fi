@@ -256,7 +256,9 @@ Details and exact weights: [TECHNICAL-OVERVIEW §8–11](TECHNICAL-OVERVIEW.md#8
   singer that the chosen match credits in another position, that singer goes first and the
   others become featured. When the match leaves the main singer out but every name it gives is
   in the file ("Sohrab MJ & Orchid" for "Amir Tataloo feat. Sohrab MJ & Orchid"), the main
-  singer is put back first. A single's album artist follows. Such a match is also not an exact
+  singer is put back first. Co-singers the match left out come back the same way ("Alireza JJ
+  feat. Hoomaan" for "Alireza JJ, Sijal & Sepehr Khalse feat. Hoomaan"). A single's album
+  artist follows. Such a match is also not an exact
   artist match: it is filed on its own only with the audio or a second source agreeing. Review
   shows "Lists X first" or "Leaves out X" on such a match.
 - **DJ mixes are podcast episodes.** Radio Javan lists DJ mixes as podcasts. A podcast

@@ -228,7 +228,8 @@ fn candidate_from_track(track: &Value) -> Option<Candidate> {
     Some(Candidate {
         provider: PROVIDER.into(),
         title: title.to_owned(),
-        artist: artist.to_owned(),
+        // Radio Javan writes three singers as "A, B, & C".
+        artist: artist.replace(", &", " &"),
         album,
         year: release_date
             .as_deref()
