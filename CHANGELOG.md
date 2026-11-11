@@ -2,6 +2,12 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.9.1](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.1) - 2026-11-11
+
+### 🐛 Fixes
+- A store's "- Persian Music" ending no longer splits an album in two ([f38a484](https://github.com/artamrj/magpie-fi/commit/f38a4840256a4cf8dc07f5161fe0b28060fd3084))
+- A wrongly tagged song is no longer filed on its own, and a crash or restart no longer leaves work stuck ([210e6b3](https://github.com/artamrj/magpie-fi/commit/210e6b3e02004a819120d4d0e95ceeea9bdadf9d))
+
 ## [0.9.0](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.0) - 2026-11-11
 
 ### ✨ New
