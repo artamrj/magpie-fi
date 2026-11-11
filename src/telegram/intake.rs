@@ -78,6 +78,7 @@ async fn attach_status_message(
     if context.config.cards && store::cards_allowed(pool, chat).await? {
         match send_card(context, request, kind, message).await {
             Card::Sent(card) => {
+                let card = card.message_id;
                 store::attach_telegram(pool, request, chat, message.message_id, card).await?;
                 store::set_card(pool, request, texts::READING_LINK).await?;
                 return Ok(());
@@ -109,7 +110,7 @@ async fn send_card(context: &Context, request: i64, kind: &str, message: &Messag
     if let Some(keyboard) = super::status::app_keyboard(context, chat, false) {
         params["reply_markup"] = keyboard;
     }
-    super::send_widget(context, params).await
+    super::send_widget(context, "sendWidget", params).await
 }
 
 /// An audio file in a message, as an audio message or as a document.

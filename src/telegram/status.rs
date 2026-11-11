@@ -11,8 +11,18 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 const INTERVAL: Duration = Duration::from_secs(3);
 
+/// The library card's numbers take a few table scans: not every round.
+const LIBRARY_INTERVAL: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+
 pub async fn run(context: Arc<Context>) {
+    let mut library_checked: Option<std::time::Instant> = None;
     loop {
+        if library_checked.is_none_or(|checked| checked.elapsed() >= LIBRARY_INTERVAL) {
+            library_checked = Some(std::time::Instant::now());
+            if let Err(error) = super::library::refresh(&context).await {
+                tracing::warn!(%error, "updating the library card failed");
+            }
+        }
         if let Err(error) = refresh(&context).await {
             tracing::warn!(%error, "updating Telegram status messages failed");
         }
@@ -243,7 +253,7 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         if context.config.cards && store::cards_allowed(pool, question.chat_id).await? {
             match send_review_card(context, &question, &song, app.as_deref()).await? {
                 super::Card::Sent(message) => {
-                    store::set_review_card(pool, question.wanted_id, message).await?;
+                    store::set_review_card(pool, question.wanted_id, message.message_id).await?;
                     continue;
                 }
                 super::Card::Lost => {
@@ -321,7 +331,7 @@ async fn send_review_card(
         params["reply_markup"] =
             json!({"inline_keyboard": [[super::mini_app_button(texts::CHOOSE_IN_APP, url)]]});
     }
-    Ok(super::send_widget(context, params).await)
+    Ok(super::send_widget(context, "sendWidget", params).await)
 }
 
 /// Review cards whose song was sorted out somewhere else (in the app, or in

@@ -203,7 +203,10 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   the app. Owners also get "Choose in the app" below it. Without cards, owners get one button that
   opens the Mini App on that song; guests, and chats without an HTTPS address, get up to three
   candidate buttons (green) and "None of these" (red) in the chat.
-- Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`. `/start`, `/help`
+- `/library` (owners) shows one shared **library card**, pinned quietly: songs, artists, hours of
+  music, the last songs magpie-fi filed, what's on the way, what waits in Review, and health. Every
+  copy in every owner's chat updates at once when the numbers change.
+- Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/library`, `/guests`, `/web`. `/start`, `/help`
   and `/guests` are rich messages (headings, tables, an expandable "How it works"); `/queue`,
   `/health` and `/id` answer ephemerally when Telegram sends them as ephemeral commands. If
   Telegram refuses a rich or ephemeral message, the bot sends the plain text to the chat instead.

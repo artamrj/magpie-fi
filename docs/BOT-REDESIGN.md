@@ -1,6 +1,6 @@
 # magpie-fi — Telegram bot redesign (Bot API 10.4)
 
-> Status: **agreed, being built step by step** (Nov 2026). Steps A to D are built. Written against
+> Status: **agreed, being built step by step** (Nov 2026). Steps A to E are built. Written against
 > Bot API 10.4 (9 Nov 2026).
 > Once a phase is built, [BLUEPRINT.md](BLUEPRINT.md) and
 > [TECHNICAL-OVERVIEW.md](TECHNICAL-OVERVIEW.md) are updated in the same commit.
@@ -210,7 +210,7 @@ Each step ships on its own and keeps the bot working.
 | **B. Messages** ✅ built | Rich `/start` `/help` `/guests` and Details, coloured and disabled buttons, ephemeral Details and `/queue` `/health` `/id`, `web_app` button on owners' status messages, plain-text fallbacks. Guests no longer get a web-page button on review questions (they can't open the page) | Clearer, tidier chat |
 | **C. Request card** ✅ built | `widgets/request.html`, `cards.rs`, the loop edits card state and caption, text fallback for a day after a refusal, `MAGPIE_TELEGRAM_CARDS` off switch, 🎉 at the end | The big one |
 | **D. Review card** ✅ built | `review.html`, choices with score bars, length difference, audio match and sources; taps choose or remove; the card shows how it ended, also after a choice in the app | Choosing in the chat |
-| **E. Library card** | Shared widget, `/library`, pinned | Live library at a glance |
+| **E. Library card** ✅ built | Shared widget, `/library` (owners only for now), pinned quietly, refreshed every 10 s on a change, a new shared card when its code changes | Live library at a glance |
 | **F. Extras** | 📲 Send me the file, optional clip preview, optional topics | — |
 
 Docs: BLUEPRINT §3.3/§3.4 and decision #3, TECHNICAL-OVERVIEW §6/§7 and the settings list

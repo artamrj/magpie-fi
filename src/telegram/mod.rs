@@ -6,6 +6,7 @@
 //! - `intake.rs`: links and audio files; `commands.rs`: `/…` commands and guests.
 //! - `actions.rs`: every button and card tap, its permission check and what it does.
 //! - `cards.rs`: requests as live cards (Bot API 10.4 widgets) and their state.
+//! - `library.rs`: `/library`, one shared card with the library at a glance.
 //! - `status.rs`: the loop that updates status messages and asks about Review.
 //! - `texts.rs`: everything the bot says.
 
@@ -14,6 +15,7 @@ pub mod api;
 mod cards;
 mod commands;
 mod intake;
+mod library;
 mod status;
 pub mod texts;
 mod types;
@@ -40,6 +42,8 @@ pub struct Context {
     /// Request → its card's cover colours (`None`: its cover had none), so a
     /// song's cover is read once, not every few seconds.
     colours: Mutex<HashMap<i64, Option<cards::Colours>>>,
+    /// What the shared library card shows now, so it is only edited on a change.
+    library_shown: Mutex<Option<String>>,
 }
 
 /// Runs the bot until magpie-fi stops. Does nothing without a bot token.
@@ -96,6 +100,7 @@ async fn serve(state: Arc<AppState>, config: TelegramConfig, bot: Bot) {
         username,
         uploads: Mutex::new(HashMap::new()),
         colours: Mutex::new(HashMap::new()),
+        library_shown: Mutex::new(None),
     });
     tokio::spawn(status::run(context.clone()));
     poll(context).await;
@@ -261,19 +266,20 @@ pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
 
 /// How sending a card (a widget) went.
 pub enum Card {
-    Sent(i32),
+    Sent(Box<Message>),
     /// Telegram said no: use text in this chat for a while.
     Refused,
     /// Unknown: it may have arrived, so nothing else is sent.
     Lost,
 }
 
-/// Sends a widget. If Telegram refuses it with a Mini App button below, it is
-/// tried once without, since widgets are new and the rules may differ.
-async fn send_widget(context: &Context, mut params: Value) -> Card {
+/// Sends a widget (`method` is `sendWidget` or `sendSharedWidget`). If
+/// Telegram refuses it with a Mini App button below, it is tried once without,
+/// since widgets are new and the rules may differ.
+async fn send_widget(context: &Context, method: &str, mut params: Value) -> Card {
     loop {
-        match context.bot.call::<_, Message>("sendWidget", &params).await {
-            Ok(sent) => return Card::Sent(sent.message_id),
+        match context.bot.call::<_, Message>(method, &params).await {
+            Ok(sent) => return Card::Sent(Box::new(sent)),
             Err(error) if api::is_refusal(&error) => {
                 let dropped = params
                     .as_object_mut()
@@ -627,10 +633,17 @@ mod tests {
             "getFile" => {
                 json!({"file_id": params["file_id"], "file_unique_id": "u", "file_path": "music/a.mp3"})
             }
-            "sendMessage" | "sendRichMessage" | "sendWidget" | "editMessageText" => {
+            "sendMessage" | "sendRichMessage" | "sendWidget" | "sendSharedWidget"
+            | "editMessageText" => {
                 let mut next = fake.next_message.lock().unwrap();
                 *next += 1;
-                json!({"message_id": 1000 + *next, "date": 0, "chat": {"id": params["chat_id"], "type": "private"}, "text": params["text"]})
+                let mut sent = json!({"message_id": 1000 + *next, "date": 0, "chat": {"id": params["chat_id"], "type": "private"}, "text": params["text"]});
+                // A new shared widget comes back with its ID.
+                if params["is_shared"] == true {
+                    sent["widget"] =
+                        json!({"id": format!("shared{}", *next), "html": params["html"]});
+                }
+                sent
             }
             _ => json!(true),
         };
@@ -1494,10 +1507,18 @@ mod tests {
         assert_eq!(card_state(&ended)["id"], track);
         let caption = wait_for(&fake, "editMessageCaption", "no longer available").await;
         assert!(caption.get("reply_markup").is_none());
-        let closed: i64 = sqlx::query_scalar("SELECT review_card FROM wanted LIMIT 1")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        // The card is marked as ended right after its caption edit.
+        let mut closed = 0;
+        for _ in 0..100 {
+            closed = sqlx::query_scalar("SELECT review_card FROM wanted LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if closed == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(closed, 2);
     }
 
@@ -1528,5 +1549,96 @@ mod tests {
             .filter(|params| params.to_string().contains("removed"))
             .count();
         assert_eq!(edits, 1);
+    }
+
+    async fn add_to_library(state: &AppState, title: &str) {
+        sqlx::query(
+            "INSERT INTO library_items(path,file_size,file_mtime_ns,duration,title,artist,source,
+               added_at,checked_at)
+             VALUES(?,1,1,3600,?,'Daft Punk','inbox',?,?)",
+        )
+        .bind(format!("/music/{title}.m4a"))
+        .bind(title)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_library_card_is_shared_pinned_and_live() {
+        let (_directory, fake, state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "library").await;
+        add_to_library(&state, "One More Time").await;
+
+        // The first /library makes the shared card and pins it quietly.
+        fake.push(message(1, OWNER, "/library"));
+        let card = wait_for(&fake, "sendWidget", "is_shared").await;
+        assert!(
+            card["html"]
+                .as_str()
+                .unwrap()
+                .contains("magpie-fi library card")
+        );
+        let shown: Value = serde_json::from_str(card["public_data"].as_str().unwrap()).unwrap();
+        assert_eq!(shown["n"], json!([1, 1, 1]));
+        assert_eq!(shown["a"][0], json!(["One More Time", "Daft Punk"]));
+        assert_eq!(card["caption"], texts::LIBRARY_CAPTION);
+        let pin = wait_for(&fake, "pinChatMessage", "message_id").await;
+        assert_eq!(pin["disable_notification"], true);
+        let first_card = pin["message_id"].clone();
+
+        // The next /library sends the same shared card and moves the pin.
+        fake.push(message(2, OWNER, "/library"));
+        let again = wait_for(&fake, "sendSharedWidget", "widget_id").await;
+        assert!(again["widget_id"].as_str().unwrap().starts_with("shared"));
+        let unpin = wait_for(&fake, "unpinChatMessage", "message_id").await;
+        assert_eq!(unpin["message_id"], first_card);
+        assert_eq!(fake.calls("sendWidget").len(), 1);
+
+        // A new song: every copy is updated with one edit.
+        add_to_library(&state, "Aerodynamic").await;
+        let update = wait_for(&fake, "editSharedWidgetData", "Aerodynamic").await;
+        let shown: Value = serde_json::from_str(update["public_data"].as_str().unwrap()).unwrap();
+        assert_eq!(shown["n"][0], 2);
+        assert_eq!(update["widget_id"], again["widget_id"]);
+    }
+
+    #[tokio::test]
+    async fn a_changed_library_card_is_made_again() {
+        let (_directory, fake, state) = start_cards().await;
+        wait_for(&fake, "setMyCommands", "library").await;
+        // A shared card made by an older magpie-fi with different card code.
+        write_state(&state.pool, "library_widget", "0123456789ab:old").await;
+        fake.push(message(1, OWNER, "/library"));
+        wait_for(&fake, "sendWidget", "is_shared").await;
+        assert!(fake.calls("sendSharedWidget").is_empty());
+        let saved = read_state(&state.pool, "library_widget").await.unwrap();
+        assert!(saved.starts_with(&cards::library_version()) && saved.contains("shared"));
+    }
+
+    #[tokio::test]
+    async fn the_library_without_cards_and_for_guests() {
+        let (_directory, fake, state) = start().await;
+        wait_for(&fake, "setMyCommands", "library").await;
+        add_to_library(&state, "One More Time").await;
+        fake.push(message(1, OWNER, "/library"));
+        let text = wait_for(&fake, "sendRichMessage", "Your library").await;
+        assert!(text.to_string().contains("One More Time · Daft Punk"));
+        assert!(fake.calls("sendWidget").is_empty());
+
+        sqlx::query(
+            "INSERT INTO telegram_guests(user_id,name,invited_by,created_at) VALUES(?,?,?,?)",
+        )
+        .bind(FRIEND as i64)
+        .bind("Friend")
+        .bind(OWNER as i64)
+        .bind("now")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        fake.push(message(2, FRIEND, "/library"));
+        wait_for(&fake, "sendMessage", "don't know that command").await;
     }
 }
