@@ -14,6 +14,9 @@ const SEPARATORS = /\s+(?:&|x|X|×|و|with|With|vs\.?|feat\.?|ft\.?|featuring)\s
 const MOVE_WARNING =
   "Their tags are rewritten and they move to the right artist folder. Navidrome may count them as new songs, so play counts can start again.";
 
+/** Artists drawn before "Show more". */
+const ARTIST_PAGE = 100;
+
 /** The Artists page: every artist in the library, with fixes for wrong names. On a phone or in
     Telegram the server status sits at the bottom; a wide window shows it in the sidebar. */
 export function Library({
@@ -28,6 +31,8 @@ export function Library({
   const artists = useArtistsQuery();
   const [search, setSearch] = useState("");
   const [openId, setOpenId] = useState<number>();
+  // A library can have thousands of artists; drawing them all at once makes the page slow.
+  const [rows, setRows] = useState(ARTIST_PAGE);
   const all = useMemo(() => artists.data ?? [], [artists.data]);
   const shown = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -38,6 +43,7 @@ export function Library({
       : all;
   }, [all, search]);
   const suspicious = shown.filter((artist) => artist.looks_like_several);
+  const plain = shown.filter((artist) => !artist.looks_like_several);
   const open = all.find((artist) => artist.id === openId);
   const artistRow = (artist: ArtistSummary) => (
     <Cell
@@ -88,7 +94,10 @@ export function Library({
         <input
           id="artist-search"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => {
+            setSearch(event.target.value);
+            setRows(ARTIST_PAGE);
+          }}
           placeholder="Search artists"
           autoComplete="off"
         />
@@ -115,7 +124,16 @@ export function Library({
             </Section>
           )}
           <Section title={suspicious.length > 0 ? "All artists" : undefined}>
-            {shown.filter((artist) => !artist.looks_like_several).map(artistRow)}
+            {plain.slice(0, rows).map(artistRow)}
+            {plain.length > rows && (
+              <Cell
+                tone="accent"
+                lead={<Icon name="chevron" />}
+                title={`Show ${Math.min(ARTIST_PAGE, plain.length - rows)} more`}
+                subtitle={`${rows.toLocaleString()} of ${plain.length.toLocaleString()} shown. Searching looks through all of them.`}
+                onClick={() => setRows((current) => current + ARTIST_PAGE)}
+              />
+            )}
             {shown.length === 0 && (
               <Cell title="No artist matches" subtitle="Try another spelling" />
             )}

@@ -64,7 +64,7 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `candidates` | One row per suggestion from a source: full field set, `score`, `score_breakdown` (JSON: sources, duration delta, audio recognition, artwork), artist credits, artwork list and status |
 | `artwork_overrides` | Cover chosen by you for a file, so it survives a rescan |
 | `canonical_names` | Preferred spelling of artist/album names (aliases, Latin vs. original script) |
-| `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
+| `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed; `second_look` marks a song that already had its one extra look |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
 | `requests` | One row per link someone asked for; Telegram status message ids |
 | `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
@@ -145,6 +145,9 @@ Each duplicate group is one job (`scan::process::process_file`). A job gets two 
 2. **Identify** with the source cascade (§10). A source that answers 401 (wrong key) is skipped
    for the rest of that check. A 429, a 403, a 503, a "quota" or "rate limit" answer or a
    timeout pauses it for 30 s, doubling up to 5 minutes, after which it is asked again. A song
+   that was identified while a source was paused and was left unsure (in Review, no match
+   chosen) is identified once more, five minutes later (`automatic_scan_files.second_look`),
+   so it does not wait in Review for good without that source. There is no third look. A song
    that makes the identifier panic is marked failed (Issues) and the scan carries on. iTunes gets at most one search every 3 s (Apple allows ~20 a
    minute).
 3. **Sort** candidates by trust tier, then score.
@@ -645,7 +648,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie-fi |
 | `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
 | `GET /library/recent` | The songs filed most recently |
-| `GET /artists` | Every artist with song count, spellings, "looks like two" and albums spelled two ways |
+| `GET /artists` | Every artist with song count, spellings, "looks like two" and albums spelled two ways. The songs are read once and counted in the program; the page draws 100 artists at a time and searches all of them. |
 | `POST /artists/{id}` | Rename, join, split or confirm an artist, or make one album of a split album (`join_album` with a key from the next route); retags and moves songs |
 | `GET /artists/{id}/albums` | The artist's albums Navidrome shows more than once (`album_changes::split_albums`): each way the album is tagged, the one kept first |
 | `GET /files?path=` | One folder of `library/` ("" is the library): folders with counts, songs |

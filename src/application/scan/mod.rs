@@ -83,7 +83,7 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     if cancelled {
         return Ok(0);
     }
-    remember_scanned_files(&state.pool, &snapshot_files).await?;
+    remember_unmarked_files(&state.pool, &snapshot_files).await?;
     if more_waiting {
         // The next batch starts right after this one is filed, without
         // waiting for the next inbox check.
@@ -112,7 +112,7 @@ pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()
     )
     .await?;
     if !cancelled {
-        remember_scanned_files(&state.pool, &snapshot_files).await?;
+        remember_unmarked_files(&state.pool, &snapshot_files).await?;
     }
     Ok(())
 }
@@ -302,13 +302,29 @@ async fn automatic_pending_files(
         .map_or(i64::MAX, |time| {
             i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
         });
-    let rows: Vec<(String, i64, i64)> =
-        sqlx::query_as("SELECT path,file_size,file_mtime_ns FROM automatic_scan_files")
+    let rows: Vec<(String, i64, i64, String)> =
+        sqlx::query_as("SELECT path,file_size,file_mtime_ns,checked_at FROM automatic_scan_files")
             .fetch_all(pool)
             .await?;
+    // Songs that wait for a second look are left alone until the longest
+    // pause of a source is over.
+    let too_early = |checked_at: &str| {
+        chrono::DateTime::parse_from_rfc3339(checked_at).is_ok_and(|checked| {
+            Utc::now()
+                .signed_duration_since(checked)
+                .to_std()
+                .unwrap_or_default()
+                < SECOND_LOOK_AFTER
+        })
+    };
+    let not_yet = rows
+        .iter()
+        .filter(|(_, size, _, checked_at)| *size == SECOND_LOOK_PENDING && too_early(checked_at))
+        .map(|(path, ..)| path.clone())
+        .collect::<std::collections::HashSet<_>>();
     let mut known = rows
         .into_iter()
-        .map(|(path, size, modified)| (path, (size, modified)))
+        .map(|(path, size, modified, _)| (path, (size, modified)))
         .collect::<HashMap<_, _>>();
     let candidates = inbox
         .into_iter()
@@ -320,7 +336,10 @@ async fn automatic_pending_files(
         let Ok(stamp) = files::stamp(&path).await else {
             continue;
         };
-        if stamp.1 <= settled_before && previous != Some(stamp) {
+        if stamp.1 <= settled_before
+            && previous != Some(stamp)
+            && !not_yet.contains(path.to_string_lossy().as_ref())
+        {
             pending.push(path);
         }
     }
@@ -335,6 +354,76 @@ async fn automatic_pending_files(
         transaction.commit().await?;
     }
     Ok(pending)
+}
+
+/// How long a song waits for its second look: the longest a source is paused.
+const SECOND_LOOK_AFTER: Duration = Duration::from_secs(5 * 60);
+/// The size stored for a file that waits for its second look. No file has
+/// it, so the file counts as changed and is identified again.
+const SECOND_LOOK_PENDING: i64 = -1;
+
+/// Remembers songs that were identified while a source was paused. The ones
+/// left unsure (in Review with no match chosen) are marked for one more look;
+/// the others, and songs that already had their second look, are remembered
+/// as usual. A song is never looked at a third time: a source that stays
+/// down must not make the inbox check run in circles.
+async fn remember_for_second_look(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
+    for path in files {
+        let text = path.to_string_lossy();
+        let unsure: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tracks WHERE path=? AND stage='review'
+                           AND selected_candidate_id IS NULL)",
+        )
+        .bind(text.as_ref())
+        .fetch_one(pool)
+        .await?;
+        let had_second_look: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM automatic_scan_files WHERE path=? AND second_look=1)",
+        )
+        .bind(text.as_ref())
+        .fetch_one(pool)
+        .await?;
+        if !unsure || had_second_look {
+            remember_scanned_files(pool, std::slice::from_ref(path)).await?;
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO automatic_scan_files(path,file_size,file_mtime_ns,checked_at,second_look)
+             VALUES(?,?,?,?,1)
+             ON CONFLICT(path) DO UPDATE SET
+               file_size=excluded.file_size,
+               file_mtime_ns=excluded.file_mtime_ns,
+               checked_at=excluded.checked_at,
+               second_look=1",
+        )
+        .bind(text.as_ref())
+        .bind(SECOND_LOOK_PENDING)
+        .bind(SECOND_LOOK_PENDING)
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+        tracing::info!(file = %path.display(), "a source was paused; this song gets a second look");
+    }
+    Ok(())
+}
+
+/// [`remember_scanned_files`] for the end of a run: every file of the run is
+/// remembered, except those just marked for a second look.
+async fn remember_unmarked_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
+    let waiting: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM automatic_scan_files WHERE file_size=?")
+            .bind(SECOND_LOOK_PENDING)
+            .fetch_all(pool)
+            .await?;
+    let waiting = waiting
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let unmarked = files
+        .iter()
+        .filter(|path| !waiting.contains(path.to_string_lossy().as_ref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    remember_scanned_files(pool, &unmarked).await
 }
 
 async fn remember_scanned_files(pool: &sqlx::SqlitePool, files: &[PathBuf]) -> Result<()> {
@@ -381,6 +470,7 @@ async fn run_files(
         // rate limits.
         songrec: Semaphore::new(2),
         disabled_providers: Mutex::new(HashMap::new()),
+        lookups_missed: std::sync::atomic::AtomicU64::new(0),
     });
     state
         .set_workflow(
@@ -421,6 +511,9 @@ async fn run_files(
                 // marked failed and shown in Issues, and this worker carries
                 // on with the next song. (When every worker died, the scan
                 // used to wait forever with the workflow slot taken.)
+                let missed_before = limits
+                    .lookups_missed
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let work = AbortOnDrop(tokio::spawn({
                     let (state, limits) = (state.clone(), limits.clone());
                     async move { process_file(&state, &limits, job, total).await }
@@ -444,7 +537,20 @@ async fn run_files(
                 if state.workflow_cancelled().await {
                     break;
                 }
-                if let Err(error) = remember_scanned_files(&state.pool, &paths).await {
+                // A source was paused while this song was identified. If the
+                // song was left unsure, it is looked at once more when the
+                // source is back; otherwise it would wait in Review for good
+                // without the answer of what may be its best source.
+                let source_missed = limits
+                    .lookups_missed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    != missed_before;
+                let remembered = if source_missed {
+                    remember_for_second_look(&state.pool, &paths).await
+                } else {
+                    remember_scanned_files(&state.pool, &paths).await
+                };
+                if let Err(error) = remembered {
                     tracing::warn!(%error, "could not remember a scanned file");
                 }
             }
@@ -645,6 +751,9 @@ pub(super) struct PipelineLimits {
     pub(super) acoustid: Semaphore,
     pub(super) songrec: Semaphore,
     pub(super) disabled_providers: Mutex<HashMap<String, ProviderPause>>,
+    /// How often a song went on without a source that was paused for a while
+    /// (a rate limit, a timeout).
+    pub(super) lookups_missed: std::sync::atomic::AtomicU64,
 }
 
 pub(super) struct FileJob {
@@ -691,6 +800,7 @@ mod tests {
             acoustid: Semaphore::new(1),
             songrec: Semaphore::new(1),
             disabled_providers: Mutex::new(HashMap::new()),
+            lookups_missed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -797,6 +907,92 @@ mod tests {
         let (batch, more_waiting) = next_batch(vec![PathBuf::from("/music/inbox/a.mp3")], staging);
         assert_eq!(batch.len(), 1);
         assert!(!more_waiting);
+    }
+
+    #[tokio::test]
+    async fn a_song_left_unsure_while_a_source_was_paused_gets_one_second_look() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("second-look.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let file = |name: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path.canonicalize().unwrap()
+        };
+        let (unsure, chosen, filed) = (file("unsure.mp3"), file("chosen.mp3"), file("filed.mp3"));
+        for (path, stage, selected) in [(&unsure, "review", None), (&chosen, "review", Some(7))] {
+            sqlx::query(
+                "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
+                   last_scanned_at,stage,selected_candidate_id)
+                 VALUES(?,'x','needs_review',0,'now','now','now',?,?)",
+            )
+            .bind(path.to_string_lossy().as_ref())
+            .bind(stage)
+            .bind(selected)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let all = vec![unsure.clone(), chosen.clone(), filed.clone()];
+        let pending = |pool: sqlx::SqlitePool| {
+            let all = all.clone();
+            async move {
+                automatic_pending_files(&pool, all, vec![], Duration::ZERO)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A source was paused while all three were identified.
+        remember_for_second_look(&pool, &all).await.unwrap();
+        // The end of the run does not undo the mark.
+        remember_unmarked_files(&pool, &all).await.unwrap();
+        // Nothing is asked again right away: the source may still be paused.
+        assert!(pending(pool.clone()).await.is_empty());
+
+        // Five minutes later only the unsure song is looked at again. A song
+        // with a chosen match or one that is not in Review is left alone.
+        sqlx::query("UPDATE automatic_scan_files SET checked_at=?")
+            .bind((Utc::now() - chrono::Duration::minutes(6)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending(pool.clone()).await, vec![unsure.clone()]);
+
+        // The source is still down at the second look: no third one.
+        remember_for_second_look(&pool, std::slice::from_ref(&unsure))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE automatic_scan_files SET checked_at=?")
+            .bind((Utc::now() - chrono::Duration::minutes(6)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(pending(pool.clone()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_paused_source_counts_the_songs_that_went_on_without_it() {
+        let limits = limits();
+        let missed = || {
+            limits
+                .lookups_missed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert!(!provider_disabled(&limits, "itunes").await);
+        assert_eq!(missed(), 0);
+        let busy = anyhow::anyhow!("HTTP status client error (429 Too Many Requests)");
+        handle_provider_error(&limits, "a.mp3", "itunes", busy).await;
+        assert_eq!(missed(), 1);
+        assert!(provider_disabled(&limits, "itunes").await);
+        assert_eq!(missed(), 2);
+        // A refused key is off for good; waiting would not help.
+        let refused = anyhow::anyhow!("HTTP status client error (401 Unauthorized)");
+        handle_provider_error(&limits, "a.mp3", "spotify", refused).await;
+        assert!(provider_disabled(&limits, "spotify").await);
+        assert_eq!(missed(), 2);
     }
 
     #[tokio::test]

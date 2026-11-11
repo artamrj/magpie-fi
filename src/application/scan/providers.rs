@@ -1107,12 +1107,23 @@ pub(crate) struct ProviderPause {
 }
 
 pub(crate) async fn provider_disabled(limits: &PipelineLimits, provider: &str) -> bool {
-    limits
-        .disabled_providers
-        .lock()
-        .await
-        .get(provider)
-        .is_some_and(|pause| pause.until.is_none_or(|until| Instant::now() < until))
+    let pauses = limits.disabled_providers.lock().await;
+    let Some(pause) = pauses.get(provider) else {
+        return false;
+    };
+    match pause.until {
+        // Off for the whole scan (a wrong key): nothing to wait for.
+        None => true,
+        Some(until) if Instant::now() < until => {
+            // A song goes on without this source. It is counted, so the songs
+            // identified meanwhile can get a second look (see `run_files`).
+            limits
+                .lookups_missed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Some(_) => false,
+    }
 }
 
 /// Pauses a source after a failure. A refused key turns it off for the rest of
@@ -1175,6 +1186,11 @@ pub(crate) async fn handle_provider_error(
     };
 
     if let Some((reason, permanent)) = pause_reason {
+        if !permanent {
+            limits
+                .lookups_missed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(how_long) = pause_provider(limits, provider, permanent).await {
             tracing::warn!(
                 file = filename,

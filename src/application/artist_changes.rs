@@ -50,80 +50,86 @@ pub struct Changed {
     pub moved: usize,
 }
 
-/// id, name, MusicBrainz ID, one artist, songs, spellings.
-type SummaryRow = (i64, String, Option<String>, bool, i64, Option<String>);
-
 /// Every artist with songs in the library, most songs first.
+///
+/// The songs are read once and counted here. Counting inside the query (one
+/// search through every song for every artist) took artists × songs steps:
+/// eight million for 2,000 artists and 4,000 songs, each time the page asked.
 pub async fn list(pool: &SqlitePool) -> Result<Vec<ArtistSummary>> {
-    let rows: Vec<SummaryRow> = sqlx::query_as(
-        "SELECT artists.id, artists.name, artists.musicbrainz_id, artists.single_entity,
-                (SELECT count(*) FROM library_items
-                  WHERE artist_ids LIKE '%|' || artists.id || '|%') AS songs,
-                (SELECT group_concat(spelling, char(31)) FROM artist_names
-                  WHERE artist_names.artist_id=artists.id) AS spellings
-         FROM artists WHERE songs > 0 ORDER BY songs DESC, artists.name",
-    )
-    .fetch_all(pool)
-    .await?;
-    let albums_to_check = albums_spelled_twice(pool).await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(id, name, musicbrainz_id, single_entity, songs, spellings)| {
-                let mut spellings = spellings
-                    .unwrap_or_default()
-                    .split('\u{1f}')
-                    .filter(|spelling| !spelling.is_empty() && *spelling != name)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                spellings.sort();
-                spellings.dedup();
-                let looks_like_several = !single_entity
-                    && [
-                        " & ", ", ", " x ", " X ", " و ", "، ", " with ", " vs ", " feat", " ft. ",
-                    ]
-                    .iter()
-                    .any(|separator| name.contains(separator));
-                ArtistSummary {
-                    albums_to_check: albums_to_check.get(&id).copied().unwrap_or(0),
-                    id,
-                    name,
-                    spellings,
-                    songs,
-                    musicbrainz_id,
-                    single_entity,
-                    looks_like_several,
-                }
-            },
-        )
-        .collect())
-}
-
-/// Per main artist: how many albums have songs that spell the album name differently.
-async fn albums_spelled_twice(pool: &SqlitePool) -> Result<std::collections::HashMap<i64, usize>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT artist_ids, album FROM library_items
-         WHERE artist_ids IS NOT NULL AND album IS NOT NULL AND album<>''",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut spellings = std::collections::HashMap::<(i64, String), BTreeSet<String>>::new();
-    for (ids, album) in rows {
-        let Some(&main) = ids_from_text(&ids).first() else {
-            continue;
-        };
-        let key = crate::domain::names::album_key(&album);
-        if !key.is_empty() {
-            spellings.entry((main, key)).or_default().insert(album);
+    let songs: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT artist_ids, album FROM library_items WHERE artist_ids IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    let mut song_counts = std::collections::HashMap::<i64, i64>::new();
+    // Per main artist and album: the ways the album name is spelled.
+    let mut album_spellings = std::collections::HashMap::<(i64, String), BTreeSet<String>>::new();
+    for (ids, album) in songs {
+        let ids = ids_from_text(&ids);
+        for id in ids.iter().collect::<BTreeSet<_>>() {
+            *song_counts.entry(*id).or_default() += 1;
+        }
+        if let (Some(&main), Some(album)) = (ids.first(), album.filter(|album| !album.is_empty())) {
+            let key = crate::domain::names::album_key(&album);
+            if !key.is_empty() {
+                album_spellings
+                    .entry((main, key))
+                    .or_default()
+                    .insert(album);
+            }
         }
     }
-    let mut counts = std::collections::HashMap::new();
-    for ((artist, _), names) in spellings {
+    // How many albums of an artist have songs that spell the album name differently.
+    let mut albums_to_check = std::collections::HashMap::<i64, usize>::new();
+    for ((artist, _), names) in album_spellings {
         if names.len() > 1 {
-            *counts.entry(artist).or_default() += 1;
+            *albums_to_check.entry(artist).or_default() += 1;
         }
     }
-    Ok(counts)
+    let mut spellings = std::collections::HashMap::<i64, Vec<String>>::new();
+    let names: Vec<(i64, String)> = sqlx::query_as("SELECT artist_id, spelling FROM artist_names")
+        .fetch_all(pool)
+        .await?;
+    for (artist, spelling) in names {
+        spellings.entry(artist).or_default().push(spelling);
+    }
+
+    let artists: Vec<(i64, String, Option<String>, bool)> =
+        sqlx::query_as("SELECT id, name, musicbrainz_id, single_entity FROM artists")
+            .fetch_all(pool)
+            .await?;
+    let mut list = artists
+        .into_iter()
+        .filter_map(|(id, name, musicbrainz_id, single_entity)| {
+            let songs = song_counts.get(&id).copied().filter(|songs| *songs > 0)?;
+            let mut spellings = spellings.remove(&id).unwrap_or_default();
+            spellings.retain(|spelling| !spelling.is_empty() && *spelling != name);
+            spellings.sort();
+            spellings.dedup();
+            let looks_like_several = !single_entity
+                && [
+                    " & ", ", ", " x ", " X ", " و ", "، ", " with ", " vs ", " feat", " ft. ",
+                ]
+                .iter()
+                .any(|separator| name.contains(separator));
+            Some(ArtistSummary {
+                albums_to_check: albums_to_check.get(&id).copied().unwrap_or(0),
+                id,
+                name,
+                spellings,
+                songs,
+                musicbrainz_id,
+                single_entity,
+                looks_like_several,
+            })
+        })
+        .collect::<Vec<_>>();
+    list.sort_by(|left, right| {
+        right
+            .songs
+            .cmp(&left.songs)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(list)
 }
 
 pub async fn rename(state: &Arc<AppState>, id: i64, new_name: &str) -> Result<Changed> {
@@ -671,6 +677,68 @@ mod tests {
         );
         assert_eq!(std::fs::read(to.join("Album/other.mp3")).unwrap(), b"other");
         assert!(!root.join(".Artist.magpie-fi-rename").exists());
+    }
+
+    #[tokio::test]
+    async fn the_artist_list_counts_songs_and_stays_quick_at_library_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path()).await;
+        let mut transaction = state.pool.begin().await.unwrap();
+        for artist in 1..=2000_i64 {
+            sqlx::query(
+                "INSERT INTO artists(id,name,created_at,updated_at) VALUES(?,?,'now','now')",
+            )
+            .bind(artist)
+            .bind(format!("Artist {artist:04}"))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO artist_names(match_key,artist_id,spelling,source)
+             VALUES('one',1,'Artist 0001','auto'),('uno',1,'Artist Uno','auto')",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        for song in 0..4000_i64 {
+            // Artist 1 sings 1,000 songs; 500 of them are duets with artist 2;
+            // artist 3 has one album spelled two ways; artist 2000 has no song.
+            let (ids, album) = match song {
+                0..500 => ("|1|2|".to_owned(), "Album".to_owned()),
+                500..1000 => ("|1|".to_owned(), "Album".to_owned()),
+                1000 => ("|3|".to_owned(), "Khalij".to_owned()),
+                1001 => ("|3|".to_owned(), "khalij".to_owned()),
+                _ => (format!("|{}|", 4 + song % 1990), "Album".to_owned()),
+            };
+            sqlx::query(
+                "INSERT INTO library_items(path,file_size,file_mtime_ns,content_key,format,source,
+                   added_at,checked_at,artist_ids,album)
+                 VALUES(?,1,1,?,'mp3','index','now','now',?,?)",
+            )
+            .bind(format!("/library/{song}.mp3"))
+            .bind(format!("fp:{song}"))
+            .bind(ids)
+            .bind(album)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let artists = list(&state.pool).await.unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(artists.len(), 1993, "artists without a song are left out");
+        assert_eq!((artists[0].id, artists[0].songs), (1, 1000));
+        assert_eq!(artists[0].spellings, ["Artist Uno"]);
+        assert_eq!((artists[1].id, artists[1].songs), (2, 500));
+        let third = artists.iter().find(|artist| artist.id == 3).unwrap();
+        assert_eq!((third.songs, third.albums_to_check), (2, 1));
+        assert!(artists.iter().all(|artist| artist.id != 2000));
+        // It used to take artists × songs steps (seconds at this size).
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// A filed song by `artist`, with its index row.
