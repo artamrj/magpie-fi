@@ -1004,6 +1004,7 @@ pub(crate) async fn apply_artwork_override(
                 url: cover_url.clone(),
                 user_confirmed: true,
                 own_record: false,
+                same_recording: false,
                 release_id: candidate.release_id.clone(),
                 isrc: candidate.isrc.clone(),
                 album: candidate.album.clone(),

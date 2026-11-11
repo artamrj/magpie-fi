@@ -692,6 +692,7 @@ pub async fn update_artwork(
         url: cover_url.clone(),
         user_confirmed: true,
         own_record: false,
+        same_recording: false,
         release_id: selected.release_id.clone(),
         isrc: selected.isrc.clone(),
         album: selected.album.clone(),

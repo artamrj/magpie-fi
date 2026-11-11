@@ -494,8 +494,13 @@ second. `RUST_LOG=magpie_fi=debug` logs what every source returned or why it was
   iTunes and Deezer by title); then the **album itself**: the front cover of the MusicBrainz
   release group (any edition of the same album, Cover Art Archive), and album searches by album
   name and album artist on iTunes (`entity=album`) and Deezer (`search/album`). Each is still
-  checked against album and artist (the album artist counts too). The release and its tags
-  never change. Only then is the cover "missing"; the time of that search is stored as
+  checked against album and artist (the album artist counts too). A song filed as its own
+  single (its album is only its own title) has no album to compare, so it takes the cover of
+  the release the same recording is on in the store: same title, artist and version, a single
+  of the song before an album, never a compilation ("Nemesis" gets the cover of "At Least for
+  Now"). A named release, such as a live single, keeps the strict check. Rows of a fresh
+  store search carry the song's whole length, not its difference from the file, and are
+  compared without a length. The release and its tags never change. Only then is the cover "missing"; the time of that search is stored as
   `metadata_completion.cover_searched_at`.
 - **Cover finder** (`src/application/cover_finder.rs`): in every inbox cycle, between identifying
   and filing, it runs the cover worker again for songs in Review whose chosen match lacks a cover

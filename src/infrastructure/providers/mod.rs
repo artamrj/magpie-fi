@@ -88,6 +88,11 @@ pub struct ArtworkCandidate {
     /// belongs to it by definition (no album or artist comparison needed).
     #[serde(default)]
     pub own_record: bool,
+    /// The cover came from a catalog row of this same recording: the title,
+    /// artist and version agree. Its album may be another one (the album the
+    /// song is on, for a song filed as its own single).
+    #[serde(default)]
+    pub same_recording: bool,
     pub release_id: Option<String>,
     pub isrc: Option<String>,
     pub album: Option<String>,
