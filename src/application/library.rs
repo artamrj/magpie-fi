@@ -1041,8 +1041,7 @@ mod tests {
         let library = directory.path();
         let folder = library.join("Ebi/Khalij (1999)");
         std::fs::create_dir_all(&folder).unwrap();
-        // FLAC: lofty 0.24 does not write MusicBrainz album IDs into MP3 files.
-        let filed = folder.join("01 - Hamdam.flac");
+        let filed = folder.join("01 - Hamdam.mp3");
         let status = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
             .arg("sine=frequency=440:duration=0.1")
