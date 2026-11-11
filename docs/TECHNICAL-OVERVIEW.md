@@ -193,11 +193,12 @@ step now. `src/application/apply.rs`:
 
 | Part | File | Job |
 |---|---|---|
-| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube; Shazam `/song/<n>/` links through the iTunes Lookup API (the number is the Apple Music ID; Shazam's pages refuse automated requests), the Shazam page only as a fallback. Only public pages and documented APIs. |
+| Link reading | `links.rs` | Spotify embed page, iTunes Lookup API and Apple playlist page, Deezer public API, yt-dlp for YouTube; Shazam `/song/<n>/` links through the iTunes Lookup API (the number is the Apple Music ID; Shazam's pages refuse automated requests), the Shazam page only as a fallback; Radio Javan `/podcast/<slug>` links through Radio Javan's public API (one episode; Premium-only episodes are refused). Only public pages and documented APIs. |
 | Queue | `store.rs` | `requests`, `wanted`, `playlists`. Retries after 30 s, 2 min, 10 min; then failed. A request's `title` falls back to its first song. |
 | Matching | `matching.rs` | Title 45 %, artist 35 %, length 20 %, version penalties (live, remix, sped up …). Official YouTube Music songs first, ordinary videos only as a strict fallback. |
 | yt-dlp | `ytdlp.rs` | YouTube Music search, details, playlists, audio download (stream copy to m4a/opus), daily self-update of the copy in `DATA_DIR/bin`. |
 | Worker | `worker.rs` | Per song: already in the library (same link or video, ISRC, or same title + first artist + length)? → choose the source → download to `.magpie-fi/staging/` → write the link's title/artist/album/ISRC as tags. |
+| Podcasts | `podcast.rs` | A Radio Javan podcast episode is downloaded from Radio Javan's own MP3 (free, no DRM, stored as sent) with the shared client and a 30-minute limit for that request, at most 1 GB, into `staging/.part/` first. Not from YouTube: a one-hour mix is rarely there in one piece. |
 
 Downloads are then identified and filed by the normal inbox cycle. When a download is filed, or
 found to be in the library already, `acquire::downloaded_file_done` records the library path and
@@ -386,12 +387,16 @@ cheap and free ones first:
 3. **MusicBrainz** text search.
 4. **Apple Music (iTunes)**, **Deezer**, **Radio Javan**, **Audiomack** (an upload site),
    **Navahang** — free
-   catalogs, good for Persian and international music.
+   catalogs, good for Persian and international music. Radio Javan's search also returns
+   podcast episodes (DJ mixes): artist = the DJ, album = the show, track = the episode
+   number, release type `broadcast` with secondary type `dj-mix`.
 5. **Genius**, only when the results still lack details.
 6. **Deezer by ISRC** (`track/isrc:…`, free), when the file has an ISRC tag and no source
    returned that code yet. Finds songs whose names are spelled differently in the catalogs.
 7. **SongRec** (Shazam recognition), when AcoustID found nothing and no candidate scores ≥ 90,
    or on the second pass when the text sources could not decide (§9); at most two at a time.
+   Never for a file longer than 20 minutes (`scan::providers::is_long_mix`): Shazam hears a
+   slice, so on a DJ mix it names one song in it.
    Its artist/title is fed back through the catalogs of step 3–5.
 8. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
    service is used.

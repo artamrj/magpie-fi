@@ -65,6 +65,7 @@ pub(crate) async fn identify(
     let has_strong_free_candidate = out.iter().any(|candidate| candidate.score >= 90.0);
     let mut recognized_info = None;
     let listened = infra_providers::songrec::available()
+        && !is_long_mix(current.duration)
         && match listen {
             Listen::WhenUnsure => !acoustid_matched && !has_strong_free_candidate,
             Listen::Always => true,
@@ -138,6 +139,16 @@ pub(crate) async fn identify(
         candidates: out,
         listened,
     })
+}
+
+/// Files longer than this are DJ mixes, podcasts or whole concerts, not one song.
+const LONG_MIX_SECONDS: f64 = 20.0 * 60.0;
+
+/// SongRec sends Shazam a slice of the file, so on a one-hour mix it names whichever song
+/// plays in that slice ("Shamdoony" for "Dor Dor 8"). Such a file is found by its tags and
+/// length only (Radio Javan lists DJ mixes as podcasts).
+pub(crate) fn is_long_mix(duration: f64) -> bool {
+    duration > LONG_MIX_SECONDS
 }
 
 /// Looks the file's own ISRC up on Deezer (free, no key), unless a source

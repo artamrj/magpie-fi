@@ -22,7 +22,7 @@ pub async fn create_request(
         .unwrap_or_else(|_| raw.to_owned());
     let Some(link) = links::classify(&url) else {
         return Err(ApiError::validation(
-            "magpie-fi can read Spotify, Apple Music, Deezer, YouTube, YouTube Music and Shazam links",
+            "magpie-fi can read Spotify, Apple Music, Deezer, YouTube, YouTube Music and Shazam links, and Radio Javan podcasts",
         ));
     };
     // The same link again: the existing entry is tried again instead of a second one.

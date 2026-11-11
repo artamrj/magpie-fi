@@ -4,6 +4,7 @@
 
 pub mod links;
 pub mod matching;
+pub mod podcast;
 pub mod store;
 pub mod worker;
 pub mod ytdlp;

@@ -162,7 +162,8 @@ pub(crate) async fn process(
         .await?;
         let can_listen_again = !identified.listened
             && listen == Listen::WhenUnsure
-            && infra_providers::songrec::available();
+            && infra_providers::songrec::available()
+            && !super::providers::is_long_mix(info.duration);
         let mut candidates = identified.candidates;
         let raw_candidate_count = candidates.len();
         dedupe_candidates(&mut candidates);

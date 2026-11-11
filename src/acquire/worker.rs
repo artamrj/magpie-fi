@@ -2,10 +2,13 @@
 //! already in the library? → find the right YouTube Music upload → download it
 //! into `.magpie-fi/staging/` → write what the link said as tags → hand it to the
 //! inbox cycle, which identifies and files it like any other new music.
+//! A Radio Javan podcast episode is downloaded from Radio Javan instead (see
+//! [`super::podcast`]).
 
 use super::{
     links,
     matching::{self, Candidate, Target},
+    podcast,
     store::{self, WantedRow},
     ytdlp,
 };
@@ -21,7 +24,10 @@ enum Outcome {
     /// Already in the library at this path.
     InLibrary(String),
     /// Downloaded into staging; the inbox cycle takes it from here.
-    Downloaded { path: PathBuf, youtube_id: String },
+    Downloaded {
+        path: PathBuf,
+        youtube_id: Option<String>,
+    },
 }
 
 struct Failure {
@@ -105,7 +111,7 @@ async fn process(state: &Arc<AppState>, library: &LibraryIndex, row: WantedRow) 
         Ok(Outcome::Downloaded { path, youtube_id }) => {
             tracing::info!(song = %label, file = %path.display(), "downloaded; identifying next");
             if let Err(error) =
-                store::mark_identifying(&state.pool, row.id, &path, Some(&youtube_id)).await
+                store::mark_identifying(&state.pool, row.id, &path, youtube_id.as_deref()).await
             {
                 tracing::warn!(%error, "could not record a download");
             }
@@ -132,6 +138,29 @@ async fn acquire(
     if let Some(path) = in_library(&state.pool, library, row).await? {
         return Ok(Outcome::InLibrary(path));
     }
+    if let Some(url) = row
+        .source_url
+        .as_deref()
+        .filter(|url| podcast::is_podcast_link(url))
+    {
+        let path = podcast::download(
+            &state.pool,
+            &state.client,
+            config,
+            url,
+            &format!("w{}", row.id),
+        )
+        .await
+        .map_err(|failure| Failure {
+            message: format!("{:#}", failure.error),
+            retry: failure.retry,
+        })?;
+        tag_download(&path, row).await;
+        return Ok(Outcome::Downloaded {
+            path,
+            youtube_id: None,
+        });
+    }
     let youtube_id = match row.youtube_id.clone() {
         Some(id) => id,
         None => choose_source(config, row).await?,
@@ -153,7 +182,15 @@ async fn acquire(
         retry: !format!("{error:#}").contains("unavailable"),
         message: format!("{error:#}"),
     })?;
-    let tagged = path.clone();
+    tag_download(&path, row).await;
+    Ok(Outcome::Downloaded {
+        path,
+        youtube_id: Some(youtube_id),
+    })
+}
+
+async fn tag_download(path: &std::path::Path, row: &WantedRow) {
+    let tagged = path.to_owned();
     let song = row.clone();
     if let Err(error) = tokio::task::spawn_blocking(move || write_request_tags(&tagged, &song))
         .await
@@ -162,7 +199,6 @@ async fn acquire(
     {
         tracing::warn!(%error, "could not write the request's tags; identification uses the file as is");
     }
-    Ok(Outcome::Downloaded { path, youtube_id })
 }
 
 /// Library songs by normalized title and artist, for [`in_library`]. Built
