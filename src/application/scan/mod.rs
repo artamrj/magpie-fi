@@ -52,8 +52,12 @@ pub async fn run_automatic(state: Arc<AppState>) -> Result<usize> {
     let cfg = &state.config;
     let (files, walk_errors) = discover_files_in_background(PathBuf::from(&cfg.input_dir)).await?;
     let (downloads, _) = discover_files_in_background(cfg.staging_dir.clone()).await?;
+    let walked_cleanly = walk_errors.is_empty();
     for error in walk_errors {
         tracing::error!(error, "inbox folder walk error");
+    }
+    if walked_cleanly && let Ok(inbox) = tokio::fs::canonicalize(&cfg.input_dir).await {
+        forget_deleted_songs(&state, &inbox).await?;
     }
     let settle = Duration::from_secs(cfg.inbox_settle_seconds);
     let pending = automatic_pending_files(&state.pool, files, downloads, settle).await?;
@@ -91,6 +95,158 @@ pub async fn retry_files(state: Arc<AppState>, files: Vec<PathBuf>) -> Result<()
         remember_scanned_files(&state.pool, &snapshot_files).await?;
     }
     Ok(())
+}
+
+/// Clears a song from Review without touching any file: its cached checks, its
+/// download entry and its row. When other copies of the same recording were
+/// waiting behind it as duplicates, the best one takes its place and its matches.
+/// `source` is the file's real path (the recorded path when the file is gone).
+pub async fn forget_track(
+    pool: &sqlx::SqlitePool,
+    track: &crate::infrastructure::db::tracks::Track,
+    source: &Path,
+) -> Result<()> {
+    sqlx::query("UPDATE wanted SET status='removed',error=NULL,updated_at=? WHERE staging_path=?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(source.to_string_lossy().as_ref())
+        .execute(pool)
+        .await?;
+    let canonical_path = source.to_string_lossy().into_owned();
+    let mut transaction = pool.begin().await?;
+    for table in [
+        "fingerprint_cache",
+        "content_hash_cache",
+        "integrity_cache",
+        "artwork_overrides",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE path=? OR path=?"
+        )))
+        .bind(&track.path)
+        .bind(&canonical_path)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    if let Some(content_key) = track.content_fingerprint.as_deref() {
+        let duplicate_tracks: Vec<crate::infrastructure::db::tracks::Track> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM tracks
+             WHERE id!=? AND status='duplicate' AND stage='skipped'
+               AND content_fingerprint=? AND is_missing=0
+               AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+                crate::infrastructure::db::tracks::TRACK_FIELDS
+            )))
+            .bind(track.id.0)
+            .bind(content_key)
+            .bind(content_key)
+            .bind(track.duration)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let evidence = duplicate_tracks
+            .iter()
+            .map(|duplicate| input_dedup::RecordingEvidence {
+                path: duplicate.path.clone().into(),
+                format: duplicate.format.clone().unwrap_or_default(),
+                bitrate: duplicate
+                    .bitrate
+                    .and_then(|value| u32::try_from(value).ok()),
+                duration: duplicate.duration,
+                content_key: duplicate.content_fingerprint.clone(),
+                isrc: None,
+                fingerprint: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(group) = input_dedup::group_recordings(&evidence).first() {
+            let promoted = &duplicate_tracks[group.representative];
+            sqlx::query("DELETE FROM candidates WHERE track_id=?")
+                .bind(promoted.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE candidates SET track_id=? WHERE track_id=?")
+                .bind(promoted.id.0)
+                .bind(track.id.0)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=NULL,status='review',stage='review',
+                 selected_candidate_id=NULL,error=NULL,
+                 stage_message='Promoted after the previous duplicate representative was removed',
+                 updated_at=? WHERE id=?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE tracks SET output_path=?,stage_message=?,updated_at=?
+                 WHERE id!=? AND status='duplicate' AND stage='skipped'
+                   AND content_fingerprint=?
+                   AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
+            )
+            .bind(&promoted.path)
+            .bind(format!("Duplicate of input file: {}", promoted.path))
+            .bind(Utc::now().to_rfc3339())
+            .bind(promoted.id.0)
+            .bind(content_key)
+            .bind(content_key)
+            .bind(track.duration)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    sqlx::query("DELETE FROM tracks WHERE id=?")
+        .bind(track.id.0)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Songs waiting in Review whose file you deleted from the inbox yourself are
+/// dropped, so the list does not keep asking about files that are gone. Only
+/// songs without a chosen match go: a choice you made is kept, and filing
+/// reports that file as missing. Nothing happens while `inbox` itself cannot
+/// be read (an unplugged disk must not empty Review).
+async fn forget_deleted_songs(state: &AppState, inbox: &Path) -> Result<usize> {
+    if tokio::fs::read_dir(inbox).await.is_err() {
+        return Ok(0);
+    }
+    let gone = |path: &str| {
+        let path = PathBuf::from(path);
+        async move {
+            matches!(
+                tokio::fs::metadata(&path).await,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+    };
+    let fields = crate::infrastructure::db::tracks::TRACK_FIELDS;
+    let mut forgotten = 0;
+    // Waiting duplicates first, so a deleted copy is never put in a deleted song's place.
+    for filter in [
+        "status='duplicate' AND stage='skipped'",
+        "stage='review' AND selected_candidate_id IS NULL",
+    ] {
+        let tracks: Vec<crate::infrastructure::db::tracks::Track> = sqlx::query_as(
+            sqlx::AssertSqlSafe(format!("SELECT {fields} FROM tracks WHERE {filter}")),
+        )
+        .fetch_all(&state.pool)
+        .await?;
+        for track in tracks {
+            let path = Path::new(&track.path);
+            let ours = path.starts_with(inbox) || path.starts_with(&state.config.staging_dir);
+            if !ours || !gone(&track.path).await {
+                continue;
+            }
+            forget_track(&state.pool, &track, path).await?;
+            tracing::info!(
+                file = track.filename,
+                "forgot a song whose file was deleted"
+            );
+            forgotten += 1;
+        }
+    }
+    Ok(forgotten)
 }
 
 /// Audio files under `root` as real paths (the form every track row uses).
@@ -574,6 +730,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remembered, 0);
+    }
+
+    #[tokio::test]
+    async fn songs_whose_file_was_deleted_from_the_inbox_leave_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let inbox = directory.path().join("inbox");
+        tokio::fs::create_dir(&inbox).await.unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        let kept = inbox.join("still-here.mp3");
+        tokio::fs::write(&kept, b"audio").await.unwrap();
+        let database = directory.path().join("deleted.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let state = AppState::new(
+            crate::config::Config {
+                input_dir: inbox.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            pool.clone(),
+        );
+        let add = |name: &'static str, path: String, status: &'static str, stage: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,
+                     last_seen_at,last_scanned_at,stage) VALUES(?,?,?,0,'now','now','now',?)",
+                )
+                .bind(path)
+                .bind(name)
+                .bind(status)
+                .bind(stage)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let path = |name: &str| inbox.join(name).to_string_lossy().into_owned();
+        add(
+            "still-here.mp3",
+            path("still-here.mp3"),
+            "needs_review",
+            "review",
+        )
+        .await;
+        add("deleted.mp3", path("deleted.mp3"), "needs_review", "review").await;
+        add(
+            "deleted-copy.mp3",
+            path("deleted-copy.mp3"),
+            "duplicate",
+            "skipped",
+        )
+        .await;
+        // A deleted file elsewhere is not the inbox's business.
+        add(
+            "elsewhere.mp3",
+            "/somewhere/else.mp3".into(),
+            "needs_review",
+            "review",
+        )
+        .await;
+        // A match you already chose is kept; filing reports the missing file.
+        let chosen = add("chosen.mp3", path("chosen.mp3"), "selected", "review").await;
+        let candidate = sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,score) VALUES(?,'manual','Song','Artist',100.0)",
+        )
+        .bind(chosen)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE tracks SET selected_candidate_id=? WHERE id=?")
+            .bind(candidate)
+            .bind(chosen)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // An inbox that cannot be read (an unplugged disk) changes nothing.
+        let unplugged = directory.path().join("not-mounted");
+        assert_eq!(forget_deleted_songs(&state, &unplugged).await.unwrap(), 0);
+
+        assert_eq!(forget_deleted_songs(&state, &inbox).await.unwrap(), 2);
+        let mut left: Vec<String> = sqlx::query_scalar("SELECT filename FROM tracks")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        left.sort();
+        assert_eq!(left, ["chosen.mp3", "elsewhere.mp3", "still-here.mp3"]);
+        assert!(kept.exists());
     }
 
     #[tokio::test]

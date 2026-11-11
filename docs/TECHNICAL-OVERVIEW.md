@@ -116,6 +116,9 @@ new → review (needs you) ──▶ ready ──▶ filed (row deleted)
    name starts with `.` or `@` (unfinished downloads, NAS metadata).
 2. Keep files that are new or changed since the last check (`automatic_scan_files`). Inbox files
    must also be unchanged for `MAGPIE_INBOX_SETTLE_SECONDS`; staging files don't wait.
+   Songs still waiting for a pick (or waiting as a duplicate) whose file you deleted from the
+   inbox are dropped from Review (`forget_deleted_songs`). A song with a chosen match is kept,
+   and nothing is dropped while the inbox folder cannot be read.
 3. For each file, in parallel: read tags and audio properties, check decodability (cached),
    compute a Chromaprint fingerprint (cached) or fall back to SHA-256.
 4. Group duplicates inside the inbox (§8) before any network lookup.
@@ -160,7 +163,8 @@ In Review you can:
   `POST /api/tracks/{id}/artwork/search`.
 - **Undo** (`POST /api/tracks/{id}/review`): clears the choice, keeps the candidates.
 - **Remove** (`DELETE /api/tracks/{id}`): only unresolved Review songs inside the inbox or
-  staging. Your files go to the trash; magpie-fi's downloads are deleted.
+  staging. Your files go to the trash; magpie-fi's downloads are deleted. When the file is
+  already gone, the song is just cleared from the list, whatever state it is in.
 - **Check & fix** (`POST /api/tracks/retry-issues`): re-runs everything in Issues. Corrupt files
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
@@ -559,7 +563,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /stop` | Stop the running workflow at a safe point |
 | `POST /write` | File all Ready songs now |
 | `GET /tracks` | All tracks with their candidates (a plain array) |
-| `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only) |
+| `DELETE /tracks/{id}` | Remove an unresolved Review file (inbox or staging only), or clear a song whose file is gone |
 | `POST /tracks/retry-issues` | Repair and re-run everything in Issues |
 | `POST /tracks/auto-approve` | Smart auto-select over Review (`approved`, `low_confidence`) |
 | `GET /tracks/{id}/audio` | Stream the file (range requests) |

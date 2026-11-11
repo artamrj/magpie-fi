@@ -41,141 +41,49 @@ pub async fn remove_track(
     }
 
     let track = track_db::track(&s.pool, id).await?;
-    if track.stage != TrackStage::Review || track.selected_candidate_id.is_some() {
-        return Err(ApiError::validation(
-            "Only unresolved tracks in Review can be removed",
-        ));
-    }
+    // A file you already deleted yourself leaves nothing to move to the trash:
+    // the song is only cleared from the list, whatever state it was in.
+    let source = match tokio::fs::canonicalize(&track.path).await {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ApiError::Internal(error.into())),
+    };
+    if let Some(source) = &source {
+        if track.stage != TrackStage::Review || track.selected_candidate_id.is_some() {
+            return Err(ApiError::validation(
+                "Only unresolved tracks in Review can be removed",
+            ));
+        }
+        let cfg = &s.config;
+        let input_dir = tokio::fs::canonicalize(&cfg.input_dir)
+            .await
+            .map_err(|error| anyhow::anyhow!("could not verify the music folder: {error}"))?;
+        let in_inbox = *source != input_dir && source.starts_with(&input_dir);
+        if !in_inbox && !source.starts_with(&cfg.staging_dir) {
+            return Err(ApiError::validation(
+                "Refusing to remove a file outside the inbox",
+            ));
+        }
+        if !tokio::fs::metadata(source).await?.is_file() {
+            return Err(ApiError::validation(
+                "The selected music path is not a regular file",
+            ));
+        }
 
-    let cfg = &s.config;
-    let input_dir = tokio::fs::canonicalize(&cfg.input_dir)
-        .await
-        .map_err(|error| anyhow::anyhow!("could not verify the music folder: {error}"))?;
-    let source = tokio::fs::canonicalize(&track.path)
+        // Your own files go to the trash; magpie-fi's downloads are simply deleted.
+        crate::application::library::discard_original(
+            &cfg.trash_dir,
+            &cfg.staging_dir,
+            &input_dir,
+            source,
+        )
         .await
         .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ApiError::not_found("music file no longer exists")
-            } else {
-                ApiError::Internal(error.into())
-            }
+            ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}"))
         })?;
-    let in_inbox = source != input_dir && source.starts_with(&input_dir);
-    if !in_inbox && !source.starts_with(&cfg.staging_dir) {
-        return Err(ApiError::validation(
-            "Refusing to remove a file outside the inbox",
-        ));
     }
-    if !tokio::fs::metadata(&source).await?.is_file() {
-        return Err(ApiError::validation(
-            "The selected music path is not a regular file",
-        ));
-    }
-
-    // Your own files go to the trash; magpie-fi's downloads are simply deleted.
-    crate::application::library::discard_original(
-        &cfg.trash_dir,
-        &cfg.staging_dir,
-        &input_dir,
-        &source,
-    )
-    .await
-    .map_err(|error| ApiError::Internal(anyhow::anyhow!("could not remove music file: {error}")))?;
-    sqlx::query("UPDATE wanted SET status='removed',error=NULL,updated_at=? WHERE staging_path=?")
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(source.to_string_lossy().as_ref())
-        .execute(&s.pool)
-        .await?;
-
-    let canonical_path = source.to_string_lossy().into_owned();
-    let mut transaction = s.pool.begin().await?;
-    for table in [
-        "fingerprint_cache",
-        "content_hash_cache",
-        "integrity_cache",
-        "artwork_overrides",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE path=? OR path=?"
-        )))
-        .bind(&track.path)
-        .bind(&canonical_path)
-        .execute(&mut *transaction)
-        .await?;
-    }
-    if let Some(content_key) = track.content_fingerprint.as_deref() {
-        let duplicate_tracks: Vec<Track> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT {} FROM tracks
-             WHERE id!=? AND status='duplicate' AND stage='skipped'
-               AND content_fingerprint=? AND is_missing=0
-               AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
-            track_db::TRACK_FIELDS
-        )))
-        .bind(track.id.0)
-        .bind(content_key)
-        .bind(content_key)
-        .bind(track.duration)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let evidence = duplicate_tracks
-            .iter()
-            .map(
-                |duplicate| crate::application::input_dedup::RecordingEvidence {
-                    path: duplicate.path.clone().into(),
-                    format: duplicate.format.clone().unwrap_or_default(),
-                    bitrate: duplicate
-                        .bitrate
-                        .and_then(|value| u32::try_from(value).ok()),
-                    duration: duplicate.duration,
-                    content_key: duplicate.content_fingerprint.clone(),
-                    isrc: None,
-                    fingerprint: None,
-                },
-            )
-            .collect::<Vec<_>>();
-        if let Some(group) = crate::application::input_dedup::group_recordings(&evidence).first() {
-            let promoted = &duplicate_tracks[group.representative];
-            sqlx::query("DELETE FROM candidates WHERE track_id=?")
-                .bind(promoted.id.0)
-                .execute(&mut *transaction)
-                .await?;
-            sqlx::query("UPDATE candidates SET track_id=? WHERE track_id=?")
-                .bind(promoted.id.0)
-                .bind(track.id.0)
-                .execute(&mut *transaction)
-                .await?;
-            sqlx::query(
-                "UPDATE tracks SET output_path=NULL,status='review',stage='review',
-                 selected_candidate_id=NULL,error=NULL,
-                 stage_message='Promoted after the previous duplicate representative was removed',
-                 updated_at=? WHERE id=?",
-            )
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(promoted.id.0)
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE tracks SET output_path=?,stage_message=?,updated_at=?
-                 WHERE id!=? AND status='duplicate' AND stage='skipped'
-                   AND content_fingerprint=?
-                   AND (? LIKE 'sha256:%' OR (duration IS NOT NULL AND ABS(duration - ?) <= 3.0))",
-            )
-            .bind(&promoted.path)
-            .bind(format!("Duplicate of input file: {}", promoted.path))
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(promoted.id.0)
-            .bind(content_key)
-            .bind(content_key)
-            .bind(track.duration)
-            .execute(&mut *transaction)
-            .await?;
-        }
-    }
-    sqlx::query("DELETE FROM tracks WHERE id=?")
-        .bind(id.0)
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
+    let source = source.unwrap_or_else(|| PathBuf::from(&track.path));
+    crate::application::scan::forget_track(&s.pool, &track, &source).await?;
 
     tracing::info!(
         file = track.filename,
@@ -1176,6 +1084,44 @@ mod tests {
         );
         assert!(!representative.exists());
         assert!(promoted.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_a_song_whose_file_is_already_gone_clears_it_from_the_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        tokio::fs::create_dir(&input).await.unwrap();
+        let database = directory.path().join("already-gone.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let state = Arc::new(AppState::new(
+            Config {
+                input_dir: input.to_string_lossy().into_owned(),
+                ..Config::default()
+            },
+            pool.clone(),
+        ));
+        // Marked as an issue, as a failed check leaves it: Remove must still work.
+        let track_id = sqlx::query(
+            "INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,
+             last_scanned_at,stage) VALUES(?,'gone.mp3','failed',1,'now','now','now','failed')",
+        )
+        .bind(input.join("gone.mp3").to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        insert_test_candidate(&pool, track_id, "Candidate", 70.0).await;
+
+        let Json(response) = remove_track(State(state), Path(TrackId(track_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(response["removed"], true);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[tokio::test]
