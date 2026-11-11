@@ -524,6 +524,19 @@ pub async fn first_filed_song(pool: &SqlitePool, request_id: i64) -> Result<Opti
     .await?)
 }
 
+/// The library file of the request's first song that is in the library
+/// (filed now, or already there).
+pub async fn first_library_song(pool: &SqlitePool, request_id: i64) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT library_path FROM wanted
+         WHERE request_id=? AND status IN ('filed','in_library') AND library_path IS NOT NULL
+         ORDER BY position LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// May this chat get cards now? Not while an earlier refusal is fresh.
 pub async fn cards_allowed(pool: &SqlitePool, chat_id: i64) -> Result<bool> {
     let until: Option<String> =

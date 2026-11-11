@@ -225,6 +225,9 @@ fn keyboard(summary: &store::RequestSummary, finished: bool, app: Option<String>
         if problems {
             row.push(Action::Details(summary.id).button(texts::DETAILS));
         }
+        if cards::wants_file_button(summary, finished) {
+            row.push(Action::SendFile(summary.id).button(texts::SEND_FILE));
+        }
     }
     let mut rows = Vec::new();
     if !row.is_empty() {

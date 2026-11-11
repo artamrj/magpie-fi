@@ -33,6 +33,8 @@ pub enum Action {
     Invite,
     /// Remove a guest (owners).
     Revoke(i64),
+    /// Send a request's filed song into the chat.
+    SendFile(i64),
 }
 
 impl fmt::Display for Action {
@@ -45,6 +47,7 @@ impl fmt::Display for Action {
             Self::Drop(track) => write!(formatter, "drop:{track}"),
             Self::Invite => write!(formatter, "invite"),
             Self::Revoke(user) => write!(formatter, "revoke:{user}"),
+            Self::SendFile(request) => write!(formatter, "file:{request}"),
         }
     }
 }
@@ -69,6 +72,7 @@ impl Action {
             "drop" => Self::Drop(number()?),
             "invite" => Self::Invite,
             "revoke" => Self::Revoke(number()?),
+            "file" => Self::SendFile(number()?),
             _ => return None,
         };
         // Nothing may follow the expected parts.
@@ -90,7 +94,7 @@ impl Action {
         match self {
             Self::Pick { .. } | Self::Invite => Some("success"),
             Self::Stop(_) | Self::Drop(_) | Self::Revoke(_) => Some("danger"),
-            Self::Retry(_) => Some("primary"),
+            Self::Retry(_) | Self::SendFile(_) => Some("primary"),
             Self::Details(_) => None,
         }
     }
@@ -113,7 +117,10 @@ impl Action {
         let user = user.to_string();
         let pool = &context.state.pool;
         Ok(match self {
-            Self::Stop(request) | Self::Retry(request) | Self::Details(request) => {
+            Self::Stop(request)
+            | Self::Retry(request)
+            | Self::Details(request)
+            | Self::SendFile(request) => {
                 store::requester_of_request(pool, request).await?.as_deref() == Some(user.as_str())
             }
             Self::Pick { track, .. } | Self::Drop(track) => store::requester_of_track(pool, track)
@@ -178,6 +185,13 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
                 };
                 edit(context, chat, message, text, None).await;
             }
+        }
+        Action::SendFile(request) => {
+            answer(context, &query.id, texts::SENDING_FILE).await;
+            // Uploading can take a while; the button is answered already.
+            let chat = message.map_or(query.from.id, |(chat, _)| chat);
+            let context = context.clone();
+            tokio::spawn(async move { super::files::send_song(&context, chat, request).await });
         }
         Action::Invite => {
             let link = super::commands::create_invite(context, query.from.id).await?;
@@ -277,6 +291,12 @@ async fn card_reply(context: &Arc<Context>, query: &WidgetQuery) -> Result<Strin
             }
             message(words)
         }
+        // Cards are only in private chats, whose ID is the person's own.
+        Action::SendFile(request) => {
+            let (context, chat) = (context.clone(), query.from.id);
+            tokio::spawn(async move { super::files::send_song(&context, chat, request).await });
+            message(texts::SENDING_FILE)
+        }
         // Cards don't offer the guest buttons.
         Action::Invite | Action::Revoke(_) => message(""),
     })
@@ -350,6 +370,7 @@ mod tests {
             Action::Drop(12),
             Action::Invite,
             Action::Revoke(200),
+            Action::SendFile(7),
         ];
         for action in actions {
             assert_eq!(Action::parse(&action.to_string()), Some(action));

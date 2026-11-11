@@ -358,6 +358,20 @@ pub const TAP_FAILED: &str = "That didn't work. Try again.";
 pub const STOP: &str = "⏹ Stop";
 pub const RETRY_FAILED: &str = "🔁 Retry failed";
 pub const DETAILS: &str = "ℹ️ Details";
+pub const SEND_FILE: &str = "📲 Send me the file";
+pub const SENDING_FILE: &str = "Sending the file…";
+pub const FILE_GONE: &str = "I can't find that song in the library any more.";
+pub const FILE_FAILED: &str = "Sending the file didn't work. Try again in a moment.";
+
+/// The filed song is over Telegram's 50 MB limit for files bots send.
+pub fn file_too_big(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let megabytes = bytes as f64 / (1024.0 * 1024.0);
+    format!(
+        "This file is {megabytes:.0} MB. Telegram only lets bots send files up to 50 MB, \
+         so play it in Navidrome instead."
+    )
+}
 pub const REMOVED_SONG: &str = "🗑 Removed. It won't be added.";
 pub const SONG_ALREADY_GONE: &str = "That song is already gone.";
 pub const PICKED: &str = "✅ Got it. Filing it now.";
