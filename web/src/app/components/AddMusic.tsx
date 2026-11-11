@@ -117,7 +117,7 @@ export function AddMusic({
           id="music-link"
           value={url}
           onChange={(event) => setUrl(event.target.value)}
-          placeholder="Spotify, Apple Music, YouTube, Deezer, Shazam…"
+          placeholder="Spotify, Apple Music, YouTube, Deezer, Shazam, Radio Javan podcast…"
           inputMode="url"
           autoComplete="off"
           enterKeyHint="go"

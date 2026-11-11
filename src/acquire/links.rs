@@ -1,6 +1,8 @@
 //! Turns a music link into the list of songs it stands for. Only public pages
 //! and documented public APIs are read; no audio comes from these services
-//! (it is downloaded from YouTube by [`super::worker`]).
+//! (it is downloaded from YouTube by [`super::worker`]). The one exception is a
+//! free Radio Javan podcast episode, downloaded from Radio Javan by
+//! [`super::podcast`].
 //!
 //! | Service | Song | Album | Playlist |
 //! |---|---|---|---|
@@ -9,6 +11,7 @@
 //! | Deezer | public API | public API | public API |
 //! | YouTube / YouTube Music | yt-dlp | — | yt-dlp |
 //! | Shazam | song page | — | — |
+//! | Radio Javan | podcast episode (public API) | — | — |
 
 use super::ytdlp;
 use crate::{
@@ -25,6 +28,7 @@ pub enum Service {
     Deezer,
     YouTube,
     Shazam,
+    RadioJavan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +174,13 @@ pub fn classify(raw: &str) -> Option<Link> {
                 .filter(|id| id.chars().all(|character| character.is_ascii_digit()))?;
             link(Service::Shazam, Scope::Track, id, None)
         }
+        // play.radiojavan.com/podcast/dor-dor-8: one podcast episode (a DJ mix).
+        "play.radiojavan.com" => match providers::radiojavan::player_slug(raw.trim()).ok()? {
+            (providers::radiojavan::LinkKind::Podcast, slug) => {
+                link(Service::RadioJavan, Scope::Track, &slug, None)
+            }
+            (providers::radiojavan::LinkKind::Song, _) => None,
+        },
         _ => None,
     }
 }
@@ -204,6 +215,7 @@ pub async fn read(
         Service::Deezer => deezer(client, link).await?,
         Service::YouTube => youtube(config, link).await?,
         Service::Shazam => shazam(client, pool, link).await?,
+        Service::RadioJavan => radiojavan_podcast(client, pool, link).await?,
     };
     collection
         .songs
@@ -590,6 +602,39 @@ async fn shazam(
     })
 }
 
+// ── Radio Javan: a podcast episode ──────────────────────────────────────────
+
+async fn radiojavan_podcast(
+    client: &reqwest::Client,
+    pool: &sqlx::SqlitePool,
+    link: &Link,
+) -> Result<Collection> {
+    let episode = providers::radiojavan::podcast(pool, client, &link.url).await?;
+    if episode.premium_only {
+        bail!(
+            "this podcast is for Radio Javan Premium members only; magpie-fi downloads free podcasts only"
+        );
+    }
+    Ok(Collection {
+        songs: vec![podcast_episode(episode.candidate, &link.url)],
+        ..Collection::default()
+    })
+}
+
+fn podcast_episode(episode: providers::Candidate, url: &str) -> Wanted {
+    Wanted {
+        title: episode.title,
+        artist: Some(episode.artist).filter(|artist| !artist.is_empty()),
+        album: episode.album,
+        track_number: episode.track_number,
+        duration: episode.duration_delta,
+        source_url: Some(url.to_owned()),
+        cover_url: episode.cover_url,
+        release_date: episode.release_date,
+        ..Wanted::default()
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// The JSON inside `<script id="…">…</script>`.
@@ -617,6 +662,31 @@ mod tests {
 
     fn kind(url: &str) -> Option<(Service, Scope, String)> {
         classify(url).map(|link| (link.service, link.scope, link.id))
+    }
+
+    #[test]
+    fn a_radio_javan_podcast_is_one_episode_to_download() {
+        // Radio Javan song links are matches in Review, not downloads.
+        assert!(classify("https://play.radiojavan.com/song/some-song").is_none());
+        let episode = podcast_episode(
+            providers::Candidate {
+                title: "Dor Dor 8 (Old School)".into(),
+                artist: "Deejay Al".into(),
+                album: Some("Dor Dor".into()),
+                track_number: Some(8),
+                duration_delta: Some(3584.21),
+                ..Default::default()
+            },
+            "https://play.radiojavan.com/podcast/dor-dor-8",
+        );
+        assert_eq!(episode.title, "Dor Dor 8 (Old School)");
+        assert_eq!(episode.artist.as_deref(), Some("Deejay Al"));
+        assert_eq!(episode.album.as_deref(), Some("Dor Dor"));
+        assert_eq!(episode.track_number, Some(8));
+        assert_eq!(episode.duration, Some(3584.21));
+        assert!(super::super::podcast::is_podcast_link(
+            episode.source_url.as_deref().unwrap()
+        ));
     }
 
     #[test]
@@ -653,6 +723,12 @@ mod tests {
                 Apple,
                 Track,
                 "1499378615",
+            ),
+            (
+                "https://play.radiojavan.com/podcast/dor-dor-8",
+                RadioJavan,
+                Track,
+                "dor-dor-8",
             ),
             (
                 "https://music.apple.com/us/album/after-hours/1499378108",

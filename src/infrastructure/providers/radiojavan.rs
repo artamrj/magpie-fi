@@ -36,20 +36,25 @@ pub async fn search(
     Ok(parse_search_results(&raw))
 }
 
+/// A pasted Radio Javan song or podcast link as a match.
 pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result<Candidate> {
-    let slug = song_slug(url)?;
-    let key = format!("song:{}", slug.to_ascii_lowercase());
-    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || {
-        api(client, "mp3", ("id", &slug))
-    })
-    .await?;
-    let track = raw
-        .get("mp3")
-        .filter(|value| value.is_object())
-        .or_else(|| raw.get("data").filter(|value| value.is_object()))
-        .unwrap_or(&raw);
-    let mut candidate = candidate_from_track(track)
-        .ok_or_else(|| anyhow::anyhow!("Radio Javan returned no usable song metadata"))?;
+    let mut candidate = match player_slug(url)? {
+        (LinkKind::Song, slug) => {
+            let key = format!("song:{}", slug.to_ascii_lowercase());
+            let raw = cached(pool, PROVIDER, &key, Duration::days(14), || {
+                api(client, "mp3", ("id", &slug))
+            })
+            .await?;
+            let track = raw
+                .get("mp3")
+                .filter(|value| value.is_object())
+                .or_else(|| raw.get("data").filter(|value| value.is_object()))
+                .unwrap_or(&raw);
+            candidate_from_track(track)
+                .ok_or_else(|| anyhow::anyhow!("Radio Javan returned no usable song metadata"))?
+        }
+        (LinkKind::Podcast, _) => podcast(pool, client, url).await?.candidate,
+    };
     candidate.score = 96.0;
     candidate.score_breakdown = Some(
         serde_json::json!({
@@ -61,6 +66,43 @@ pub async fn lookup_url(pool: &SqlitePool, client: &Client, url: &str) -> Result
         .to_string(),
     );
     Ok(candidate)
+}
+
+/// A Radio Javan podcast episode: its details as a match, and its audio.
+#[derive(Clone, Debug)]
+pub struct Podcast {
+    pub candidate: Candidate,
+    /// Radio Javan's own MP3 of the episode (free and public, no DRM).
+    pub audio_url: Option<String>,
+    /// Only Radio Javan Premium members may play it: magpie-fi doesn't download those.
+    pub premium_only: bool,
+}
+
+/// Reads a podcast link (`play.radiojavan.com/podcast/dor-dor-8`).
+pub async fn podcast(pool: &SqlitePool, client: &Client, url: &str) -> Result<Podcast> {
+    let (LinkKind::Podcast, slug) = player_slug(url)? else {
+        bail!("Radio Javan URL must point to a podcast");
+    };
+    let key = format!("podcast:{}", slug.to_ascii_lowercase());
+    let raw = cached(pool, PROVIDER, &key, Duration::days(14), || {
+        api(client, "podcast", ("id", &slug))
+    })
+    .await?;
+    let episode = raw
+        .get("podcast")
+        .filter(|value| value.is_object())
+        .unwrap_or(&raw);
+    let candidate = candidate_from_podcast(episode)
+        .ok_or_else(|| anyhow::anyhow!("Radio Javan returned no usable podcast details"))?;
+    Ok(Podcast {
+        candidate,
+        audio_url: episode["link"]
+            .as_str()
+            .map(str::trim)
+            .filter(|link| link.starts_with("https://"))
+            .map(str::to_owned),
+        premium_only: episode["premium_only"].as_bool().unwrap_or(false),
+    })
 }
 
 /// One call to Radio Javan's desktop API.
@@ -92,7 +134,15 @@ fn reject_api_error(raw: &Value) -> Result<()> {
     Ok(())
 }
 
-fn song_slug(url: &str) -> Result<String> {
+/// What a Radio Javan player link points at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkKind {
+    Song,
+    Podcast,
+}
+
+/// The kind and slug of a `play.radiojavan.com/song/…` or `/podcast/…` link.
+pub fn player_slug(url: &str) -> Result<(LinkKind, String)> {
     let parsed = reqwest::Url::parse(url).context("invalid Radio Javan URL")?;
     if parsed.scheme() != "https"
         || !matches!(
@@ -102,15 +152,31 @@ fn song_slug(url: &str) -> Result<String> {
     {
         bail!("only HTTPS Radio Javan player links are supported");
     }
-    let encoded = parsed
-        .path()
-        .strip_prefix("/song/")
-        .filter(|value| !value.is_empty() && !value.contains('/'))
-        .ok_or_else(|| anyhow::anyhow!("Radio Javan URL must point to a song"))?;
-    Ok(percent_decode_str(encoded)
+    let path = parsed.path();
+    let (kind, encoded) = if let Some(rest) = path.strip_prefix("/song/") {
+        (LinkKind::Song, rest)
+    } else if let Some(rest) = path.strip_prefix("/podcast/") {
+        (LinkKind::Podcast, rest)
+    } else {
+        bail!("Radio Javan URL must point to a song or a podcast");
+    };
+    let encoded = encoded.trim_end_matches('/');
+    if encoded.is_empty() || encoded.contains('/') {
+        bail!("Radio Javan URL must point to a song or a podcast");
+    }
+    let slug = percent_decode_str(encoded)
         .decode_utf8()
-        .context("Radio Javan song URL is not valid UTF-8")?
-        .into_owned())
+        .context("Radio Javan URL is not valid UTF-8")?
+        .into_owned();
+    Ok((kind, slug))
+}
+
+#[cfg(test)]
+fn song_slug(url: &str) -> Result<String> {
+    match player_slug(url)? {
+        (LinkKind::Song, slug) => Ok(slug),
+        (LinkKind::Podcast, _) => bail!("Radio Javan URL must point to a song"),
+    }
 }
 
 fn parse_search_results(raw: &Value) -> Vec<Candidate> {
@@ -124,10 +190,18 @@ fn parse_search_results(raw: &Value) -> Vec<Candidate> {
     } else if raw["top"]["mp3"].is_object() {
         tracks.push(&raw["top"]["mp3"]);
     }
+    // A file of a DJ mix is found as the podcast episode it came from.
+    let podcasts = raw["podcasts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(5)
+        .filter_map(candidate_from_podcast);
     let mut seen = HashSet::new();
     tracks
         .into_iter()
         .filter_map(candidate_from_track)
+        .chain(podcasts)
         .filter(|candidate| {
             let key = format!(
                 "{}|{}",
@@ -169,6 +243,55 @@ fn candidate_from_track(track: &Value) -> Option<Candidate> {
             .map(str::to_owned),
         duration_delta: track["duration"].as_f64(),
         raw_json: track.to_string(),
+        ..Default::default()
+    })
+}
+
+/// A podcast episode is filed as one track of its show: "Dor Dor 8 (Old School)" by Deejay Al
+/// is track 8 of "Dor Dor". A DJ mix is a broadcast with the "dj-mix" secondary type, as
+/// MusicBrainz files them; a talk show is a plain broadcast.
+fn candidate_from_podcast(episode: &Value) -> Option<Candidate> {
+    let title = nonempty(episode["title"].as_str())?;
+    let artist = nonempty(episode["podcast_artist"].as_str())?;
+    let show_permlink = episode["show_permlink"].as_str().map(str::trim);
+    let show = show_permlink
+        .map(|permlink| permlink.replace('-', " "))
+        .filter(|show| !show.trim().is_empty());
+    let episode_number = show_permlink
+        .zip(episode["permlink"].as_str())
+        .and_then(|(show, permlink)| {
+            let rest = permlink.get(show.len()..)?;
+            permlink
+                .get(..show.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(show))
+                .then_some(rest)
+        })
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|number| number.parse::<i64>().ok());
+    let release_date = parse_release_date(episode);
+    let talk = episode["talk"].as_bool().unwrap_or(false);
+    Some(Candidate {
+        provider: PROVIDER.into(),
+        title: title.to_owned(),
+        artist: artist.to_owned(),
+        album_artist: show.as_ref().map(|_| artist.to_owned()),
+        album: show,
+        track_number: episode_number,
+        year: release_date
+            .as_deref()
+            .and_then(|date| date.get(..4))
+            .map(str::to_owned),
+        release_date,
+        release_type: Some("broadcast".into()),
+        release_secondary_types: (!talk).then(|| "dj-mix".into()),
+        cover_url: episode["photo"]
+            .as_str()
+            .or_else(|| episode["thumbnail"].as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        duration_delta: episode["duration"].as_f64(),
+        raw_json: episode.to_string(),
         ..Default::default()
     })
 }
@@ -233,6 +356,86 @@ mod tests {
             song_slug("https://play.radiojavan.com/song/dj-sasha-tehraan-kenaret-%28remix%29")
                 .unwrap(),
             "dj-sasha-tehraan-kenaret-(remix)"
+        );
+    }
+
+    fn example_podcast() -> Value {
+        serde_json::json!({
+            "id": 2979,
+            "title": "Dor Dor 8 (Old School)",
+            "podcast_artist": "Deejay Al",
+            "show_permlink": "Dor-Dor",
+            "permlink": "Dor-Dor-8",
+            "duration": 3584.21,
+            "created_at": "2020-08-17T00:00:00-04:00",
+            "date": "Deejay Al",
+            "talk": false,
+            "premium_only": false,
+            "photo": "https://assets.rjassets.com/static/podcasts/dor-dor-8/7a6914eb094c891.jpg",
+            "link": "https://host2.rjmedia-content.app/media/podcast/mp3-192/2979-cedb7bb84319d95.mp3"
+        })
+    }
+
+    #[test]
+    fn a_podcast_episode_is_a_track_of_its_show() {
+        let candidates = parse_search_results(&serde_json::json!({
+            "mp3s": [],
+            "podcasts": [example_podcast()],
+            "top": []
+        }));
+        assert_eq!(candidates.len(), 1);
+        let episode = &candidates[0];
+        assert_eq!(episode.title, "Dor Dor 8 (Old School)");
+        assert_eq!(episode.artist, "Deejay Al");
+        assert_eq!(episode.album.as_deref(), Some("Dor Dor"));
+        assert_eq!(episode.album_artist.as_deref(), Some("Deejay Al"));
+        assert_eq!(episode.track_number, Some(8));
+        assert_eq!(episode.release_date.as_deref(), Some("2020-08-17"));
+        assert_eq!(episode.release_type.as_deref(), Some("broadcast"));
+        assert_eq!(episode.release_secondary_types.as_deref(), Some("dj-mix"));
+        assert_eq!(episode.duration_delta, Some(3584.21));
+    }
+
+    #[test]
+    fn reads_song_and_podcast_links() {
+        assert_eq!(
+            player_slug("https://play.radiojavan.com/podcast/dor-dor-8").unwrap(),
+            (LinkKind::Podcast, "dor-dor-8".to_owned())
+        );
+        assert_eq!(
+            player_slug("https://play.radiojavan.com/song/dj-sasha-x/").unwrap(),
+            (LinkKind::Song, "dj-sasha-x".to_owned())
+        );
+        assert!(player_slug("https://play.radiojavan.com/podcast/").is_err());
+        assert!(song_slug("https://play.radiojavan.com/podcast/dor-dor-8").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "live Radio Javan API probe"]
+    async fn live_podcast_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("radiojavan-live.sqlite");
+        let pool = crate::infrastructure::db::connect(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let client = Client::new();
+        let url = "https://play.radiojavan.com/podcast/dor-dor-8";
+        let episode = podcast(&pool, &client, url).await.unwrap();
+        assert_eq!(episode.candidate.title, "Dor Dor 8 (Old School)");
+        assert_eq!(episode.candidate.artist, "Deejay Al");
+        assert_eq!(episode.candidate.album.as_deref(), Some("Dor Dor"));
+        assert_eq!(episode.candidate.track_number, Some(8));
+        assert!(!episode.premium_only);
+        assert!(episode.audio_url.is_some_and(|url| url.ends_with(".mp3")));
+        // A file tagged like the episode finds it by search too.
+        let found = search(&pool, &client, "Dor Dor 8 (Old School)", Some("Deejay Al"))
+            .await
+            .unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|candidate| candidate.title == "Dor Dor 8 (Old School)"
+                    && candidate.album.as_deref() == Some("Dor Dor"))
         );
     }
 
