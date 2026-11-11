@@ -549,6 +549,29 @@ pub async fn cards_refused(pool: &SqlitePool, chat_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The library card pinned in this chat, if any.
+pub async fn library_message(pool: &SqlitePool, chat_id: i64) -> Result<Option<i32>> {
+    Ok(
+        sqlx::query_scalar("SELECT library_message_id FROM telegram_chats WHERE chat_id=?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
+}
+
+pub async fn set_library_message(pool: &SqlitePool, chat_id: i64, message_id: i32) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO telegram_chats(chat_id,library_message_id) VALUES(?,?)
+         ON CONFLICT(chat_id) DO UPDATE SET library_message_id=excluded.library_message_id",
+    )
+    .bind(chat_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A finished request gets a live status message again (retry pressed).
 pub async fn reopen(pool: &SqlitePool, request_id: i64) -> Result<()> {
     sqlx::query("UPDATE requests SET closed=0 WHERE id=?")

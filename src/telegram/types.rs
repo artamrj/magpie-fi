@@ -79,6 +79,14 @@ pub struct Message {
     pub caption: Option<String>,
     pub audio: Option<Audio>,
     pub document: Option<Document>,
+    /// A widget message (Bot API 10.4).
+    pub widget: Option<Widget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Widget {
+    /// Set for shared widgets: send it again with `sendSharedWidget`.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

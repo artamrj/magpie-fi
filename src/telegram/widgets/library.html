@@ -1,0 +1,209 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      magpie-fi library card: a shared Bot API 10.4 widget. Every copy draws the
+      same public_data (keys: src/telegram/cards.rs), which the bot updates for
+      all of them at once. No taps, no network.
+      Budget: 32 KB, and 4 KB after zlib -9 (web/scripts/check-widgets.mjs).
+    -->
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      body {
+        font:
+          15px/1.35 system-ui,
+          sans-serif;
+        color: var(--tg-theme-text-color);
+      }
+      #k {
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--tg-theme-secondary-bg-color);
+      }
+      .h {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .h b {
+        flex: 1;
+        font-size: 17px;
+      }
+      #s {
+        font-size: 12px;
+        color: var(--tg-theme-hint-color);
+      }
+      .n {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .n div {
+        padding: 10px 6px;
+        border-radius: 12px;
+        text-align: center;
+        background: var(--tg-theme-bg-color);
+      }
+      .n b {
+        display: block;
+        font-size: 22px;
+        font-variant-numeric: tabular-nums;
+        color: var(--tg-theme-accent-text-color);
+        transition: transform 0.4s;
+      }
+      .n b.up {
+        transform: scale(1.15);
+      }
+      .n small,
+      .q {
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--tg-theme-hint-color);
+      }
+      .q {
+        margin: 14px 0 6px;
+      }
+      #a p {
+        display: flex;
+        gap: 8px;
+        padding: 6px 0;
+        border-top: 1px solid var(--tg-theme-section-separator-color);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #a p:first-child {
+        border-top: 0;
+      }
+      #a span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #a i {
+        font-style: normal;
+        color: var(--tg-theme-hint-color);
+      }
+      #c {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      #c span {
+        padding: 3px 10px;
+        border-radius: 99px;
+        font-size: 13px;
+        background: var(--tg-theme-bg-color);
+      }
+      #c .bad {
+        color: var(--tg-theme-destructive-text-color);
+      }
+      .live {
+        animation: p 1.6s ease-in-out infinite;
+      }
+      @keyframes p {
+        50% {
+          opacity: 0.45;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .live {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="k">
+      <div class="h">
+        <span>📚</span><b>Your library</b><span id="s"></span>
+      </div>
+      <div class="n">
+        <div><b id="n0">–</b><small>Songs</small></div>
+        <div><b id="n1">–</b><small>Artists</small></div>
+        <div><b id="n2">–</b><small>Hours</small></div>
+      </div>
+      <div id="r">
+        <div class="q">Just added</div>
+        <div id="a"></div>
+      </div>
+      <div id="c"></div>
+    </div>
+    <script>
+      var T = window.TelegramWidget,
+        last = [];
+      var PROBLEM = {
+        l: "⚠️ Library folder not writable",
+        y: "⚠️ yt-dlp missing",
+        m: "⚠️ No HTTPS address for the app",
+      };
+      function $(i) {
+        return document.getElementById(i);
+      }
+      function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = text;
+        return e;
+      }
+      function draw() {
+        var s = null;
+        try {
+          s = JSON.parse(T.publicData);
+        } catch (e) {}
+        if (!s) return;
+        var format = new Intl.NumberFormat();
+        (s.n || []).forEach(function (value, i) {
+          var b = $("n" + i);
+          b.textContent = format.format(value);
+          if (last[i] != null && value > last[i]) {
+            b.className = "up";
+            setTimeout(function () {
+              b.className = "";
+            }, 400);
+          }
+          last[i] = value;
+        });
+        var list = $("a");
+        list.textContent = "";
+        (s.a || []).forEach(function (song) {
+          var line = el("p");
+          line.dir = "auto";
+          line.appendChild(el("span", "", "🎵 " + song[0]));
+          line.appendChild(el("i", "", song[1]));
+          list.appendChild(line);
+        });
+        $("r").hidden = !(s.a || []).length;
+        var chips = $("c");
+        chips.textContent = "";
+        if (s.w)
+          chips.appendChild(el("span", "live", "⏳ " + s.w + " on the way"));
+        if (s.r) chips.appendChild(el("span", "", "🤔 " + s.r + " in Review"));
+        (s.h || "").split("").forEach(function (code) {
+          if (PROBLEM[code])
+            chips.appendChild(el("span", "bad", PROBLEM[code]));
+        });
+        $("s").textContent = s.h ? "" : "✅ All good";
+      }
+      if (T) {
+        T.onEvent("publicDataChanged", draw);
+        // Live numbers while the card is on screen.
+        T.onEvent("activated", function () {
+          T.watchPublicData();
+        });
+        T.onEvent("deactivated", function () {
+          T.unwatchPublicData();
+        });
+        if (T.watchPublicData) T.watchPublicData();
+        draw();
+        if (T.ready) T.ready();
+      }
+    </script>
+  </body>
+</html>

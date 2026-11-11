@@ -87,6 +87,10 @@ pub async fn on_command(
             let text = texts::login_link(&link, public_url.is_some());
             say(context, &chat, &Rich::plain(text), keyboard).await
         }
+        "library" if role == Role::Owner => {
+            super::library::send(context, user.id).await?;
+            None
+        }
         "guests" if role == Role::Owner => {
             let (text, keyboard) = guests_view(context).await?;
             say(context, &chat, &text, Some(keyboard)).await

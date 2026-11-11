@@ -24,6 +24,9 @@ pub const REQUEST_HTML: &str = include_str!("widgets/request.html");
 /// The review card's code ("which song is this?"), sent once per song in Review.
 pub const REVIEW_HTML: &str = include_str!("widgets/review.html");
 
+/// The library card's code. It is one shared widget for every owner's chat.
+pub const LIBRARY_HTML: &str = include_str!("widgets/library.html");
+
 /// Telegram's limit for a widget's state and for an answer to a tap.
 pub const MAX_DATA: usize = 1024;
 
@@ -311,6 +314,70 @@ fn fit_review(mut card: Value) -> Value {
     card
 }
 
+// ── The library card ────────────────────────────────────────────────────────
+//
+// One shared widget: every copy shows the same `public_data`, so the bot
+// updates them all with one edit. Keys: `n` [songs, artists, hours of music];
+// `a` the last songs magpie-fi filed, each [title, artist]; `w` songs on the
+// way; `r` songs waiting in Review; `h` problems: l library not writable,
+// y yt-dlp missing, m no Mini App (no HTTPS address).
+
+/// What the library card shows.
+#[derive(Debug, Default, PartialEq)]
+pub struct LibraryStats {
+    pub songs: i64,
+    pub artists: i64,
+    pub hours: i64,
+    /// Latest first, as (title, artist).
+    pub recent: Vec<(String, String)>,
+    pub on_the_way: i64,
+    pub in_review: i64,
+    pub library_writable: bool,
+    pub ytdlp: bool,
+    pub mini_app: bool,
+}
+
+pub fn library_state(stats: &LibraryStats) -> Value {
+    let mut problems = String::new();
+    for (ok, code) in [
+        (stats.library_writable, 'l'),
+        (stats.ytdlp, 'y'),
+        (stats.mini_app, 'm'),
+    ] {
+        if !ok {
+            problems.push(code);
+        }
+    }
+    let mut card = json!({
+        "n": [stats.songs, stats.artists, stats.hours],
+        "a": stats.recent.iter().take(3).map(|(title, artist)| json!([title, artist])).collect::<Vec<_>>(),
+        "w": stats.on_the_way,
+        "r": stats.in_review,
+        "h": problems,
+    });
+    for limit in [60, 32, 16] {
+        if card.to_string().len() <= MAX_DATA {
+            break;
+        }
+        for song in card["a"].as_array_mut().into_iter().flatten() {
+            for part in [0, 1] {
+                if let Some(text) = song[part].as_str() {
+                    song[part] = json!(shorten(text, limit));
+                }
+            }
+        }
+    }
+    card
+}
+
+/// A short fingerprint of the library card's code. A shared widget keeps the
+/// code it was made with, so a new magpie-fi version with a changed card makes
+/// a new shared widget instead of sending the old one again.
+pub fn library_version() -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(LIBRARY_HTML.as_bytes())[..6])
+}
+
 /// Three colours for the card from a song's embedded cover: the top-left, the
 /// middle and the bottom-right of the picture, darkened when very light so
 /// white text stays readable. `None` when the file has no valid cover.
@@ -553,7 +620,30 @@ mod tests {
     }
 
     #[test]
+    fn the_library_card_lists_problems_and_fits() {
+        let long = "A song title that goes on and on and on ".repeat(10);
+        let stats = LibraryStats {
+            songs: 1234,
+            artists: 210,
+            hours: 81,
+            recent: vec![(long.clone(), long.clone()); 5],
+            on_the_way: 3,
+            in_review: 1,
+            library_writable: true,
+            ytdlp: false,
+            mini_app: false,
+        };
+        let state = library_state(&stats);
+        assert!(state.to_string().len() <= MAX_DATA);
+        assert_eq!(state["n"], json!([1234, 210, 81]));
+        assert_eq!(state["h"], "ym");
+        assert_eq!(state["a"].as_array().unwrap().len(), 3);
+        assert_eq!(library_version().len(), 12);
+    }
+
+    #[test]
     fn the_card_code_is_within_telegram_limits() {
+        assert!(LIBRARY_HTML.len() <= 32768 && !LIBRARY_HTML.contains('\0'));
         assert!(REVIEW_HTML.len() <= 32768 && !REVIEW_HTML.contains('\0'));
         // The compressed limit (4096 bytes) is checked by web/scripts/check-widgets.mjs.
         assert!(REQUEST_HTML.len() <= 32768);

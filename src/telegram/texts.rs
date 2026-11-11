@@ -126,7 +126,7 @@ pub struct Command {
     pub ephemeral: bool,
 }
 
-pub const COMMANDS: [Command; 6] = [
+pub const COMMANDS: [Command; 7] = [
     Command {
         name: "help",
         menu: "What I can do",
@@ -147,6 +147,13 @@ pub const COMMANDS: [Command; 6] = [
         help: "is everything working",
         owners_only: false,
         ephemeral: true,
+    },
+    Command {
+        name: "library",
+        menu: "Your library at a glance (owners)",
+        help: "your library at a glance, kept up to date",
+        owners_only: true,
+        ephemeral: false,
     },
     Command {
         name: "guests",
@@ -244,6 +251,54 @@ pub fn health(health: &Health) -> String {
         health.songs,
         check(health.ytdlp),
     )
+}
+
+// ── Library ─────────────────────────────────────────────────────────────────
+
+pub const LIBRARY_CAPTION: &str = "📚 <b>Your library</b>";
+
+/// `/library` as text, where the chat can't show the card.
+pub fn library(stats: &crate::telegram::cards::LibraryStats) -> Rich {
+    let recent: Vec<String> = stats
+        .recent
+        .iter()
+        .map(|(title, artist)| format!("{} · {}", escape(title), escape(artist)))
+        .collect();
+    let mut html = format!(
+        "<h3>📚 Your library</h3>\
+         <table bordered compact><tr><th>Songs</th><th>Artists</th><th>Hours</th></tr>\
+         <tr><td>{}</td><td>{}</td><td>{}</td></tr></table>",
+        stats.songs, stats.artists, stats.hours
+    );
+    let mut plain = format!(
+        "📚 <b>Your library</b>\n{} songs · {} artists · {} hours",
+        stats.songs, stats.artists, stats.hours
+    );
+    if !recent.is_empty() {
+        html.push_str("<h4>Just added</h4><ul>");
+        plain.push_str("\n\n<b>Just added</b>");
+        for song in &recent {
+            html.push_str(&format!("<li>{song}</li>"));
+            plain.push_str(&format!("\n• {song}"));
+        }
+        html.push_str("</ul>");
+    }
+    let mut status = Vec::new();
+    if stats.on_the_way > 0 {
+        status.push(format!("⏳ {} on the way", stats.on_the_way));
+    }
+    if stats.in_review > 0 {
+        status.push(format!("🤔 {} in Review", stats.in_review));
+    }
+    if !status.is_empty() {
+        let status = status.join(" · ");
+        html.push_str(&format!("<p>{status}</p>"));
+        plain.push_str(&format!("\n\n{status}"));
+    }
+    Rich {
+        html: Some(html),
+        plain,
+    }
 }
 
 // ── Guests ──────────────────────────────────────────────────────────────────
