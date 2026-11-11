@@ -411,8 +411,9 @@ cheap and free ones first:
    Never for a file longer than 20 minutes (`scan::providers::is_long_mix`): Shazam hears a
    slice, so on a DJ mix it names one song in it.
    Its artist/title is fed back through the catalogs of step 3–5.
-8. **SoundCloud**, **Discogs**, **Last.fm** — each only with its free key or token. No paid
-   service is used.
+8. **Discogs**, **Last.fm** — each only with its free key or token. No paid service is used.
+   SoundCloud is not searched (its app keys are no longer given out); a pasted SoundCloud link
+   is read from the public oEmbed page without a key.
 
 Free without a key: MusicBrainz, Apple Music, Deezer, Radio Javan, Audiomack, Navahang, Genius,
 SongRec. Other sources: **Cover Art Archive** (covers by MusicBrainz release), **Wikidata**

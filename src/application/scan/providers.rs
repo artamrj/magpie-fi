@@ -87,11 +87,6 @@ pub(crate) async fn identify(
         out.extend(songrec_candidates);
     }
     let catalog_info = recognized_info.as_ref().unwrap_or(current);
-    if !cfg.soundcloud_client_id.trim().is_empty()
-        && !cfg.soundcloud_client_secret.trim().is_empty()
-    {
-        out.extend(query_soundcloud(state, limits, catalog_info, filename).await);
-    }
     out.extend(query_discogs(state, limits, catalog_info, filename).await);
     out.extend(query_lastfm(state, limits, catalog_info, filename).await);
     // Scores above were measured against the source's own credit. From here on (Review,
@@ -329,40 +324,6 @@ where
             Vec::new()
         }
     }
-}
-
-pub(crate) async fn query_soundcloud(
-    state: &Arc<AppState>,
-    limits: &PipelineLimits,
-    current: &audio::AudioInfo,
-    filename: &str,
-) -> Vec<infra_providers::Candidate> {
-    query_catalog(
-        state,
-        limits,
-        current,
-        filename,
-        CatalogSpec {
-            provider: "soundcloud",
-            source: "soundcloud_track_search",
-            requires_title: true,
-            key_check: |_| None,
-        },
-        |state, current| async move {
-            let cfg = &state.config;
-            let title = current.title.as_deref().unwrap_or_default();
-            infra_providers::soundcloud::search(
-                &state.client,
-                &state.soundcloud_auth,
-                &cfg.soundcloud_client_id,
-                &cfg.soundcloud_client_secret,
-                title,
-                current.artist.as_deref(),
-            )
-            .await
-        },
-    )
-    .await
 }
 
 pub(crate) async fn query_songrec(

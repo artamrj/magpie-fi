@@ -82,8 +82,6 @@ pub struct Config {
     /// Keep a self-updating copy of yt-dlp in `data_dir/bin` (the Docker image does).
     pub ytdlp_self_update: bool,
     pub acoustid_key: String,
-    pub soundcloud_client_id: String,
-    pub soundcloud_client_secret: String,
     pub youtube_api_key: String,
     pub discogs_token: String,
     pub lastfm_key: String,
@@ -123,8 +121,6 @@ impl Config {
             ytdlp_cookies: None,
             ytdlp_self_update: false,
             acoustid_key: String::new(),
-            soundcloud_client_id: String::new(),
-            soundcloud_client_secret: String::new(),
             youtube_api_key: String::new(),
             discogs_token: String::new(),
             lastfm_key: String::new(),
@@ -225,14 +221,19 @@ impl Config {
                 );
             }
         }
-        text(
-            &mut config.soundcloud_client_id,
+        // SoundCloud search needed an app key that SoundCloud no longer hands out.
+        // SoundCloud links still work through its public link lookup.
+        for name in [
             "MAGPIE_SOUNDCLOUD_CLIENT_ID",
-        );
-        text(
-            &mut config.soundcloud_client_secret,
             "MAGPIE_SOUNDCLOUD_CLIENT_SECRET",
-        );
+        ] {
+            if get(name).is_some() {
+                tracing::warn!(
+                    setting = name,
+                    "SoundCloud search was removed; remove the setting"
+                );
+            }
+        }
         text(&mut config.youtube_api_key, "MAGPIE_YOUTUBE_API_KEY");
         text(&mut config.discogs_token, "MAGPIE_DISCOGS_TOKEN");
         text(&mut config.lastfm_key, "MAGPIE_LASTFM_KEY");
