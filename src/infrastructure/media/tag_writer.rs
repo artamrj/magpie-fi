@@ -166,10 +166,58 @@ pub fn write(
     if let Some(text) = lyrics.map(str::to_owned).or(preserved_lyrics) {
         set(tag, lyrics_key(tag.tag_type()), &text);
     }
-    file.save_to_path(path, WriteOptions::default())?;
+    save(&file, path)?;
     if file.file_type() == lofty::file::FileType::Mp4 {
         merge_duplicate_atoms(path)?;
     }
+    Ok(())
+}
+
+/// The TXXX descriptions Picard writes and Navidrome reads for these IDs in an MP3. lofty
+/// 0.24 reads them into the generic tag but drops them when it turns that tag back into
+/// ID3v2, so `save` writes them itself.
+const MP3_RELEASE_ID_FRAMES: [(ItemKey, &str); 3] = [
+    (ItemKey::MusicBrainzReleaseId, "MusicBrainz Album Id"),
+    (
+        ItemKey::MusicBrainzReleaseGroupId,
+        "MusicBrainz Release Group Id",
+    ),
+    (ItemKey::MusicBrainzTrackId, "MusicBrainz Release Track Id"),
+];
+
+/// Saves the tags. Every save goes through here: a plain save of an MP3 would lose the
+/// album, release-group and release-track IDs, also ones Picard wrote before.
+fn save(file: &lofty::file::TaggedFile, path: &Path) -> Result<()> {
+    file.save_to_path(path, WriteOptions::default())?;
+    if file.file_type() != lofty::file::FileType::Mpeg {
+        return Ok(());
+    }
+    let ids = file
+        .primary_tag()
+        .map(|tag| {
+            MP3_RELEASE_ID_FRAMES
+                .iter()
+                .filter_map(|(key, description)| {
+                    let id = tag.get_string(*key)?.trim();
+                    is_mbid(id).then(|| (*description, id.to_owned()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    use lofty::{file::AudioFile, mpeg::MpegFile};
+    let mut reader = std::fs::File::open(path)?;
+    let mut mpeg = MpegFile::read_from(&mut reader, ParseOptions::new())?;
+    drop(reader);
+    let id3v2 = mpeg
+        .id3v2_mut()
+        .context("the MP3 has no ID3v2 tag after saving")?;
+    for (description, id) in ids {
+        id3v2.insert_user_text(description.to_owned(), id);
+    }
+    id3v2.save_to_path(path, WriteOptions::default())?;
     Ok(())
 }
 
@@ -452,7 +500,7 @@ pub fn edit_fields(path: &Path, edit: &TagEdit) -> Result<()> {
         Some(None) => tag.remove_disk_total(),
         Some(Some(number)) => tag.set_disk_total(number),
     }
-    file.save_to_path(path, WriteOptions::default())?;
+    save(&file, path)?;
     if file.file_type() == lofty::file::FileType::Mp4 {
         merge_duplicate_atoms(path)?;
     }
@@ -472,7 +520,7 @@ pub fn embed_lyrics(path: &Path, text: &str) -> Result<()> {
     }
     let tag = file.primary_tag_mut().expect("primary tag present");
     set(tag, lyrics_key(tag.tag_type()), text);
-    file.save_to_path(path, WriteOptions::default())?;
+    save(&file, path)?;
     verify_lyrics(path, text)
 }
 
@@ -535,7 +583,7 @@ pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
         }
     }
     if changed {
-        file.save_to_path(path, WriteOptions::default())?;
+        save(&file, path)?;
     }
     Ok(changed)
 }
@@ -681,7 +729,7 @@ pub fn write_album_tags(path: &Path, album: &AlbumTags) -> Result<bool> {
         set(tag, ItemKey::FlagCompilation, "1");
     }
     optional(tag, ItemKey::Label, &album.label);
-    file.save_to_path(path, WriteOptions::default())?;
+    save(&file, path)?;
     Ok(true)
 }
 
@@ -724,7 +772,7 @@ pub fn apply_telegram_details(
         changed = true;
     }
     if changed {
-        file.save_to_path(path, WriteOptions::default())?;
+        save(&file, path)?;
     }
     Ok(changed)
 }
@@ -1351,6 +1399,102 @@ mod tests {
         assert_eq!(details.title.as_deref(), Some("Khaleej"));
         // Already the same: nothing is written.
         assert!(!write_album_tags(&odd_song, &wanted).unwrap());
+    }
+
+    #[test]
+    fn mp3_keeps_the_musicbrainz_album_ids() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let tone = |name: &str| {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.1")
+                .args(["-q:a", "9"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let release = "2c7d7a5a-2c2d-4b3e-9c39-7f3cbf1b6a11";
+        let group = "8f1c5b0e-6a8d-4d0a-b3f4-1e2a7c9d5e22";
+        let track = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c33";
+        let (song, other) = (tone("song.mp3"), tone("other.mp3"));
+        let candidate = Candidate {
+            title: "Hamdam".into(),
+            artist: "Ebi".into(),
+            album: Some("Khalij".into()),
+            album_artist: Some("Ebi".into()),
+            release_id: Some(release.into()),
+            release_group_id: Some(group.into()),
+            release_track_id: Some(track.into()),
+            ..Default::default()
+        };
+        write(&song, &candidate, None, None).unwrap();
+        verify_written_metadata(&song, &candidate).unwrap();
+
+        // Written as the TXXX frames Picard and Navidrome read.
+        let frames = |path: &Path| {
+            use lofty::{file::AudioFile, mpeg::MpegFile};
+            let mut reader = std::fs::File::open(path).unwrap();
+            let mpeg = MpegFile::read_from(&mut reader, ParseOptions::new()).unwrap();
+            let id3v2 = mpeg.id3v2().unwrap();
+            MP3_RELEASE_ID_FRAMES
+                .map(|(_, description)| id3v2.get_user_text(description).map(str::to_owned))
+        };
+        let expected = [release, group, track].map(|id| Some(id.to_owned()));
+        assert_eq!(frames(&song), expected);
+        assert_eq!(
+            read_details(&song).unwrap().musicbrainz_release.as_deref(),
+            Some(release)
+        );
+        let album = read_album_tags(&song).unwrap();
+        assert_eq!(album.release_id.as_deref(), Some(release));
+        assert_eq!(album.release_group_id.as_deref(), Some(group));
+
+        // Other edits keep them.
+        embed_lyrics(&song, "la la").unwrap();
+        assert_eq!(frames(&song), expected);
+
+        // The album-joining code copies them to another song, and nothing is left to do.
+        write(
+            &other,
+            &Candidate {
+                release_id: None,
+                ..candidate.clone()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(read_album_tags(&other).unwrap().release_id.is_none());
+        assert!(write_album_tags(&other, &album).unwrap());
+        assert_eq!(read_album_tags(&other).unwrap(), album);
+        assert!(!write_album_tags(&other, &album).unwrap());
+
+        // An album without them removes them.
+        let bare = AlbumTags {
+            release_id: None,
+            release_group_id: None,
+            ..album.clone()
+        };
+        assert!(write_album_tags(&other, &bare).unwrap());
+        assert_eq!(read_album_tags(&other).unwrap(), bare);
+
+        // Not a MusicBrainz ID: never written.
+        let fake = Candidate {
+            release_id: Some("spotify:album:123".into()),
+            ..candidate
+        };
+        write(&song, &fake, None, None).unwrap();
+        assert!(read_album_tags(&song).unwrap().release_id.is_none());
     }
 
     #[test]

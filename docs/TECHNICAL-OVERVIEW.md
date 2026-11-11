@@ -171,9 +171,11 @@ step now. `src/application/apply.rs`:
    the destination (`library::destination`, §5 of the blueprint). A song whose album the album
    artist already has (`names::same_album`: any spelling, any year) first takes that album's
    details from a song in its folder (`library::align_with_existing_release`,
-   `tag_writer::read_album_tags`), so Navidrome shows one album. lofty 0.24 writes no
-   MusicBrainz album, release-group or track ID into MP3 files, so those exist only in FLAC,
-   M4A and Opus files.
+   `tag_writer::read_album_tags`), so Navidrome shows one album. lofty 0.24 drops the
+   MusicBrainz album, release-group and release-track IDs when it saves an MP3, so every tag
+   save goes through `tag_writer::save`, which writes them back as the TXXX frames Picard and
+   Navidrome read ("MusicBrainz Album Id", "MusicBrainz Release Group Id", "MusicBrainz
+   Release Track Id"). All formats carry them.
 2. **Per song**:
    - **Already in the library?** (`library::find_same_recording`). If yes and the new file is not
      an upgrade (lossless over lossy), the new file and its inbox duplicates go to the trash.
