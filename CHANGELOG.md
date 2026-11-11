@@ -2,6 +2,18 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.9.0](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.0) - 2026-11-11
+
+### ✨ New
+- Review can keep a file's own tags when no match is right ([f080640](https://github.com/artamrj/magpie-fi/commit/f080640a2755a8b56fd553b0dee7a7bf5f038d8f))
+- Keeping a file's own tags also keeps its own cover when it is a real one ([276c8f6](https://github.com/artamrj/magpie-fi/commit/276c8f6f8554975b86500b4ab68bfb8eecc10023))
+
+### 🐛 Fixes
+- Songs whose file you deleted from the inbox leave Review, and Remove works on them ([ed76a0e](https://github.com/artamrj/magpie-fi/commit/ed76a0e1066a2dd37ec9610c2b84e290fe4dd097))
+- A match no longer drops the file's co-singers, and Apple Music and Deezer links fill in the tags ([091ebe2](https://github.com/artamrj/magpie-fi/commit/091ebe2d5c607e6f32dbb12b732e75d44228caa9))
+- Songs of one new album filed together land in one album when sources spell it differently ([faa9583](https://github.com/artamrj/magpie-fi/commit/faa95833bee30877e9f278e768261f4456672f32))
+- The cover search finds covers of songs that are only sold on an album ([f69a33f](https://github.com/artamrj/magpie-fi/commit/f69a33f04f22bcd7ad27102c97af74116b7a948f))
+
 ## [0.8.3](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.3) - 2026-11-11
 
 ### ✨ New
