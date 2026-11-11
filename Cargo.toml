@@ -1,6 +1,6 @@
 [package]
 name = "magpie-fi"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license = "MIT"
 description = "Turns any music link or file into a clean, tagged music library that you own"

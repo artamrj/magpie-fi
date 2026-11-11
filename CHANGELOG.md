@@ -2,6 +2,15 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.10.1](https://github.com/artamrj/magpie-fi/releases/tag/v0.10.1) - 2026-11-11
+
+### 🐛 Fixes
+- Featured singers in square brackets become artists, not part of the title ([b85cd7e](https://github.com/artamrj/magpie-fi/commit/b85cd7eb8049c3d2a84bb6c8d2fa7a60e807bd51))
+
+### 📖 Docs
+- The project says how to report a problem, suggest an idea or send a change ([849ef8c](https://github.com/artamrj/magpie-fi/commit/849ef8c4feb88cb22064f3815bd23779b039aaf7))
+- The README leads with the goal, a clean music library for any music server or player ([0bcb66b](https://github.com/artamrj/magpie-fi/commit/0bcb66b2c3fa107dbc6280bf1a379c7763ddf963))
+
 ## [0.10.0](https://github.com/artamrj/magpie-fi/releases/tag/v0.10.0) - 2026-11-11
 
 ### ✨ New
