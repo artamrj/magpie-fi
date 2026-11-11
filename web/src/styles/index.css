@@ -705,7 +705,9 @@ button.cell:active {
   min-height: 48px;
   position: relative;
 }
-.field-row + .field-row::before {
+.field-row + .field-row::before,
+.field-row + .info-row::before,
+.info-row + .field-row::before {
   content: "";
   position: absolute;
   top: 0;

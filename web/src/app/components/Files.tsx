@@ -799,6 +799,16 @@ function SongInfo({ song, feedback }: { song: SongDetails; feedback: Feedback })
       >
         {row("title")}
         {row("artist")}
+        {/* The Artist line keeps its "&"; these separate names are what Navidrome links. */}
+        <Info
+          label="Credited to"
+          value={
+            changed.includes("artist")
+              ? "Set again from the new artist when you save"
+              : song.artists.join(" · ")
+          }
+          empty="Not listed separately: the artist line counts as one artist"
+        />
         {row("album")}
         {row("album_artist")}
         {pair("track", "track_total")}

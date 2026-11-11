@@ -286,7 +286,8 @@ Saving (`PUT /files/song`, `file_browser::edit_song`) takes the workflow slot, t
    (`files::edit_on_copy`, shared with the Artists page), reads the copy back, and renames it
    over the song only when every field reads as written;
 4. describes the song again into `library_items`.
-A new artist or album artist rewrites ARTISTS / ALBUMARTISTS from the text (`A feat. B` gives
+The page shows the separate ARTISTS values under the artist line as "Credited to" (read-only), so a
+split made on the Artists page can be seen there. A new artist or album artist rewrites ARTISTS / ALBUMARTISTS from the text (`A feat. B` gives
 two, `A & B` stays one) and drops that artist's sort name and MusicBrainz artist IDs; a new year
 also replaces a release date of another year; an empty field removes the tag. The answer holds
 the old values of the changed fields, and the page's Undo saves them again. WAV and AIFF are not
