@@ -2,6 +2,18 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.10.0](https://github.com/artamrj/magpie-fi/releases/tag/v0.10.0) - 2026-11-11
+
+### ✨ New
+- Review stays quick with thousands of songs waiting, and can be searched ([8a3a25d](https://github.com/artamrj/magpie-fi/commit/8a3a25d1c6412b8c8a7dcf72154b41cb0781307c))
+- Downloaded covers are kept as files, not inside the database ([db0b8da](https://github.com/artamrj/magpie-fi/commit/db0b8dae630650541acfcd6af9afcb644666b221))
+
+### 🐛 Fixes
+- The Artists page stays quick with thousands of artists, and a song gets a second look after a source was busy ([7f2beb8](https://github.com/artamrj/magpie-fi/commit/7f2beb8fb230566cdf15a292a1ee18971900fdac))
+
+### 📖 Docs
+- The README shows what magpie-fi does, with screenshots and a quick start ([fb693ba](https://github.com/artamrj/magpie-fi/commit/fb693baec14303a90767d64e785b26408a3f5db3))
+
 ## [0.9.1](https://github.com/artamrj/magpie-fi/releases/tag/v0.9.1) - 2026-11-11
 
 ### 🐛 Fixes
