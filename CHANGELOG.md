@@ -2,6 +2,11 @@
 
 What changed in each magpie-fi release. The newest is first.
 
+## [0.8.2](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.2) - 2026-11-11
+
+### ✨ New
+- Releases come with real notes and take one command ([4af5abd](https://github.com/artamrj/magpie-fi/commit/4af5abd94e4c421163c9c5293b3ecfc89da3be89))
+
 ## [0.8.1](https://github.com/artamrj/magpie-fi/releases/tag/v0.8.1) - 2026-11-11
 
 ### ✨ New
