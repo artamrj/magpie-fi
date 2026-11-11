@@ -433,6 +433,8 @@ source gave a length at all). The Review screen shows this text. A release witho
   is used.
 - Deezer lists "Featured" contributors after "feat."; a source that gives a plain artist and
   "(feat. …)" in the title keeps its main artist first (`credits::normalize_structured`).
+  Apple Music's square brackets after a version ("Arriba (Remix) [feat. Sak Noel & Salvi]")
+  are read the same way, in song and album titles.
 - **Upload sites** (Audiomack, SoundCloud, YouTube) show what the uploader typed, often the same
   wrong tags as the file, so they are not an exact catalog match by themselves.
 

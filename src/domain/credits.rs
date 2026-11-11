@@ -610,10 +610,17 @@ fn remove_feature_clause(title: &str) -> (String, Option<String>) {
     let title = clean_text(title);
     // Byte positions must match `title` (see `parse_supported_credit`).
     let lower = title.to_ascii_lowercase();
-    for marker in ["(feat. ", "(feat ", "(ft. ", "(ft ", "(featuring "] {
-        if let Some(start) = lower.find(marker)
-            && let Some(relative_close) = title[start + marker.len()..].find(')')
-        {
+    // Apple Music uses square brackets when the title already has round ones:
+    // "Arriba (Remix) [feat. Sak Noel & Salvi]".
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        for word in ["feat. ", "feat ", "ft. ", "ft ", "featuring "] {
+            let marker = format!("{open}{word}");
+            let Some(start) = lower.find(&marker) else {
+                continue;
+            };
+            let Some(relative_close) = title[start + marker.len()..].find(close) else {
+                continue;
+            };
             let close = start + marker.len() + relative_close;
             let featured = clean_text(&title[start + marker.len()..close]);
             let cleaned = clean_text(&format!("{} {}", &title[..start], &title[close + 1..]));
@@ -714,6 +721,19 @@ mod tests {
         );
         assert_eq!(credits.artist, "Amir Tataloo feat. Sohrab MJ & Orchid");
         assert_eq!(credits.title, "Male Man Bash");
+    }
+
+    #[test]
+    fn featured_singers_in_square_brackets_join_the_main_singer() {
+        // Apple Music switches to square brackets after a "(Remix)".
+        let credits =
+            normalize_structured("THK", "Arriba (Remix) [feat. Sak Noel & Salvi]", Vec::new());
+        assert_eq!(credits.artist, "THK feat. Sak Noel & Salvi");
+        assert_eq!(credits.title, "Arriba (Remix)");
+        assert_eq!(
+            release_title_without_featured("Arriba (Remix) - Single [feat. Sak Noel & Salvi]"),
+            "Arriba (Remix) - Single"
+        );
     }
 
     #[test]
