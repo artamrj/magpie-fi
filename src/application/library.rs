@@ -8,7 +8,14 @@ use crate::{
         input_dedup::{self, RecordingEvidence},
     },
     domain::{audio, credits},
-    infrastructure::{fingerprint_cache, media::fingerprint, providers::Candidate},
+    infrastructure::{
+        fingerprint_cache,
+        media::{
+            fingerprint,
+            tag_writer::{self, AlbumTags},
+        },
+        providers::Candidate,
+    },
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -103,7 +110,7 @@ pub fn destination(library: &Path, candidate: &Candidate, extension: &str) -> Pa
         .join(format!("{file}.{extension}"))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReleaseKind {
     Album,
     Single,
@@ -144,11 +151,14 @@ fn is_compilation(candidate: &Candidate) -> bool {
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("compilation"))
 }
 
-/// Keeps an album together. Catalogs often disagree about a year (the single's
-/// year for one song, the album's for the next), which would give one album
-/// two folders and two albums in Navidrome. When the album artist already has
-/// a folder for this album (same name and kind, another year), the song takes
-/// that folder's year.
+/// Keeps an album together. Catalogs disagree about an album: its spelling ("Khalij" on one,
+/// "Khaleej" on another), its year or full release date, which edition it is (another
+/// MusicBrainz album ID). Navidrome tells albums apart by all of these, so one album would
+/// show up twice. When the album artist already has a folder for this album (the same album
+/// by [`crate::domain::names::same_album`], any year), the song joins it and takes the
+/// album's details from a song already there (see [`AlbumTags`]). A single named like an
+/// album the artist has (the title song) joins that album. Without a readable song in the
+/// folder, only the folder's year is taken.
 pub fn align_with_existing_release(library: &Path, candidate: &mut Candidate) {
     let probe = destination(library, candidate, "x");
     let (Some(release_folder), Some(artist_folder)) =
@@ -162,44 +172,135 @@ pub fn align_with_existing_release(library: &Path, candidate: &mut Candidate) {
     else {
         return;
     };
-    let suffix = match release_kind(candidate) {
-        ReleaseKind::Single => " [Single]",
-        ReleaseKind::Ep => " [EP]",
-        ReleaseKind::Album => "",
-    };
-    let album = current
-        .strip_suffix(suffix)
-        .map(|name| strip_year(name).0.to_owned())
-        .unwrap_or_else(|| current.clone());
+    let kind = release_kind(candidate);
+    let ((album, _), _) = folder_release(&current);
     let Ok(entries) = std::fs::read_dir(artist_folder) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == current || !entry.path().is_dir() {
-            continue;
-        }
-        let Some(rest) = name.strip_suffix(suffix) else {
-            continue;
-        };
-        if suffix.is_empty() && (rest.ends_with(" [Single]") || rest.ends_with(" [EP]")) {
-            continue;
-        }
-        if let (existing_album, Some(year)) = strip_year(rest)
-            && crate::domain::names::match_key(existing_album)
-                == crate::domain::names::match_key(&album)
-        {
-            candidate.year = Some(year.to_owned());
-            if candidate
-                .release_date
-                .as_deref()
-                .is_some_and(|date| !date.starts_with(year))
+    // The album itself before a single or EP of the same name; then the fullest folder.
+    let best = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ((existing_album, year), existing_kind) = folder_release(&name);
+            let joins = existing_kind == kind || existing_kind == ReleaseKind::Album;
+            (joins && crate::domain::names::same_album(existing_album, album))
+                .then(|| (entry.path(), year.map(str::to_owned), existing_kind))
+        })
+        .map(|(folder, year, existing_kind)| {
+            let songs = files::audio_files(&folder).0;
+            (folder, year, existing_kind, songs)
+        })
+        .max_by_key(|(_, _, existing_kind, songs)| {
+            (*existing_kind == ReleaseKind::Album, songs.len())
+        });
+    let Some((_, year, existing_kind, mut songs)) = best else {
+        return;
+    };
+    songs.sort();
+    let album_tags = songs
+        .iter()
+        .find_map(|song| tag_writer::read_album_tags(song).ok())
+        .filter(|tags| tags.album.is_some());
+    match album_tags {
+        Some(tags) => join_album(candidate, tags, year, existing_kind),
+        None => {
+            if let Some(year) = year
+                && candidate.year.as_deref() != Some(year.as_str())
             {
-                candidate.release_date = None;
+                if candidate
+                    .release_date
+                    .as_deref()
+                    .is_some_and(|date| !date.starts_with(&year))
+                {
+                    candidate.release_date = None;
+                }
+                candidate.year = Some(year);
             }
-            return;
         }
     }
+}
+
+/// The song takes the album's details, so it lands in the album's folder and Navidrome sees
+/// one album. The song's own details (title, artists, recording) stay.
+fn join_album(
+    candidate: &mut Candidate,
+    tags: AlbumTags,
+    folder_year: Option<String>,
+    kind: ReleaseKind,
+) {
+    let changed_kind = release_kind(candidate) != kind;
+    candidate.album = tags.album;
+    if let Some(album_artist) = tags.album_artist {
+        let names = if tags.album_artists.is_empty() {
+            credits::normalize_featured(&album_artist, "")
+                .artists
+                .into_iter()
+                .map(|credit| credit.name)
+                .collect()
+        } else {
+            tags.album_artists
+        };
+        let ids =
+            (tags.release_artist_ids.len() == names.len()).then_some(&tags.release_artist_ids);
+        let count = names.len();
+        candidate.album_artist_credits = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| credits::ArtistCredit {
+                musicbrainz_id: ids.map(|ids| ids[index].clone()),
+                ..credits::ArtistCredit::new(name, if index + 1 < count { " & " } else { "" })
+            })
+            .collect();
+        candidate.album_artist = Some(album_artist);
+        candidate.album_artist_sort = tags.album_artist_sort;
+    }
+    if candidate.release_id.as_deref().map(str::to_ascii_lowercase)
+        != tags.release_id.as_deref().map(str::to_ascii_lowercase)
+    {
+        // The track ID belongs to the other edition.
+        candidate.release_track_id = None;
+    }
+    candidate.release_id = tags.release_id;
+    candidate.release_group_id = tags.release_group_id;
+    candidate.release_date = tags.release_date;
+    candidate.original_date = tags.original_date;
+    candidate.year = tags
+        .year
+        .and_then(|year| year.get(..4).map(str::to_owned))
+        .or(folder_year);
+    candidate.release_type = tags.release_type.or_else(|| {
+        Some(
+            match kind {
+                ReleaseKind::Album => "album",
+                ReleaseKind::Single => "single",
+                ReleaseKind::Ep => "ep",
+            }
+            .to_owned(),
+        )
+    });
+    candidate.is_compilation = tags.compilation;
+    candidate.label = tags.label;
+    if changed_kind {
+        // A single's "track 1 of 1" is not its place on the album.
+        candidate.track_number = None;
+        candidate.track_total = None;
+        candidate.disc_number = None;
+        candidate.disc_total = None;
+    }
+}
+
+/// "Khalij (1999) [Single]" → (("Khalij", Some("1999")), Single).
+fn folder_release(name: &str) -> ((&str, Option<&str>), ReleaseKind) {
+    let (rest, kind) = if let Some(rest) = name.strip_suffix(" [Single]") {
+        (rest, ReleaseKind::Single)
+    } else if let Some(rest) = name.strip_suffix(" [EP]") {
+        (rest, ReleaseKind::Ep)
+    } else {
+        (name, ReleaseKind::Album)
+    };
+    (strip_year(rest), kind)
 }
 
 /// "Discovery (2001)" → ("Discovery", Some("2001")).
@@ -925,6 +1026,84 @@ mod tests {
         other.year = Some("1997".into());
         align_with_existing_release(library, &mut other);
         assert_eq!(other.year.as_deref(), Some("1997"));
+    }
+
+    #[test]
+    fn a_new_song_takes_the_details_of_its_album_in_the_library() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path();
+        let folder = library.join("Ebi/Khalij (1999)");
+        std::fs::create_dir_all(&folder).unwrap();
+        // FLAC: lofty 0.24 does not write MusicBrainz album IDs into MP3 files.
+        let filed = folder.join("01 - Hamdam.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=0.1")
+            .args(["-q:a", "9"])
+            .arg(&filed)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let album = Candidate {
+            title: "Hamdam".into(),
+            artist: "Ebi".into(),
+            album: Some("Khalij".into()),
+            album_artist: Some("Ebi".into()),
+            year: Some("1999".into()),
+            release_date: Some("1999-03-01".into()),
+            release_id: Some("6b1d6b26-1c1e-4c4e-9d4a-5f4f4b1d2a11".into()),
+            release_type: Some("album".into()),
+            ..Default::default()
+        };
+        tag_writer::write(&filed, &album, None, None).unwrap();
+
+        // Another source spells the album its own way and calls the title song a single.
+        let mut song = Candidate {
+            title: "Khaleej".into(),
+            artist: "Ebi".into(),
+            album: Some("Khaleej".into()),
+            album_artist: Some("Ebi".into()),
+            year: Some("2001".into()),
+            release_date: Some("2001-01-01".into()),
+            release_type: Some("single".into()),
+            release_track_id: Some("0c1d6b26-1c1e-4c4e-9d4a-5f4f4b1d2a11".into()),
+            track_number: Some(1),
+            track_total: Some(1),
+            ..Default::default()
+        };
+        align_with_existing_release(library, &mut song);
+
+        assert_eq!(song.album.as_deref(), Some("Khalij"));
+        assert_eq!(song.year.as_deref(), Some("1999"));
+        assert_eq!(song.release_date.as_deref(), Some("1999-03-01"));
+        assert_eq!(song.release_id, album.release_id);
+        assert_eq!(song.release_track_id, None);
+        assert_eq!(song.release_type.as_deref(), Some("album"));
+        assert_eq!(song.track_number, None);
+        assert_eq!(song.title, "Khaleej");
+        assert_eq!(
+            destination(library, &song, "flac"),
+            folder.join("Khaleej.flac")
+        );
+
+        // Another album of the artist is left alone.
+        let mut other = Candidate {
+            title: "Lalehzaar".into(),
+            artist: "Ebi".into(),
+            album: Some("Lalehzaar".into()),
+            year: Some("2022".into()),
+            ..Default::default()
+        };
+        align_with_existing_release(library, &mut other);
+        assert_eq!(other.album.as_deref(), Some("Lalehzaar"));
+        assert_eq!(other.year.as_deref(), Some("2022"));
     }
 
     #[test]

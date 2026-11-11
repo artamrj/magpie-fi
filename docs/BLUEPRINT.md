@@ -168,8 +168,8 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
     differences as chips, details on demand), pick a cover, file anyway, repair, or remove. The
     manual tag editor is a mode of that screen. The screen's action is Telegram's native Main
     Button (Secondary Button for Skip / Remove), drawn in the page outside Telegram.
-  - **Artists**: song and artist counts, and the artists (rename, join, split a duet, from a
-    bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
+  - **Artists**: song and artist counts, and the artists (rename, join, split a duet, make an
+    album that Navidrome shows twice one album, from a bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
     log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar
     instead, one short line per fact with the details on hover.
   - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
@@ -325,8 +325,15 @@ DATA_ROOT/magpie-fi/                magpie-fi.sqlite, bin/yt-dlp (keep on a loca
   combined `A & B` name. Every spelling of an artist (`گوگوش`, `Googoosh`, `GOOGOOSH`) has one
   identity, so one folder (§5.4).
 - Songs of one new album filed together get one year, so the album never splits.
-- A song whose year differs from an album folder that already exists joins that folder, so an
-  album never splits in two.
+- **An album already in the library decides its details.** Navidrome tells albums apart by
+  name, album artist (or its MusicBrainz ID), MusicBrainz album ID and release date, so songs
+  of one album that disagree on any of them show up as two albums. A new song whose album the
+  album artist already has (the same album in any spelling: "Khalij" = "Khaleej", a store's
+  " - Single" ending, any year) joins that folder and takes the album's details from a song
+  already there: name, album artist, release date, year, MusicBrainz album and release-group
+  IDs, release type, compilation flag and label. A single named like an album the artist has
+  (the title song) joins the album, without the single's track number. Editions stay apart
+  ("Khalij (Remastered)").
 - Every name is Unicode **NFC**; `/ \ : * ? " < > |` and control characters are replaced,
   trailing dots and spaces trimmed, at most 180 bytes per part.
 - Name collisions get ` (2)`, ` (3)`, … — unless the existing file is the same audio with the
@@ -376,6 +383,11 @@ name in `ARTISTS` / `ALBUMARTISTS` and one folder:
   automatically after indexing; their songs move to the main artist's folder.
 - The **Artists** page lists them with their spellings: rename, join two, split a duet, or mark
   "one artist". The songs are retagged and moved; Navidrome may then see them as new songs.
+- **Albums shown twice.** Opening an artist checks its albums (every song's album details) and
+  offers "Make one album" for each album Navidrome would show more than once: every song takes
+  the details most of the album has (ties: an album over a single, a MusicBrainz release, a full
+  date) and moves into the folder most of those songs are in; a single that joins loses its
+  track number. The list marks artists with an album spelled two ways ("Albums?").
 
 ### 5.5 Navidrome
 

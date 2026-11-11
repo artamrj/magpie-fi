@@ -25,6 +25,25 @@ export type ArtistSummary = {
   musicbrainz_id?: string | null;
   single_entity: boolean;
   looks_like_several: boolean;
+  /** Albums whose songs spell the album name differently (Navidrome shows them twice). */
+  albums_to_check: number;
+};
+
+/** One album of an artist that Navidrome shows more than once (GET /api/artists/{id}/albums). */
+export type SplitAlbum = {
+  key: string;
+  /** The name it keeps. */
+  album: string;
+  songs: number;
+  /** Each way the album is tagged, the one it keeps first. */
+  versions: {
+    album: string;
+    year?: string | null;
+    kind?: string | null;
+    songs: number;
+    kept: boolean;
+    differs_in: string[];
+  }[];
 };
 
 /** What an artist change did to the songs. */

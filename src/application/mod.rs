@@ -1,3 +1,4 @@
+pub mod album_changes;
 pub mod apply;
 pub mod artist_changes;
 pub mod artists;

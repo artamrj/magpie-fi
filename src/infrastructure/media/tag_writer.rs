@@ -540,6 +540,151 @@ pub fn replace_artist(path: &Path, old: &str, new: &[String]) -> Result<bool> {
     Ok(changed)
 }
 
+/// What makes songs one album in Navidrome: it groups by album name, album artist (or its
+/// MusicBrainz ID), MusicBrainz album ID and release date. Songs of one album must agree on
+/// all of them, or Navidrome shows the album twice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlbumTags {
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub album_artists: Vec<String>,
+    pub album_artist_sort: Option<String>,
+    pub release_artist_ids: Vec<String>,
+    /// RELEASEDATE: Navidrome groups albums by it.
+    pub release_date: Option<String>,
+    pub original_date: Option<String>,
+    /// DATE.
+    pub year: Option<String>,
+    pub release_id: Option<String>,
+    pub release_group_id: Option<String>,
+    pub release_type: Option<String>,
+    pub compilation: bool,
+    pub label: Option<String>,
+}
+
+impl AlbumTags {
+    /// The values Navidrome tells albums apart by. Two songs with different keys are two
+    /// albums there, whatever their folder.
+    pub fn grouping_key(&self) -> (String, String, String, String) {
+        let key = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(crate::domain::names::match_key)
+                .unwrap_or_default()
+        };
+        let artist = if self.release_artist_ids.is_empty() {
+            key(&self.album_artist)
+        } else {
+            self.release_artist_ids.join("|").to_ascii_lowercase()
+        };
+        (
+            key(&self.album),
+            artist,
+            self.release_date.clone().unwrap_or_default(),
+            self.release_id
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        )
+    }
+}
+
+const ALBUM_TEXT_KEYS: [ItemKey; 11] = [
+    ItemKey::AlbumTitle,
+    ItemKey::AlbumArtist,
+    ItemKey::AlbumArtistSortOrder,
+    ItemKey::ReleaseDate,
+    ItemKey::OriginalReleaseDate,
+    ItemKey::RecordingDate,
+    ItemKey::MusicBrainzReleaseId,
+    ItemKey::MusicBrainzReleaseGroupId,
+    ItemKey::MusicBrainzReleaseType,
+    ItemKey::FlagCompilation,
+    ItemKey::Label,
+];
+
+/// The album details of a song (see [`AlbumTags`]).
+pub fn read_album_tags(path: &Path) -> Result<AlbumTags> {
+    let file = Probe::open(path)?.guess_file_type()?.read()?;
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(AlbumTags::default());
+    };
+    let text = |key: ItemKey| {
+        tag.get_string(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let list = |key: ItemKey| {
+        tag.get_strings(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    };
+    Ok(AlbumTags {
+        album: text(ItemKey::AlbumTitle),
+        album_artist: text(ItemKey::AlbumArtist),
+        album_artists: list(ItemKey::AlbumArtists),
+        album_artist_sort: text(ItemKey::AlbumArtistSortOrder),
+        release_artist_ids: list(ItemKey::MusicBrainzReleaseArtistId),
+        release_date: text(ItemKey::ReleaseDate),
+        original_date: text(ItemKey::OriginalReleaseDate),
+        year: text(ItemKey::RecordingDate).or_else(|| text(ItemKey::Year)),
+        release_id: text(ItemKey::MusicBrainzReleaseId),
+        release_group_id: text(ItemKey::MusicBrainzReleaseGroupId),
+        release_type: text(ItemKey::MusicBrainzReleaseType),
+        compilation: text(ItemKey::FlagCompilation).is_some_and(|value| value == "1"),
+        label: text(ItemKey::Label),
+    })
+}
+
+/// Gives a song exactly these album details: every one is written, and every one the album
+/// lacks is removed, so the song and the album agree. Returns whether anything changed.
+pub fn write_album_tags(path: &Path, album: &AlbumTags) -> Result<bool> {
+    if read_album_tags(path)? == *album {
+        return Ok(false);
+    }
+    let mut file = Probe::open(path)?.guess_file_type()?.read()?;
+    if file.primary_tag().is_none() {
+        let kind = file.primary_tag_type();
+        file.insert_tag(Tag::new(kind));
+    }
+    let tag = file
+        .primary_tag_mut()
+        .context("the song has no tag to write")?;
+    for key in ALBUM_TEXT_KEYS.into_iter().chain([
+        ItemKey::Year,
+        ItemKey::AlbumArtists,
+        ItemKey::MusicBrainzReleaseArtistId,
+    ]) {
+        tag.remove_key(key);
+    }
+    optional(tag, ItemKey::AlbumTitle, &album.album);
+    optional(tag, ItemKey::AlbumArtist, &album.album_artist);
+    push_text_values(tag, ItemKey::AlbumArtists, album.album_artists.clone());
+    optional(tag, ItemKey::AlbumArtistSortOrder, &album.album_artist_sort);
+    push_text_values(
+        tag,
+        ItemKey::MusicBrainzReleaseArtistId,
+        album.release_artist_ids.clone(),
+    );
+    optional(tag, ItemKey::ReleaseDate, &album.release_date);
+    optional(tag, ItemKey::OriginalReleaseDate, &album.original_date);
+    optional(tag, ItemKey::RecordingDate, &album.year);
+    optional(tag, ItemKey::MusicBrainzReleaseId, &album.release_id);
+    optional(
+        tag,
+        ItemKey::MusicBrainzReleaseGroupId,
+        &album.release_group_id,
+    );
+    optional(tag, ItemKey::MusicBrainzReleaseType, &album.release_type);
+    if album.compilation {
+        set(tag, ItemKey::FlagCompilation, "1");
+    }
+    optional(tag, ItemKey::Label, &album.label);
+    file.save_to_path(path, WriteOptions::default())?;
+    Ok(true)
+}
+
 /// Writes the title and performer Telegram shows for a sent file into it.
 /// Files forwarded from music channels often have no tags or a channel's name
 /// as artist, while the message carries the right ones (for your own files
@@ -1139,6 +1284,73 @@ mod tests {
 
         let file = Probe::open(&path).unwrap().read().unwrap();
         assert_eq!(file.primary_tag().unwrap().pictures()[0].data(), artwork);
+    }
+
+    #[test]
+    fn album_details_copy_from_one_song_to_another() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let tone = |name: &str| {
+            let path = directory.path().join(name);
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=0.1")
+                .args(["-q:a", "9"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let (album_song, odd_song) = (tone("album.mp3"), tone("odd.mp3"));
+        let album = Candidate {
+            title: "Hamdam".into(),
+            artist: "Ebi".into(),
+            album: Some("Khalij".into()),
+            album_artist: Some("Ebi".into()),
+            year: Some("1999".into()),
+            release_date: Some("1999-03-01".into()),
+            release_type: Some("album".into()),
+            ..Default::default()
+        };
+        write(&album_song, &album, None, None).unwrap();
+        let odd = Candidate {
+            title: "Khaleej".into(),
+            artist: "Ebi".into(),
+            album: Some("Khaleej".into()),
+            album_artist: Some("Ebi".into()),
+            year: Some("1999".into()),
+            release_date: Some("1999".into()),
+            release_type: Some("single".into()),
+            label: Some("Caltex".into()),
+            ..Default::default()
+        };
+        write(&odd_song, &odd, None, None).unwrap();
+
+        let wanted = read_album_tags(&album_song).unwrap();
+        assert_eq!(wanted.album.as_deref(), Some("Khalij"));
+        assert_eq!(wanted.release_date.as_deref(), Some("1999-03-01"));
+        assert_ne!(
+            read_album_tags(&odd_song).unwrap().grouping_key(),
+            wanted.grouping_key()
+        );
+        assert!(write_album_tags(&odd_song, &wanted).unwrap());
+        let now = read_album_tags(&odd_song).unwrap();
+        assert_eq!(now, wanted);
+        assert_eq!(now.grouping_key(), wanted.grouping_key());
+        // The label only the odd song had is gone: the album has none.
+        assert!(now.label.is_none());
+        // The song's own details stay.
+        let details = read_details(&odd_song).unwrap();
+        assert_eq!(details.title.as_deref(), Some("Khaleej"));
+        // Already the same: nothing is written.
+        assert!(!write_album_tags(&odd_song, &wanted).unwrap());
     }
 
     #[test]

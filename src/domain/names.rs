@@ -88,6 +88,26 @@ pub fn same_loose_title(left: &str, right: &str) -> bool {
     loose_title_key(left).is_some_and(|key| Some(key) == loose_title_key(right))
 }
 
+/// Two album names are the same album: the same name, or the same Persian words in another
+/// Latin spelling ("Khalij" = "Khaleej"), or one with a store's " - Single" / " - EP" ending.
+/// Editions stay apart: "Khalij (Remastered)" is another album.
+pub fn same_album(left: &str, right: &str) -> bool {
+    let key = album_key(left);
+    !key.is_empty() && key == album_key(right)
+}
+
+/// One key for every spelling of an album name (see [`same_album`]), to group songs by.
+pub fn album_key(value: &str) -> String {
+    let trimmed = value.trim();
+    // ASCII lowercasing keeps byte positions, so the ending can be cut from `trimmed`.
+    let lower = trimmed.to_ascii_lowercase();
+    let plain = [" - single", " - ep", " (single)", " (ep)"]
+        .iter()
+        .find(|ending| lower.ends_with(*ending))
+        .map_or(trimmed, |ending| &trimmed[..trimmed.len() - ending.len()]);
+    loose_title_key(plain).unwrap_or_else(|| match_key(plain))
+}
+
 fn fold_transliteration(word: &str) -> String {
     let mut word = word.to_owned();
     for (from, to) in [
@@ -168,6 +188,19 @@ pub fn has_arabic_script(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_album_in_several_spellings() {
+        assert!(same_album("Khalij", "Khaleej"));
+        assert!(same_album("Khaleej - Single", "Khalij"));
+        assert!(same_album(
+            "Apple Music Live: Billie Eilish",
+            "apple music live billie eilish"
+        ));
+        assert!(!same_album("Khalij", "Khalij (Remastered)"));
+        assert!(!same_album("Khalij", "Lalehzaar"));
+        assert!(!same_album("", ""));
+    }
 
     #[test]
     fn persian_spellings_of_one_name_share_a_key() {

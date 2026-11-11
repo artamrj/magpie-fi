@@ -36,6 +36,10 @@ pub struct ArtistSummary {
     pub single_entity: bool,
     /// The name looks like several artists ("A & B", "A, B", "A x B").
     pub looks_like_several: bool,
+    /// Albums of this artist whose songs spell the album name differently ("Khalij" and
+    /// "Khaleej"), so Navidrome shows them twice. A quick look at the index only; opening
+    /// the artist checks every album detail (see `album_changes::split_albums`).
+    pub albums_to_check: usize,
 }
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
@@ -61,6 +65,7 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ArtistSummary>> {
     )
     .fetch_all(pool)
     .await?;
+    let albums_to_check = albums_spelled_twice(pool).await?;
     Ok(rows
         .into_iter()
         .map(
@@ -80,6 +85,7 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ArtistSummary>> {
                     .iter()
                     .any(|separator| name.contains(separator));
                 ArtistSummary {
+                    albums_to_check: albums_to_check.get(&id).copied().unwrap_or(0),
                     id,
                     name,
                     spellings,
@@ -91,6 +97,33 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<ArtistSummary>> {
             },
         )
         .collect())
+}
+
+/// Per main artist: how many albums have songs that spell the album name differently.
+async fn albums_spelled_twice(pool: &SqlitePool) -> Result<std::collections::HashMap<i64, usize>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT artist_ids, album FROM library_items
+         WHERE artist_ids IS NOT NULL AND album IS NOT NULL AND album<>''",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut spellings = std::collections::HashMap::<(i64, String), BTreeSet<String>>::new();
+    for (ids, album) in rows {
+        let Some(&main) = ids_from_text(&ids).first() else {
+            continue;
+        };
+        let key = crate::domain::names::album_key(&album);
+        if !key.is_empty() {
+            spellings.entry((main, key)).or_default().insert(album);
+        }
+    }
+    let mut counts = std::collections::HashMap::new();
+    for ((artist, _), names) in spellings {
+        if names.len() > 1 {
+            *counts.entry(artist).or_default() += 1;
+        }
+    }
+    Ok(counts)
 }
 
 pub async fn rename(state: &Arc<AppState>, id: i64, new_name: &str) -> Result<Changed> {
@@ -454,7 +487,7 @@ fn retag(song: &Path, old_spellings: &[String], new_names: &[String]) -> Result<
     })
 }
 
-async fn unused(target: PathBuf) -> Result<PathBuf> {
+pub(crate) async fn unused(target: PathBuf) -> Result<PathBuf> {
     let mut candidate = target.clone();
     let mut number = 2;
     while tokio::fs::try_exists(&candidate).await? {
@@ -466,7 +499,12 @@ async fn unused(target: PathBuf) -> Result<PathBuf> {
 
 /// Moves a song (and its lyrics files, and the album cover once the album
 /// folder is empty) and updates the index, the songs and the playlists.
-async fn move_song(state: &Arc<AppState>, root: &Path, from: &Path, to: &Path) -> Result<()> {
+pub(crate) async fn move_song(
+    state: &Arc<AppState>,
+    root: &Path,
+    from: &Path,
+    to: &Path,
+) -> Result<()> {
     if let Some(parent) = to.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

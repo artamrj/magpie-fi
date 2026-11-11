@@ -22,6 +22,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tracks", get(handlers::list_tracks))
         .route("/artists", get(handlers::list_artists))
         .route("/artists/{id}", post(handlers::change_artist))
+        .route("/artists/{id}/albums", get(handlers::split_albums))
         .route("/files", get(handlers::list_folder))
         .route("/files/search", get(handlers::search_files))
         .route(
