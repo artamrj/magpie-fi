@@ -171,7 +171,8 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   - **Artists**: song and artist counts, and the artists (rename, join, split a duet, make an
     album that Navidrome shows twice one album, from a bottom sheet). On a phone and in Telegram the status (bot, sources, folders, downloads,
     log out) sits at the bottom of this tab; a wide window shows it at the foot of the sidebar
-    instead, one short line per fact with the details on hover.
+    instead, in rows like the sidebar nav: "Ready" with the song count, then one row only for
+    each problem (bot off, sources missing, no yt-dlp), with a short explanation on hover.
   - **Files**: the `library/` folder as it is on disk, one folder at a time (a folder tree on a
     wide screen), a search over titles, artists, albums and paths, and one song's tags, cover,
     sound and path with a player. The tags (title, artist, album, album artist, track, disc,
