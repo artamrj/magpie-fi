@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Setup guide
+    url: https://github.com/artamrj/magpie-fi#quick-start
+    about: How to install and set up magpie-fi

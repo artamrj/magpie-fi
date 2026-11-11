@@ -1,0 +1,18 @@
+name: Idea
+description: Suggest a feature or a new source
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you want to do
+      description: Describe the situation, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could it work
+  - type: markdown
+    attributes:
+      value: magpie-fi only uses free and public sources. Paid APIs and anything that breaks copy protection are not accepted.

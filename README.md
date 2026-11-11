@@ -210,6 +210,12 @@ cd web && npm ci && npm run format:check && npm run lint && npm run build
 | [docs/BLUEPRINT.md](docs/BLUEPRINT.md) | What and why: principles, library layout, naming, tags, decisions |
 | [docs/TECHNICAL-OVERVIEW.md](docs/TECHNICAL-OVERVIEW.md) | How: pipeline steps, scoring, API, tables, file map |
 | [AGENTS.md](AGENTS.md) | Rules and commands for contributors and coding agents |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to report a problem or send a change |
+
+## Support the project
+
+If magpie-fi is useful to you, a ⭐ on GitHub helps other people find it. Problems and ideas
+are welcome as [issues](https://github.com/artamrj/magpie-fi/issues/new/choose).
 
 ## History
 
