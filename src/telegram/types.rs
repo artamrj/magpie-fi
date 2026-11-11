@@ -68,7 +68,10 @@ impl Chat {
 /// bot needs from it.
 #[derive(Debug, Deserialize)]
 pub struct Message {
+    /// 0 for ephemeral messages.
     pub message_id: i32,
+    /// Set for ephemeral messages (Bot API 10.2), such as an ephemeral command.
+    pub ephemeral_message_id: Option<i32>,
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,

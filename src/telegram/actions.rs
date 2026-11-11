@@ -2,7 +2,7 @@
 //! here only, so a button and the code that handles it can't drift apart.
 //! Widget taps (Bot API 10.4) will send the same short codes.
 
-use super::{Context, Role, answer, edit, role, send, texts};
+use super::{Context, Role, To, answer, edit, edit_rich, role, say, send, texts};
 use crate::{
     acquire::store,
     types::{CandidateId, TrackId},
@@ -72,9 +72,30 @@ impl Action {
         (number().is_none() && action.to_string() == data).then_some(action)
     }
 
-    /// An inline button that sends this action.
+    /// An inline button that sends this action, coloured by what it does.
     pub fn button(self, text: &str) -> Value {
-        json!({"text": text, "callback_data": self.to_string()})
+        let mut button = json!({"text": text, "callback_data": self.to_string()});
+        if let Some(style) = self.style() {
+            button["style"] = json!(style);
+        }
+        button
+    }
+
+    /// Bot API 9.4 button colours: green accepts, red stops or removes, blue is
+    /// the main next step. Plain buttons only show something.
+    fn style(self) -> Option<&'static str> {
+        match self {
+            Self::Pick { .. } | Self::Invite => Some("success"),
+            Self::Stop(_) | Self::Drop(_) | Self::Revoke(_) => Some("danger"),
+            Self::Retry(_) => Some("primary"),
+            Self::Details(_) => None,
+        }
+    }
+
+    /// The same button greyed out: shown but does nothing (Bot API 10.3), so a
+    /// row of buttons keeps its shape while a request is busy.
+    pub fn disabled_button(text: &str) -> Value {
+        json!({"text": text, "disabled": {}})
     }
 
     /// Owners may press anything; guests only buttons of their own requests.
@@ -127,11 +148,18 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
             answer(context, &query.id, &texts::retrying(queued)).await;
         }
         Action::Details(request) => {
-            answer(context, &query.id, "").await;
+            // Only the person who pressed sees it, so the chat stays tidy; it
+            // can be pressed again at any time.
             if let Some((chat, message)) = message {
                 let songs = store::request_songs(pool, request).await?;
-                send(context, chat, &texts::details(&songs), Some(message)).await;
+                let to = To::Presser {
+                    chat,
+                    query: query.id.clone(),
+                    message,
+                };
+                say(context, &to, &texts::details(&songs), None).await;
             }
+            answer(context, &query.id, "").await;
         }
         Action::Pick { track, candidate } => {
             let reply = pick_candidate(context, track, candidate).await;
@@ -172,7 +200,7 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
             answer(context, &query.id, texts::REMOVED_GUEST).await;
             if let Some((chat, message)) = message {
                 let (text, keyboard) = super::commands::guests_view(context).await?;
-                edit(context, chat, message, &text, Some(keyboard)).await;
+                edit_rich(context, chat, message, &text, Some(keyboard)).await;
             }
         }
     }
@@ -220,6 +248,22 @@ mod tests {
         for action in actions {
             assert_eq!(Action::parse(&action.to_string()), Some(action));
         }
+    }
+
+    #[test]
+    fn buttons_are_coloured_by_what_they_do() {
+        assert_eq!(Action::Drop(1).button("x")["style"], "danger");
+        assert_eq!(
+            Action::Pick {
+                track: 1,
+                candidate: 2
+            }
+            .button("x")["style"],
+            "success"
+        );
+        assert!(Action::Details(1).button("x").get("style").is_none());
+        let off = Action::disabled_button("x");
+        assert!(off.get("callback_data").is_none() && off["disabled"] == json!({}));
     }
 
     #[test]

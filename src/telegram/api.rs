@@ -167,6 +167,12 @@ pub fn is_not_modified(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.description.contains("message is not modified"))
 }
 
+/// Telegram answered and said no (as opposed to a network problem, where the
+/// request may have arrived).
+pub fn is_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TelegramError>().is_some()
+}
+
 /// The message to edit no longer exists (deleted by the user).
 pub fn is_gone(error: &anyhow::Error) -> bool {
     error.downcast_ref::<TelegramError>().is_some_and(|error| {
