@@ -19,6 +19,9 @@ pub async fn run(context: Arc<Context>) {
         if let Err(error) = ask_reviews(&context).await {
             tracing::warn!(%error, "asking about review songs failed");
         }
+        if let Err(error) = settle_review_cards(&context).await {
+            tracing::warn!(%error, "updating answered review cards failed");
+        }
         tokio::time::sleep(INTERVAL).await;
     }
 }
@@ -224,25 +227,39 @@ fn keyboard(summary: &store::RequestSummary, finished: bool, app: Option<String>
 }
 
 /// "Which song is this?" for songs sent from Telegram that wait in review.
-/// Owners with a Mini App get one button that opens the app on that song;
-/// guests (who can't open the web page) and chats without an HTTPS address get
-/// up to three candidates in the chat.
+/// Where the chat can show cards, it is a review card with up to three choices
+/// to tap. Otherwise owners with a Mini App get one button that opens the app
+/// on that song, and guests (who can't open the web page) and chats without an
+/// HTTPS address get up to three candidate buttons in the chat.
 async fn ask_reviews(context: &Context) -> Result<()> {
-    for question in store::unasked_reviews(&context.state.pool).await? {
+    let pool = &context.state.pool;
+    for question in store::unasked_reviews(pool).await? {
         let song = match &question.artist {
             Some(artist) => format!("{artist} – {}", question.title),
             None => question.title.clone(),
         };
-        let (answer, rows) =
-            match super::mini_app_track_url(&context.state.config.public_url, question.track_id)
-                .filter(|_| context.config.owners.contains(&question.chat_id))
-            {
-                Some(url) => (
-                    texts::ReviewAnswer::InApp,
-                    vec![vec![super::mini_app_button(texts::CHOOSE_IN_APP, &url)]],
-                ),
-                None => chat_choices(context, &question).await?,
-            };
+        let app = super::mini_app_track_url(&context.state.config.public_url, question.track_id)
+            .filter(|_| context.config.owners.contains(&question.chat_id));
+        if context.config.cards && store::cards_allowed(pool, question.chat_id).await? {
+            match send_review_card(context, &question, &song, app.as_deref()).await? {
+                super::Card::Sent(message) => {
+                    store::set_review_card(pool, question.wanted_id, message).await?;
+                    continue;
+                }
+                super::Card::Lost => {
+                    store::set_review_message(pool, question.wanted_id, 0).await?;
+                    continue;
+                }
+                super::Card::Refused => store::cards_refused(pool, question.chat_id).await?,
+            }
+        }
+        let (answer, rows) = match app {
+            Some(url) => (
+                texts::ReviewAnswer::InApp,
+                vec![vec![super::mini_app_button(texts::CHOOSE_IN_APP, &url)]],
+            ),
+            None => chat_choices(context, &question).await?,
+        };
         let text = texts::review_question(&song, question.reason.as_deref(), &answer);
         let sent = send_with(
             context,
@@ -254,9 +271,105 @@ async fn ask_reviews(context: &Context) -> Result<()> {
         .await;
         // Remember the question even if sending failed, so it is not repeated forever.
         let message = sent.map_or(0, |message| message.message_id);
-        store::set_review_message(&context.state.pool, question.wanted_id, message).await?;
+        store::set_review_message(pool, question.wanted_id, message).await?;
     }
     Ok(())
+}
+
+/// A review card for one song: what the file is, why magpie-fi is unsure, and
+/// the three best choices with what supports each.
+async fn send_review_card(
+    context: &Context,
+    question: &store::ReviewQuestion,
+    song: &str,
+    app: Option<&str>,
+) -> Result<super::Card> {
+    let pool = &context.state.pool;
+    let seconds: Option<f64> = sqlx::query_scalar("SELECT duration FROM tracks WHERE id=?")
+        .bind(question.track_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    let choices: Vec<cards::ReviewChoice> = sqlx::query_as(
+        "SELECT id,coalesce(title,'') AS title,coalesce(artist,'') AS artist,album,year,score,
+           duration_delta,score_breakdown
+         FROM candidates WHERE track_id=? ORDER BY score DESC LIMIT 3",
+    )
+    .bind(question.track_id)
+    .fetch_all(pool)
+    .await?;
+    let file = cards::ReviewFile {
+        song: song.to_owned(),
+        seconds,
+        reason: question.reason.clone(),
+    };
+    let state = cards::review_state(question.track_id, &file, &choices);
+    let caption = texts::review_question(
+        song,
+        question.reason.as_deref(),
+        &texts::ReviewAnswer::InCard,
+    );
+    let mut params = json!({
+        "chat_id": question.chat_id,
+        "html": cards::REVIEW_HTML,
+        "chat_data": cards::with_revision(state, super::revision()),
+        "caption": caption,
+        "parse_mode": "HTML",
+        "allow_queries": true,
+    });
+    if let Some(url) = app {
+        params["reply_markup"] =
+            json!({"inline_keyboard": [[super::mini_app_button(texts::CHOOSE_IN_APP, url)]]});
+    }
+    Ok(super::send_widget(context, params).await)
+}
+
+/// Review cards whose song was sorted out somewhere else (in the app, or in
+/// the chat's own buttons) say so, instead of offering choices that are gone.
+async fn settle_review_cards(context: &Context) -> Result<()> {
+    for card in store::settled_review_cards(&context.state.pool).await? {
+        let (state, words) = match card.status.as_str() {
+            "removed" => ("removed", texts::REVIEW_REMOVED),
+            "failed" => ("gone", texts::REVIEW_GONE),
+            _ => ("app", texts::REVIEW_DONE_IN_APP),
+        };
+        end_review_card(context, &card, state, words, None).await?;
+    }
+    Ok(())
+}
+
+/// Shows how a review card ended, and stops updating it. `app` keeps the
+/// "Choose in the app" button (when something is left to do there).
+pub async fn end_review_card(
+    context: &Context,
+    card: &store::ReviewCard,
+    state: &str,
+    words: &str,
+    app: Option<String>,
+) -> Result<()> {
+    let track = card.track_id.unwrap_or_default();
+    let outcome = cards::review_outcome(track, &card.song, state, words);
+    let data = cards::with_revision(outcome, super::revision());
+    let _: Option<Value> = context
+        .bot
+        .try_call(
+            "editMessageWidgetData",
+            &json!({"chat_id": card.chat_id, "message_id": card.message_id, "chat_data": data}),
+        )
+        .await;
+    // The caption says the same; without a keyboard the app button goes away.
+    let mut params = json!({
+        "chat_id": card.chat_id,
+        "message_id": card.message_id,
+        "caption": texts::escape(words),
+        "parse_mode": "HTML",
+    });
+    if let Some(url) = app {
+        params["reply_markup"] =
+            json!({"inline_keyboard": [[super::mini_app_button(texts::CHOOSE_IN_APP, &url)]]});
+    }
+    let _: Option<Value> = context.bot.try_call("editMessageCaption", &params).await;
+    store::close_review_card(&context.state.pool, card.wanted_id).await
 }
 
 /// Candidate buttons for chats without a Mini App.

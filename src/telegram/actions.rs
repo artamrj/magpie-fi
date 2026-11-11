@@ -168,12 +168,7 @@ pub async fn on_button(context: &Arc<Context>, query: &super::types::CallbackQue
             }
         }
         Action::Drop(track) => {
-            let removed = crate::http::handlers::remove_track(
-                axum::extract::State(context.state.clone()),
-                axum::extract::Path(TrackId(track)),
-            )
-            .await
-            .is_ok();
+            let removed = remove_song(context, track).await;
             answer(context, &query.id, "").await;
             if let Some((chat, message)) = message {
                 let text = if removed {
@@ -242,7 +237,7 @@ pub async fn on_card_tap(context: &Arc<Context>, query: &WidgetQuery) -> Result<
     Ok(())
 }
 
-async fn card_reply(context: &Context, query: &WidgetQuery) -> Result<String> {
+async fn card_reply(context: &Arc<Context>, query: &WidgetQuery) -> Result<String> {
     let message = |text: &str| json!({ "m": text }).to_string();
     let Some(action) = Action::parse(&query.data) else {
         return Ok(message(""));
@@ -257,9 +252,65 @@ async fn card_reply(context: &Context, query: &WidgetQuery) -> Result<String> {
             let songs = store::request_songs(&context.state.pool, request).await?;
             super::cards::details_answer(&songs)
         }
-        // A request card only offers the buttons above.
-        _ => message(""),
+        // From a review card. Choosing can take longer than the 15 s a card
+        // waits for an answer (it may look for a cover), so the answer comes
+        // now and the card shows how it ended when it's done.
+        Action::Pick { track, candidate } => {
+            let context = context.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pick_on_card(&context, track, candidate).await {
+                    tracing::warn!(%error, "choosing from a review card failed");
+                }
+            });
+            message(texts::SAVING_CHOICE)
+        }
+        Action::Drop(track) => {
+            let card = store::review_card_of_track(&context.state.pool, track).await?;
+            let removed = remove_song(context, track).await;
+            let (state, words) = if removed {
+                ("removed", texts::REVIEW_REMOVED)
+            } else {
+                ("gone", texts::SONG_ALREADY_GONE)
+            };
+            if let Some(card) = card {
+                super::status::end_review_card(context, &card, state, words, None).await?;
+            }
+            message(words)
+        }
+        // Cards don't offer the guest buttons.
+        Action::Invite | Action::Revoke(_) => message(""),
     })
+}
+
+/// A choice made on a review card; the card then shows how it went.
+async fn pick_on_card(context: &Context, track: i64, candidate: i64) -> Result<()> {
+    let card = store::review_card_of_track(&context.state.pool, track).await?;
+    let reply = pick_candidate(context, track, candidate).await;
+    let Some(card) = card else {
+        return Ok(());
+    };
+    let (state, app) = match reply {
+        texts::PICKED => ("filed", None),
+        // Saved, but the cover is missing: finish it in the app.
+        texts::PICKED_NO_COVER => (
+            "cover",
+            super::mini_app_track_url(&context.state.config.public_url, track)
+                .filter(|_| context.config.owners.contains(&card.chat_id)),
+        ),
+        _ => ("gone", None),
+    };
+    super::status::end_review_card(context, &card, state, reply, app).await
+}
+
+/// "None of these": the song waiting in Review is removed, the same as Remove
+/// on the web page. False when it was no longer there.
+async fn remove_song(context: &Context, track: i64) -> bool {
+    crate::http::handlers::remove_track(
+        axum::extract::State(context.state.clone()),
+        axum::extract::Path(TrackId(track)),
+    )
+    .await
+    .is_ok()
 }
 
 /// Selects a candidate for a song waiting in review; returns the reply.

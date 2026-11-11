@@ -196,9 +196,13 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   Telegram can't show cards (or with `MAGPIE_TELEGRAM_CARDS=false`) it is a text status message
   instead, edited as songs arrive, with Stop / Retry failed / Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
   out so the row doesn't jump). Details is an ephemeral answer, seen only by whoever pressed it.
-  "Not sure which song this is" questions have one button that opens the Mini App on that song for
-  owners; guests, and chats without an HTTPS address, get up to three candidate buttons (green)
-  and "None of these" (red) in the chat.
+  "Not sure which song this is" questions are **review cards**: the file, why magpie-fi is unsure,
+  and up to three choices, each with its score, length difference, "Audio match" and the sources
+  that found it, a "This one" button, and "None of these". A tap uses the same choose/remove
+  logic as the web page; the card then shows how it ended, also when the song was sorted out in
+  the app. Owners also get "Choose in the app" below it. Without cards, owners get one button that
+  opens the Mini App on that song; guests, and chats without an HTTPS address, get up to three
+  candidate buttons (green) and "None of these" (red) in the chat.
 - Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`. `/start`, `/help`
   and `/guests` are rich messages (headings, tables, an expandable "How it works"); `/queue`,
   `/health` and `/id` answer ephemerally when Telegram sends them as ephemeral commands. If

@@ -65,7 +65,7 @@ The schema is in `migrations/` and is applied at startup. Current tables:
 | `automatic_scan_files` | Size + mtime of every checked file, so only new or changed files are processed |
 | `library_items` | The permanent library index: one row per audio file in `library/` (§8) |
 | `requests` | One row per link someone asked for; its Telegram status message: id, `card_kind` (`card` or `text`) and the card's last caption |
-| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path |
+| `wanted` | One row per song a request wants, in order: status, attempts, staging/library path; its Telegram review question (`review_message_id`, `review_card`: 0 text or none, 1 card waiting for a choice, 2 card showing how it ended) |
 | `playlists` | One row per playlist link → one `.m3u8` file |
 | `telegram_guests`, `telegram_invites`, `telegram_state`, `telegram_chats` | Invited guests, one-time invite tokens, the update offset, chats whose Telegram refused a card (text until `cards_off_until`) |
 | `login_links`, `sessions` | Web login: one-time links and 30-day sessions (SHA-256 hashes only) |
@@ -158,9 +158,10 @@ In Review you can:
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
 
-The Telegram bot asks about Telegram songs in Review: owners get a button that opens the Mini
-App on that song; guests and chats without HTTPS get up to three candidates in the chat, which
-call the same choose/remove logic.
+The Telegram bot asks about Telegram songs in Review with a review card (up to three choices to
+tap, with score, length difference, audio match and sources). Without cards, owners get a button
+that opens the Mini App on that song; guests and chats without HTTPS get up to three candidate
+buttons in the chat. All of them call the same choose/remove logic.
 
 ### Phase 4 — File into the library
 
@@ -222,7 +223,7 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 | Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
 | Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
 | Buttons | `actions.rs` | One `Action` type for every button and card tap (`widget_query`, answered with `answerWidgetQuery` within 15 s): its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
-| Cards | `cards.rs`, `widgets/request.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. |
+| Cards | `cards.rs`, `widgets/request.html`, `widgets/review.html` | Each request as a live card (Bot API 10.4 widget, sent with `sendWidget`). The HTML is fixed at send time; the bot only changes its state (`chat_data`, ≤ 1024 bytes: counts, one letter per song, the song being worked on, which buttons to show, and three colours from a filed song's verified cover). Edits are silent. The card's caption is what the chat list, notifications and older apps show. Telegram's limits for the HTML (32 KB, 4 KB compressed) are checked by `web/scripts/check-widgets.mjs` in `npm run lint`. If Telegram refuses a card, that chat gets text status messages for a day. `MAGPIE_TELEGRAM_CARDS=false` turns cards off. Review cards (`review.html`) show a song in Review and up to three choices; their badges come from the same rules as smart approval (`breakdown_has_audio_recognition`, `breakdown_sources`). A pick is answered at once (choosing can take longer than the 15 s a card waits) and the card then shows how it ended. Review cards whose song was sorted out in the app are updated by the status loop. |
 | Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message (card state with `editMessageWidgetData` and its caption, or text) only when what it shows changed, closes it when nothing is left, and asks about songs waiting in Review. A finished album or playlist of 5+ songs gets one short 🎉 message, because edits don't notify. |
 | Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. Rich messages carry their plain text too, for the fallback. The command list (`COMMANDS`) marks `/queue`, `/health` and `/id` as `is_ephemeral`. |
 

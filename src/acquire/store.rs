@@ -592,6 +592,66 @@ pub async fn set_review_message(pool: &SqlitePool, wanted_id: i64, message_id: i
 }
 
 /// Who asked for the song in this review track, and in which chat.
+/// A review question sent as a card, still waiting for a choice.
+pub async fn set_review_card(pool: &SqlitePool, wanted_id: i64, message_id: i32) -> Result<()> {
+    sqlx::query("UPDATE wanted SET review_message_id=?,review_card=1 WHERE id=?")
+        .bind(message_id)
+        .bind(wanted_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Where a song's review card is: (wanted ID, chat, message, still waiting).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReviewCard {
+    pub wanted_id: i64,
+    pub chat_id: i64,
+    pub message_id: i32,
+    pub track_id: Option<i64>,
+    /// The song's status now ("filed", "removed", "identifying", …).
+    pub status: String,
+    /// "Artist – Title", as the card showed it.
+    pub song: String,
+}
+
+const REVIEW_CARD: &str = "SELECT w.id AS wanted_id,r.chat_id,w.review_message_id AS message_id,
+       t.id AS track_id,w.status,
+       CASE WHEN w.artist IS NULL THEN w.title ELSE w.artist||' – '||w.title END AS song
+     FROM wanted w JOIN requests r ON r.id=w.request_id
+     LEFT JOIN tracks t ON t.path=w.staging_path";
+
+/// The open review card for a Review song, if it was asked about with one.
+pub async fn review_card_of_track(pool: &SqlitePool, track_id: i64) -> Result<Option<ReviewCard>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{REVIEW_CARD} WHERE t.id=? AND w.review_card=1 AND r.chat_id IS NOT NULL
+           AND w.review_message_id>0 LIMIT 1"
+    )))
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Open review cards whose song left Review some other way (chosen or removed
+/// in the app, or filed by itself), so the card can say so.
+pub async fn settled_review_cards(pool: &SqlitePool) -> Result<Vec<ReviewCard>> {
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{REVIEW_CARD} WHERE w.review_card=1 AND r.chat_id IS NOT NULL AND w.review_message_id>0
+           AND (w.status<>'identifying' OR t.id IS NULL OR t.stage<>'review')"
+    )))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The review card now shows its outcome and is not updated again.
+pub async fn close_review_card(pool: &SqlitePool, wanted_id: i64) -> Result<()> {
+    sqlx::query("UPDATE wanted SET review_card=2 WHERE id=?")
+        .bind(wanted_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn requester_of_track(pool: &SqlitePool, track_id: i64) -> Result<Option<(i64, String)>> {
     Ok(sqlx::query_as(
         "SELECT r.id,coalesce(r.requested_by,'') FROM tracks t

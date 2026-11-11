@@ -1,7 +1,7 @@
 //! What people send: links become requests, audio files become uploads.
 //! Both go into the same queue the web page uses.
 
-use super::{Context, api, cards, react, send, texts, types::Message, types::User};
+use super::{Card, Context, api, cards, react, send, texts, types::Message, types::User};
 use crate::acquire::{links, store, worker};
 use anyhow::Result;
 use serde_json::json;
@@ -94,14 +94,7 @@ async fn attach_status_message(
     Ok(())
 }
 
-enum Card {
-    Sent(i32),
-    Refused,
-    Lost,
-}
-
-/// Sends a request card. Owners also get a button that opens the app; if
-/// Telegram refuses the card with that button, it is tried once without.
+/// Sends a request card. Owners also get a button that opens the app.
 async fn send_card(context: &Context, request: i64, kind: &str, message: &Message) -> Card {
     let chat = message.chat.id;
     let mut params = json!({
@@ -116,27 +109,7 @@ async fn send_card(context: &Context, request: i64, kind: &str, message: &Messag
     if let Some(keyboard) = super::status::app_keyboard(context, chat, false) {
         params["reply_markup"] = keyboard;
     }
-    loop {
-        match context.bot.call::<_, Message>("sendWidget", &params).await {
-            Ok(sent) => return Card::Sent(sent.message_id),
-            Err(error) if api::is_refusal(&error) => {
-                if params
-                    .as_object_mut()
-                    .and_then(|p| p.remove("reply_markup"))
-                    .is_some()
-                {
-                    tracing::info!(%error, "Telegram refused a card with an app button; trying without");
-                    continue;
-                }
-                tracing::info!(%error, "Telegram refused a request card; using text in this chat for a day");
-                return Card::Refused;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "sending a request card failed");
-                return Card::Lost;
-            }
-        }
-    }
+    super::send_widget(context, params).await
 }
 
 /// An audio file in a message, as an audio message or as a document.
