@@ -25,7 +25,7 @@ mod settings;
 mod tracks;
 
 pub use apply::start_apply;
-pub use artists::{change_artist, list_artists};
+pub use artists::{change_artist, list_artists, split_albums};
 pub use files::{
     folder_tags, list_folder, save_song, save_songs, search_files, song_artwork, song_audio,
     song_details,

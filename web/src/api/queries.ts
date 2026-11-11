@@ -10,6 +10,7 @@ import type {
   MusicRequest,
   Setup,
   SongDetails,
+  SplitAlbum,
   Track,
   WantedSong,
   Workflow,
@@ -30,6 +31,14 @@ export function useArtistsQuery() {
     queryKey: queryKeys.artists,
     queryFn: () => api<ArtistSummary[]>("/artists"),
     refetchInterval: 30000,
+  });
+}
+
+/** The artist's albums that Navidrome shows twice. Reads every song's tags, so only on demand. */
+export function useSplitAlbumsQuery(artistId: number) {
+  return useQuery({
+    queryKey: [...queryKeys.artists, artistId, "albums"],
+    queryFn: () => api<SplitAlbum[]>(`/artists/${artistId}/albums`),
   });
 }
 

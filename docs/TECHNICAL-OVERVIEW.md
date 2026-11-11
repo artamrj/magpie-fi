@@ -170,7 +170,12 @@ step now. `src/application/apply.rs`:
 
 1. **Prepare**: load every Ready track with its candidate, re-run completion and name
    canonicalisation, re-group duplicates, pick the best available file per group, and compute
-   the destination (`library::destination`, §5 of the blueprint).
+   the destination (`library::destination`, §5 of the blueprint). A song whose album the album
+   artist already has (`names::same_album`: any spelling, any year) first takes that album's
+   details from a song in its folder (`library::align_with_existing_release`,
+   `tag_writer::read_album_tags`), so Navidrome shows one album. lofty 0.24 writes no
+   MusicBrainz album, release-group or track ID into MP3 files, so those exist only in FLAC,
+   M4A and Opus files.
 2. **Per song**:
    - **Already in the library?** (`library::find_same_recording`). If yes and the new file is not
      an upgrade (lossless over lossy), the new file and its inbox duplicates go to the trash.
@@ -560,8 +565,9 @@ All routes are under `/api` (`src/http/router.rs`).
 | `GET /candidates/{id}/artwork/preview` | A candidate's catalog cover, through magpie-fi |
 | `POST /source/resolve` | Read a song link (Shazam, Spotify, YouTube, …) into fields |
 | `GET /library/recent` | The songs filed most recently |
-| `GET /artists` | Every artist with song count, spellings and "looks like two" |
-| `POST /artists/{id}` | Rename, join, split or confirm an artist (retags and moves its songs) |
+| `GET /artists` | Every artist with song count, spellings, "looks like two" and albums spelled two ways |
+| `POST /artists/{id}` | Rename, join, split or confirm an artist, or make one album of a split album (`join_album` with a key from the next route); retags and moves songs |
+| `GET /artists/{id}/albums` | The artist's albums Navidrome shows more than once (`album_changes::split_albums`): each way the album is tagged, the one kept first |
 | `GET /files?path=` | One folder of `library/` ("" is the library): folders with counts, songs |
 | `GET /files/search?q=&in=` | Songs and folders matching every word, optionally inside one folder |
 | `GET /files/song?path=` | Every tag of one song, read from the file, with its `version` |

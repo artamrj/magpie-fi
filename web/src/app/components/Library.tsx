@@ -1,8 +1,8 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { post } from "../../api/client";
-import { queryKeys, useArtistsQuery } from "../../api/queries";
-import type { ArtistChanged, ArtistSummary, Setup } from "../../api/types";
+import { queryKeys, useArtistsQuery, useSplitAlbumsQuery } from "../../api/queries";
+import type { ArtistChanged, ArtistSummary, Setup, SplitAlbum } from "../../api/types";
 import { Icon } from "../Icons";
 import { askConfirm, haptic } from "../telegram";
 import { EmptyState, ListSkeleton } from "./EmptyStates";
@@ -50,7 +50,13 @@ export function Library({
       ]
         .filter(Boolean)
         .join(" · ")}
-      trailing={artist.looks_like_several ? <Tag tone="warn">Split?</Tag> : undefined}
+      trailing={
+        artist.looks_like_several ? (
+          <Tag tone="warn">Split?</Tag>
+        ) : artist.albums_to_check > 0 ? (
+          <Tag tone="warn">Albums?</Tag>
+        ) : undefined
+      }
       chevron
       selected={wide && artist.id === openId}
       onClick={() => {
@@ -313,52 +319,121 @@ function ArtistActions({
     );
 
   return (
-    <Section
-      footer={artist.looks_like_several ? "This name looks like two artists in one." : undefined}
-    >
-      {artist.looks_like_several && (
-        <>
-          <Cell
-            tone="accent"
-            lead={<Icon name="sparkles" />}
-            title={`Split into ${splitParts.join(" and ")}`}
-            subtitle={`Songs move to ${splitParts[0]}’s folder; both get credit`}
-            disabled={busy || splitParts.length < 2}
-            onClick={() => void change({ action: "split", parts: splitParts })}
-          />
-          <Cell
-            tone="link"
-            lead={<Icon name="check" />}
-            title="It’s one artist (a band or duo)"
-            disabled={busy}
-            onClick={() => void change({ action: "one_artist" })}
-          />
-        </>
-      )}
-      <Cell
-        tone="link"
-        lead={<Icon name="edit" />}
-        title="Rename…"
-        chevron
-        onClick={() => setMode("rename")}
-      />
-      <Cell
-        tone="link"
-        lead={<Icon name="user" />}
-        title="Same artist as…"
-        chevron
-        onClick={() => setMode("join")}
-      />
-      {!artist.looks_like_several && (
+    <>
+      <Section
+        footer={artist.looks_like_several ? "This name looks like two artists in one." : undefined}
+      >
+        {artist.looks_like_several && (
+          <>
+            <Cell
+              tone="accent"
+              lead={<Icon name="sparkles" />}
+              title={`Split into ${splitParts.join(" and ")}`}
+              subtitle={`Songs move to ${splitParts[0]}’s folder; both get credit`}
+              disabled={busy || splitParts.length < 2}
+              onClick={() => void change({ action: "split", parts: splitParts })}
+            />
+            <Cell
+              tone="link"
+              lead={<Icon name="check" />}
+              title="It’s one artist (a band or duo)"
+              disabled={busy}
+              onClick={() => void change({ action: "one_artist" })}
+            />
+          </>
+        )}
         <Cell
           tone="link"
-          lead={<Icon name="sparkles" />}
-          title="Split into several artists…"
+          lead={<Icon name="edit" />}
+          title="Rename…"
           chevron
-          onClick={() => setMode("split")}
+          onClick={() => setMode("rename")}
         />
-      )}
-      {busy && <Cell title="Working…" lead={<Spinner />} />}
+        <Cell
+          tone="link"
+          lead={<Icon name="user" />}
+          title="Same artist as…"
+          chevron
+          onClick={() => setMode("join")}
+        />
+        {!artist.looks_like_several && (
+          <Cell
+            tone="link"
+            lead={<Icon name="sparkles" />}
+            title="Split into several artists…"
+            chevron
+            onClick={() => setMode("split")}
+          />
+        )}
+        {busy && <Cell title="Working…" lead={<Spinner />} />}
+      </Section>
+      <AlbumFixes artist={artist} feedback={feedback} />
+    </>
+  );
+}
+
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? "" : "s"}`;
+
+/** How the other versions of a split album differ, in one line. */
+function versionsLine(album: SplitAlbum) {
+  return album.versions
+    .filter((version) => !version.kept)
+    .map((version) => {
+      const songs = plural(version.songs, "song");
+      const kind = version.kind ? `, ${version.kind}` : "";
+      if (version.differs_in.includes("spelling")) return `${songs} as “${version.album}”${kind}`;
+      const other = version.differs_in.filter((what) => what !== version.kind);
+      return `${songs} with another ${other.join(" and ") || "folder"}${kind}`;
+    })
+    .join(" · ");
+}
+
+/** Albums Navidrome shows twice because their songs disagree on the album's details. */
+function AlbumFixes({ artist, feedback }: { artist: ArtistSummary; feedback: Feedback }) {
+  const queryClient = useQueryClient();
+  const albums = useSplitAlbumsQuery(artist.id);
+  const [busyKey, setBusyKey] = useState<string>();
+  if (albums.isPending) return <Cell title="Checking the albums…" lead={<Spinner />} />;
+  if (!albums.data?.length) return null;
+
+  const join = async (album: SplitAlbum) => {
+    const question = `Make “${album.album}” one album? ${plural(album.songs, "song")} get the same album details and the same folder. ${MOVE_WARNING}`;
+    if (!(await askConfirm(question))) return;
+    setBusyKey(album.key);
+    try {
+      const result = await post<ArtistChanged>(`/artists/${artist.id}`, {
+        action: "join_album",
+        key: album.key,
+      });
+      haptic.success();
+      feedback.notify(
+        `“${album.album}” is one album: ${result.retagged} songs retagged, ${result.moved} moved`,
+      );
+      await queryClient.invalidateQueries({ queryKey: queryKeys.artists });
+    } catch (reason) {
+      haptic.error();
+      feedback.fail((reason as Error).message);
+    } finally {
+      setBusyKey(undefined);
+    }
+  };
+
+  return (
+    <Section
+      title="Albums shown twice"
+      footer="Navidrome splits an album when its songs disagree on its name, album artist, release date or edition. Every song takes the details most of the album has and moves into its folder."
+    >
+      {albums.data.map((album) => (
+        <Cell
+          key={album.key}
+          tone="accent"
+          lead={busyKey === album.key ? <Spinner /> : <Icon name="sparkles" />}
+          title={`Make “${album.album}” one album`}
+          subtitle={versionsLine(album)}
+          disabled={busyKey !== undefined}
+          onClick={() => void join(album)}
+        />
+      ))}
     </Section>
   );
 }
