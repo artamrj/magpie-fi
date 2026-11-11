@@ -42,7 +42,8 @@ export function SongScreen({
   feedback: Feedback;
 }) {
   const chosen = selectedCandidate(track);
-  const [pickedId, setPickedId] = useState<number | undefined>(
+  // "file" stands for the last option: none of the matches, the file's own tags.
+  const [pickedId, setPickedId] = useState<number | "file" | undefined>(
     chosen?.id ?? track.candidates[0]?.id,
   );
   const [editing, setEditing] = useState(false);
@@ -59,6 +60,9 @@ export function SongScreen({
   const duplicate = isPossibleDuplicate(track);
   const coverNeeded = review && needsCover(track);
   const picked = track.candidates.find((item) => item.id === pickedId);
+  const keepingFile = pickedId === "file";
+  // Only a file that names its own title and artist has tags worth keeping.
+  const canKeepFile = Boolean(track.current_title?.trim() && track.current_artist?.trim());
   const shown = chosen ?? picked;
 
   const act = async (kind: NonNullable<typeof busy>, action: () => Promise<void>) => {
@@ -97,6 +101,24 @@ export function SongScreen({
         feedback.notify(
           "Match accepted, but some details are missing. Edit the tags to fill them.",
         );
+      }
+    });
+
+  const keepFileTags = () =>
+    act("choose", async () => {
+      const result = await post<{ ready: boolean; cover_verified: boolean }>(
+        `/tracks/${track.id}/keep-tags`,
+      );
+      await feedback.refresh();
+      haptic.success();
+      if (result.ready) {
+        feedback.notify("The file's own tags are kept", returnToReview);
+        onNext();
+      } else if (!result.cover_verified) {
+        feedback.notify("The file's own tags are kept. It still needs a cover.");
+        onCover();
+      } else {
+        feedback.notify("The file's own tags are kept, but some details are missing. Edit them.");
       }
     });
 
@@ -176,6 +198,15 @@ export function SongScreen({
         },
       };
     if (coverNeeded) return { primary: { text: "Pick a cover", onClick: onCover } };
+    if (review && track.candidates.length > 0 && keepingFile)
+      return {
+        primary: {
+          text: "Keep the file's tags",
+          onClick: () => void keepFileTags(),
+          busy: busy === "choose",
+        },
+        secondary: { text: "Skip", onClick: onNext },
+      };
     if (review && track.candidates.length > 0)
       return {
         primary: {
@@ -267,6 +298,16 @@ export function SongScreen({
                     }}
                   />
                 ))}
+                {canKeepFile && !chosen && (
+                  <FileOption
+                    track={track}
+                    picked={keepingFile}
+                    onPick={() => {
+                      haptic.tap();
+                      setPickedId("file");
+                    }}
+                  />
+                )}
               </Section>
             )}
 
@@ -578,6 +619,39 @@ function ReleaseOption({
           </div>
         </div>
       </details>
+    </div>
+  );
+}
+
+/** The last choice in the list: none of the matches is right, the file's own tags are. */
+function FileOption({
+  track,
+  picked,
+  onPick,
+}: {
+  track: Track;
+  picked: boolean;
+  onPick: () => void;
+}) {
+  const meta = [track.current_artist, track.current_album].filter(Boolean).join(" · ");
+  return (
+    <div className="cell has-lead option" role="radio" aria-checked={picked}>
+      <button
+        type="button"
+        className="cell-lead"
+        onClick={onPick}
+        aria-label="Keep the file's own tags"
+      >
+        <span className={`radio ${picked ? "on" : ""}`} />
+        <OriginalCover track={track} size="medium" />
+      </button>
+      <button type="button" className="cell-main" onClick={onPick}>
+        <b dir="auto">{track.current_title}</b>
+        {meta && <small dir="auto">{meta}</small>}
+        <span className="chips">
+          <span>None of these: keep the file's own tags</span>
+        </span>
+      </button>
     </div>
   );
 }

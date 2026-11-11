@@ -148,6 +148,10 @@ In Review you can:
   Review; doubtful songs stay.
 - **Edit by hand** (`PUT /api/tracks/{id}/manual`): a `manual` candidate (score 100). Pasting a
   Shazam/Spotify/YouTube/… song link fills the fields (`POST /api/source/resolve`).
+- **Keep the file's own tags** (`POST /api/tracks/{id}/keep-tags`): for when no match is right
+  and the file is. The last choice in the release list, shown when the file has a title and an
+  artist. Its tags are saved like an edit by hand (a `manual` candidate), so the song still needs
+  a verified cover; the picture already inside the file does not count as one.
 - **Change the cover** (`PUT /api/tracks/{id}/artwork`): a cover URL or a song link; the image is
   verified and remembered in `artwork_overrides`. **Search again**:
   `POST /api/tracks/{id}/artwork/search`.
@@ -559,6 +563,7 @@ All routes are under `/api` (`src/http/router.rs`).
 | `POST /tracks/{id}/choose` | Accept a candidate |
 | `POST /tracks/{id}/review` | Undo the choice |
 | `PUT /tracks/{id}/manual` | Save details typed by hand |
+| `POST /tracks/{id}/keep-tags` | Keep the file's own tags instead of a match |
 | `PUT /tracks/{id}/artwork` | Set and verify a cover URL or song link |
 | `POST /tracks/{id}/artwork/search` | Search covers again |
 | `GET /tracks/{id}/artwork/preview` | The cover that will be embedded |

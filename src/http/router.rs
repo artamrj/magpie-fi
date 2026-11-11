@@ -44,6 +44,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tracks/{id}/choose", post(handlers::select_candidate))
         .route("/tracks/{id}/review", post(handlers::return_to_review))
         .route("/tracks/{id}/file-anyway", post(handlers::file_anyway))
+        .route("/tracks/{id}/keep-tags", post(handlers::keep_file_tags))
         .route(
             "/tracks/{id}/manual",
             axum::routing::put(handlers::manual_candidate),

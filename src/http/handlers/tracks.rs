@@ -558,6 +558,65 @@ pub async fn manual_candidate(
     Path(id): Path<TrackId>,
     Json(value): Json<CandidateEdit>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    save_own_tags(&s, id, value, "Entered manually").await
+}
+
+/// `POST /api/tracks/{id}/keep-tags`: none of the matches is right and the
+/// file's own tags are. They become the chosen details, as if typed by hand,
+/// so the song still needs a verified cover before it is filed.
+pub async fn keep_file_tags(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<TrackId>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let track = track_db::track(&s.pool, id).await?;
+    let (Some(title), Some(artist)) = (
+        track.current_title.clone().filter(|v| !v.trim().is_empty()),
+        track
+            .current_artist
+            .clone()
+            .filter(|v| !v.trim().is_empty()),
+    ) else {
+        return Err(ApiError::validation(
+            "The file has no title or artist of its own; edit the tags instead",
+        ));
+    };
+    // Title, artist and album are the ones the page shows. The rest is read
+    // from the file so a year or genre it already has is not lost.
+    let path = std::path::PathBuf::from(&track.path);
+    let rest = tokio::task::spawn_blocking(move || tag_writer::read_details(&path))
+        .await
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let edit = CandidateEdit {
+        title,
+        artist,
+        artist_credits: Vec::new(),
+        album: track.current_album.clone(),
+        album_artist: track.current_album_artist.clone(),
+        album_artist_credits: Vec::new(),
+        track_number: track.current_track_number,
+        track_total: rest.track_total.map(i64::from),
+        disc_number: rest.disc.map(i64::from),
+        disc_total: rest.disc_total.map(i64::from),
+        year: rest.year,
+        genre: rest.genre,
+        composer: rest.composer,
+        label: rest.label,
+        isrc: rest.isrc,
+        release_date: rest.release_date,
+        cover_url: None,
+    };
+    save_own_tags(&s, id, edit, "Kept the file's own tags").await
+}
+
+/// Saves details that come from you and not from a catalog as the chosen
+/// `manual` candidate. `prefix` starts the status line shown on the song.
+async fn save_own_tags(
+    s: &Arc<AppState>,
+    id: TrackId,
+    value: CandidateEdit,
+    prefix: &str,
+) -> ApiResult<Json<serde_json::Value>> {
     if value.title.trim().is_empty() || value.artist.trim().is_empty() {
         return Err(ApiError::validation("Title and artist are required"));
     }
@@ -615,7 +674,7 @@ pub async fn manual_candidate(
             ..Default::default()
         }];
     }
-    let completion = finalize_selection(&s, &mut candidate, None, None).await?;
+    let completion = finalize_selection(s, &mut candidate, None, None).await?;
     let candidate_id = candidate_db::insert(&s.pool, id.0, &candidate).await?;
     if completion.core_complete
         && let Some(cover_url) = candidate.cover_url.as_deref()
@@ -629,7 +688,7 @@ pub async fn manual_candidate(
         )
         .await?;
     }
-    let (status, stage, message) = readiness_state(&candidate, &completion, "Entered manually");
+    let (status, stage, message) = readiness_state(&candidate, &completion, prefix);
     sqlx::query(
         "UPDATE tracks SET selected_candidate_id=?,status=?,stage=?,stage_message=? WHERE id=?",
     )
@@ -1215,6 +1274,67 @@ mod tests {
         assert_eq!(row.0, "review");
         assert_eq!(row.1, "needs_review");
         assert_ne!(row.2, "verified");
+    }
+
+    #[tokio::test]
+    async fn keeping_the_files_own_tags_selects_them_and_still_needs_a_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("keep-tags.sqlite");
+        let pool = db::connect(database.to_str().unwrap()).await.unwrap();
+        let mut offline = AppState::new(Config::default(), pool.clone());
+        // The cover search must fail here, and fail without the internet.
+        offline.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let state = Arc::new(offline);
+        let track_id = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage,current_title,current_artist) VALUES('/music/own.mp3','own.mp3','needs_review',0,'now','now','now','review','Mano Bebakhsh (Nostalogy)','Marjan Kandi')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        // A wrong match that must not be the one chosen.
+        sqlx::query(
+            "INSERT INTO candidates(track_id,provider,title,artist,album,duration_delta,score,score_breakdown)
+             VALUES(?,'deezer','Other song','Other singer','Other album',1.0,60.0,'{}')",
+        )
+        .bind(track_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(response) = keep_file_tags(State(state.clone()), Path(TrackId(track_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(response["selected"], true);
+        // The cover gate holds: the file's tags alone do not make it Ready.
+        assert_eq!(response["ready"], false);
+        let row: (String, String, String, String, String) = sqlx::query_as(
+            "SELECT tracks.stage,candidates.provider,candidates.title,candidates.artist,tracks.stage_message
+             FROM tracks JOIN candidates ON candidates.id=tracks.selected_candidate_id WHERE tracks.id=?",
+        )
+        .bind(track_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "review");
+        assert_eq!(row.1, "manual");
+        assert_eq!(row.2, "Mano Bebakhsh (Nostalogy)");
+        assert_eq!(row.3, "Marjan Kandi");
+        assert!(row.4.starts_with("Kept the file's own tags"));
+
+        // A file without a title of its own has nothing to keep.
+        let untitled = sqlx::query("INSERT INTO tracks(path,filename,status,is_missing,first_seen_at,last_seen_at,last_scanned_at,stage,current_artist) VALUES('/music/untitled.mp3','untitled.mp3','needs_review',0,'now','now','now','review','Marjan Kandi')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        assert!(
+            keep_file_tags(State(state), Path(TrackId(untitled)))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
