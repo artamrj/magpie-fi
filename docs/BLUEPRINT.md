@@ -186,12 +186,18 @@ Only one workflow (inbox cycle, "File now", auto-approve, "Check & fix") runs at
   1360 px (a 15–16" laptop or a desktop screen) the song also puts the release list and "what
   changes in your file" next to each other, so both are in view without scrolling.
 - With `MAGPIE_PUBLIC_URL` (HTTPS) the same page opens **inside Telegram** as a Mini App, from the
-  bot's menu button or "📱 Open review" (`?view=review`).
+  bot's menu button, "📱 Open magpie-fi" on `/start`, or "🎵 Open in the app" on a status message
+  (`?view=review` when a song waits there). Only owners get these buttons; guests can't open the page.
 - The bot: one status message per request, edited as songs arrive, with Stop / Retry failed /
-  Details buttons; "Not sure which song this is" questions with one button that opens the Mini
-  App on that song (up to three candidate buttons in chat only when there is no HTTPS address);
-  `/start`,
-  `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`.
+  Details buttons (red Stop, blue Retry; while a playlist is busy, Retry and Details stay greyed
+  out so the row doesn't jump). Details is an ephemeral answer, seen only by whoever pressed it.
+  "Not sure which song this is" questions have one button that opens the Mini App on that song for
+  owners; guests, and chats without an HTTPS address, get up to three candidate buttons (green)
+  and "None of these" (red) in the chat.
+- Commands: `/start`, `/help`, `/queue`, `/health`, `/id`, `/guests`, `/web`. `/start`, `/help`
+  and `/guests` are rich messages (headings, tables, an expandable "How it works"); `/queue`,
+  `/health` and `/id` answer ephemerally when Telegram sends them as ephemeral commands. If
+  Telegram refuses a rich or ephemeral message, the bot sends the plain text to the chat instead.
 
 ### 3.5 The image and deployment
 

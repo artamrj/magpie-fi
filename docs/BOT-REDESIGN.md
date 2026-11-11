@@ -1,6 +1,6 @@
 # magpie-fi — Telegram bot redesign (Bot API 10.4)
 
-> Status: **agreed, being built step by step** (Nov 2026). Step A is built. Written against
+> Status: **agreed, being built step by step** (Nov 2026). Steps A and B are built. Written against
 > Bot API 10.4 (9 Nov 2026).
 > Once a phase is built, [BLUEPRINT.md](BLUEPRINT.md) and
 > [TECHNICAL-OVERVIEW.md](TECHNICAL-OVERVIEW.md) are updated in the same commit.
@@ -206,7 +206,7 @@ Each step ships on its own and keeps the bot working.
 | Step | What | Visible change |
 |---|---|---|
 | **A. Base** ✅ built | Own types, `actions.rs`, split `mod.rs` into `intake.rs` and `commands.rs`, all text into `texts.rs`, tests for uploads, buttons and review questions | None |
-| **B. Messages** | Rich `/start` `/help` `/guests`, coloured and disabled buttons, ephemeral Details and answers, `is_ephemeral` commands, `web_app` button on status messages | Clearer, tidier chat |
+| **B. Messages** ✅ built | Rich `/start` `/help` `/guests` and Details, coloured and disabled buttons, ephemeral Details and `/queue` `/health` `/id`, `web_app` button on owners' status messages, plain-text fallbacks. Guests no longer get a web-page button on review questions (they can't open the page) | Clearer, tidier chat |
 | **C. Request card** | `request.html`, `cards.rs`, the loop edits widget state, text fallback, 🎉 at the end | The big one |
 | **D. Review card** | `review.html`, candidate cards with score bars, taps file the song | Choosing in the chat |
 | **E. Library card** | Shared widget, `/library`, pinned | Live library at a glance |

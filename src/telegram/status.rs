@@ -35,7 +35,13 @@ async fn refresh(context: &Context) -> Result<()> {
             continue;
         }
         let message = i32::try_from(open.status_message_id).unwrap_or_default();
-        let params = edit_params(open.chat_id, message, &text, keyboard(summary, finished));
+        let app = app_url(context, open.chat_id, summary.review > 0);
+        let params = edit_params(
+            open.chat_id,
+            message,
+            &text,
+            keyboard(summary, finished, app),
+        );
         match context
             .bot
             .call::<_, Value>("editMessageText", &params)
@@ -68,24 +74,52 @@ async fn refresh(context: &Context) -> Result<()> {
     Ok(())
 }
 
+/// The Mini App for this chat: only owners may open the web page, and only
+/// over HTTPS. It opens on Review when a song there waits for them.
+fn app_url(context: &Context, chat: i64, review: bool) -> Option<String> {
+    if !context.config.owners.contains(&chat) {
+        return None;
+    }
+    let view = if review { "review" } else { "" };
+    super::mini_app_url(&context.state.config.public_url, view)
+}
+
 /// Stop while songs are waiting; Retry and Details when something failed.
-fn keyboard(summary: &store::RequestSummary, finished: bool) -> Option<Value> {
+/// While a playlist is busy the row keeps its shape: Retry and Details stay
+/// greyed out until they can do something, so buttons don't jump around.
+fn keyboard(summary: &store::RequestSummary, finished: bool, app: Option<String>) -> Option<Value> {
+    let problems = summary.failed > 0 || summary.review > 0;
     let mut row = Vec::new();
     if !finished && summary.working > 0 && summary.total > 1 {
         row.push(Action::Stop(summary.id).button(texts::STOP));
+        row.push(Action::disabled_button(texts::RETRY_FAILED));
+        row.push(if problems {
+            Action::Details(summary.id).button(texts::DETAILS)
+        } else {
+            Action::disabled_button(texts::DETAILS)
+        });
+    } else {
+        if finished && summary.failed > 0 {
+            row.push(Action::Retry(summary.id).button(texts::RETRY_FAILED));
+        }
+        if problems {
+            row.push(Action::Details(summary.id).button(texts::DETAILS));
+        }
     }
-    if finished && summary.failed > 0 {
-        row.push(Action::Retry(summary.id).button(texts::RETRY_FAILED));
+    let mut rows = Vec::new();
+    if !row.is_empty() {
+        rows.push(row);
     }
-    if summary.failed > 0 || summary.review > 0 {
-        row.push(Action::Details(summary.id).button(texts::DETAILS));
+    if let Some(url) = app {
+        rows.push(vec![super::mini_app_button(texts::OPEN_IN_APP, &url)]);
     }
-    Some(json!({"inline_keyboard": if row.is_empty() { vec![] } else { vec![row] }}))
+    Some(json!({ "inline_keyboard": rows }))
 }
 
 /// "Which song is this?" for songs sent from Telegram that wait in review.
-/// With a Mini App the question has one button that opens the app on that song;
-/// without one (no HTTPS address) up to three candidates are offered in chat.
+/// Owners with a Mini App get one button that opens the app on that song;
+/// guests (who can't open the web page) and chats without an HTTPS address get
+/// up to three candidates in the chat.
 async fn ask_reviews(context: &Context) -> Result<()> {
     for question in store::unasked_reviews(&context.state.pool).await? {
         let song = match &question.artist {
@@ -93,7 +127,9 @@ async fn ask_reviews(context: &Context) -> Result<()> {
             None => question.title.clone(),
         };
         let (answer, rows) =
-            match super::mini_app_track_url(&context.state.config.public_url, question.track_id) {
+            match super::mini_app_track_url(&context.state.config.public_url, question.track_id)
+                .filter(|_| context.config.owners.contains(&question.chat_id))
+            {
                 Some(url) => (
                     texts::ReviewAnswer::InApp,
                     vec![vec![super::mini_app_button(texts::CHOOSE_IN_APP, &url)]],
@@ -194,12 +230,26 @@ mod tests {
             working: 2,
             ..store::RequestSummary::default()
         };
-        let busy = keyboard(&summary, false).unwrap().to_string();
-        assert!(busy.contains("stop:7") && !busy.contains("retry"));
+        // Busy: Stop works, Retry and Details are greyed out.
+        let busy = keyboard(&summary, false, None).unwrap();
+        let row = &busy["inline_keyboard"][0];
+        assert_eq!(row[0]["callback_data"], "stop:7");
+        assert_eq!(row[0]["style"], "danger");
+        assert!(row[1]["disabled"].is_object() && row[2]["disabled"].is_object());
+        // Done with a failure: Retry and Details work, Stop is gone.
         summary.working = 0;
         summary.failed = 1;
-        let done = keyboard(&summary, true).unwrap().to_string();
+        let done = keyboard(&summary, true, None).unwrap().to_string();
         assert!(done.contains("retry:7") && done.contains("details:7") && !done.contains("stop"));
+        assert!(!done.contains("disabled"));
+        // All fine, with the app: only the app button.
+        summary.failed = 0;
+        let app = keyboard(&summary, true, Some("https://m.example/".into())).unwrap();
+        assert_eq!(app["inline_keyboard"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            app["inline_keyboard"][0][0]["web_app"]["url"],
+            "https://m.example/"
+        );
     }
 
     #[test]

@@ -158,8 +158,9 @@ In Review you can:
   first go through `media::repair`, which re-encodes the decodable audio and keeps the damaged
   original as a `.magpie-fi-damaged` backup.
 
-The Telegram bot asks about Telegram songs in Review with up to three candidates and calls the
-same choose/remove logic.
+The Telegram bot asks about Telegram songs in Review: owners get a button that opens the Mini
+App on that song; guests and chats without HTTPS get up to three candidates in the chat, which
+call the same choose/remove logic.
 
 ### Phase 4 — File into the library
 
@@ -209,12 +210,12 @@ rewrites the request's playlist (`library/Playlists/<name>.m3u8`, relative paths
 |---|---|---|
 | Client | `api.rs` | Bot API calls to `api.telegram.org` with magpie-fi's HTTP client. Waits on "retry after", ignores "message is not modified", drops the URL (it holds the token) from every error. Bots can download files up to 20 MB; bigger files get a clear answer. |
 | Types | `types.rs` | The Bot API types the bot reads, written by hand (Bot API 10.4). Only the fields in use; unknown fields are ignored, so a new API version never breaks reading updates. |
-| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners, guests and strangers, sends a message to the right handler, Mini App links, small send/edit/answer/react helpers. |
+| Bot | `mod.rs` | Long polling (offset in `telegram_state`), owners, guests and strangers, sends a message to the right handler, Mini App links. `say` sends a message to the chat, or ephemerally to whoever pressed a button or sent an ephemeral command; as a rich message (`sendRichMessage` with its `html` form) when there is one. When Telegram clearly refuses an ephemeral or rich message, it sends the plain text to the chat instead; after a network error it doesn't, so nothing arrives twice. |
 | Intake | `intake.rs` | Links → `requests`; audio files → `wanted` rows downloaded into staging. Files sent within 3 s join one upload request (a forwarded album). |
 | Commands | `commands.rs` | `/start`, `/help`, `/queue`, `/health`, `/web`, `/guests`, `/id`, random one-time invite tokens. |
-| Buttons | `actions.rs` | One `Action` type for every button: its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), who may press it (owners anything, guests only their own requests and songs), and what it does. |
+| Buttons | `actions.rs` | One `Action` type for every button: its `callback_data` (`stop:12`, `pick:3:9`, at most 64 bytes), its colour (`style`: green Pick/Invite, red Stop/None of these/Remove, blue Retry), who may press it (owners anything, guests only their own requests and songs), and what it does. Greyed-out buttons use `disabled`. |
 | Status | `status.rs` | Every 3 s: reads all open requests with their progress in one query, edits a status message only when its text changed, closes it when nothing is left, and asks about songs waiting in Review. |
-| Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. |
+| Texts | `texts.rs` | Everything the bot says and every button label, and the progress bar. Rich messages carry their plain text too, for the fallback. The command list (`COMMANDS`) marks `/queue`, `/health` and `/id` as `is_ephemeral`. |
 
 ## 7. Web page login (`src/http/auth.rs`)
 

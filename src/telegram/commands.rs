@@ -2,8 +2,8 @@
 //! invites.
 
 use super::{
-    Context, Role, actions::Action, mini_app_button, mini_app_url, role, send, send_with,
-    set_menu_button, texts, types::User,
+    Context, Role, To, actions::Action, mini_app_button, mini_app_url, role, say, set_menu_button,
+    texts, texts::Rich, types::User,
 };
 use crate::acquire::store;
 use anyhow::Result;
@@ -14,30 +14,41 @@ use std::sync::Arc;
 pub fn menu() -> Value {
     let commands: Vec<Value> = texts::COMMANDS
         .iter()
-        .map(|(command, description)| json!({"command": command, "description": description}))
+        .map(|command| {
+            let mut entry = json!({"command": command.name, "description": command.menu});
+            if command.ephemeral {
+                entry["is_ephemeral"] = json!(true);
+            }
+            entry
+        })
         .collect();
     json!({ "commands": commands })
 }
 
+/// A command. `reply` is where short answers go: ephemeral when the command
+/// was. Answers with Mini App buttons always go to the chat, because
+/// ephemeral messages can't carry them.
 pub async fn on_command(
     context: &Arc<Context>,
-    chat: i64,
+    reply: &To,
     user: &User,
     name: &str,
     argument: &str,
 ) -> Result<()> {
+    // The bot only answers in private chats, where the chat ID is the user's.
+    let chat = To::chat(user.id);
     if name == "id" {
-        send(context, chat, &texts::your_id(user.id), None).await;
+        say(context, reply, &Rich::plain(texts::your_id(user.id)), None).await;
         return Ok(());
     }
     if name == "start"
         && let Some(token) = argument.strip_prefix("invite_")
     {
-        return redeem_invite(context, chat, user, token).await;
+        return redeem_invite(context, &chat, user, token).await;
     }
     let role = role(context, user.id).await;
     if role == Role::Stranger {
-        send(context, chat, &texts::welcome(false, user.id), None).await;
+        say(context, reply, &Rich::plain(texts::stranger(user.id)), None).await;
         return Ok(());
     }
     let public_url = &context.state.config.public_url;
@@ -50,21 +61,14 @@ pub async fn on_command(
                     |url| json!({"inline_keyboard": [[mini_app_button(texts::OPEN_APP, &url)]]}),
                 );
             }
-            send_with(
-                context,
-                chat,
-                &texts::welcome(true, user.id),
-                None,
-                keyboard,
-            )
-            .await
+            say(context, &chat, &texts::start(), keyboard).await
         }
-        "help" => send(context, chat, &texts::help(role == Role::Owner), None).await,
+        "help" => say(context, reply, &texts::help(role == Role::Owner), None).await,
         "queue" => {
             let requests = store::list_requests(&context.state.pool, 30).await?;
-            send(context, chat, &texts::queue(&requests), None).await
+            say(context, reply, &Rich::plain(texts::queue(&requests)), None).await
         }
-        "health" => send(context, chat, &health(context).await, None).await,
+        "health" => say(context, reply, &Rich::plain(health(context).await), None).await,
         "web" if role == Role::Owner => {
             let base = public_url
                 .clone()
@@ -81,13 +85,13 @@ pub async fn on_command(
             }
             let keyboard = (!rows.is_empty()).then(|| json!({ "inline_keyboard": rows }));
             let text = texts::login_link(&link, public_url.is_some());
-            send_with(context, chat, &text, None, keyboard).await
+            say(context, &chat, &Rich::plain(text), keyboard).await
         }
         "guests" if role == Role::Owner => {
             let (text, keyboard) = guests_view(context).await?;
-            send_with(context, chat, &text, None, Some(keyboard)).await
+            say(context, &chat, &text, Some(keyboard)).await
         }
-        _ => send(context, chat, texts::UNKNOWN_COMMAND, None).await,
+        _ => say(context, reply, &Rich::plain(texts::UNKNOWN_COMMAND), None).await,
     };
     Ok(())
 }
@@ -111,7 +115,7 @@ async fn health(context: &Context) -> String {
 
 // ── Guests ──────────────────────────────────────────────────────────────────
 
-pub async fn guests_view(context: &Context) -> Result<(String, Value)> {
+pub async fn guests_view(context: &Context) -> Result<(Rich, Value)> {
     let guests: Vec<(i64, Option<String>)> =
         sqlx::query_as("SELECT user_id,name FROM telegram_guests ORDER BY created_at")
             .fetch_all(&context.state.pool)
@@ -127,14 +131,14 @@ pub async fn guests_view(context: &Context) -> Result<(String, Value)> {
     Ok((texts::guests(&guests), json!({"inline_keyboard": rows})))
 }
 
-async fn redeem_invite(context: &Context, chat: i64, user: &User, token: &str) -> Result<()> {
+async fn redeem_invite(context: &Context, chat: &To, user: &User, token: &str) -> Result<()> {
     let created_by: Option<i64> =
         sqlx::query_scalar("DELETE FROM telegram_invites WHERE token=? RETURNING created_by")
             .bind(token)
             .fetch_optional(&context.state.pool)
             .await?;
     let Some(created_by) = created_by else {
-        send(context, chat, texts::INVITE_USED, None).await;
+        say(context, chat, &Rich::plain(texts::INVITE_USED), None).await;
         return Ok(());
     };
     let name = user.display_name();
@@ -148,7 +152,7 @@ async fn redeem_invite(context: &Context, chat: i64, user: &User, token: &str) -
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(&context.state.pool)
     .await?;
-    send(context, chat, &texts::welcome_guest(&name), None).await;
+    say(context, chat, &texts::welcome_guest(&name), None).await;
     Ok(())
 }
 

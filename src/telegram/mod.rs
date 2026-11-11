@@ -181,11 +181,20 @@ async fn on_message(context: &Arc<Context>, message: &Message) -> anyhow::Result
             .split_once(char::is_whitespace)
             .map_or((command, ""), |(name, rest)| (name, rest.trim()));
         let name = name.split('@').next().unwrap_or(name);
-        return commands::on_command(context, chat, user, name, argument).await;
+        // An ephemeral command (Bot API 10.2) gets an ephemeral answer.
+        let reply = match message.ephemeral_message_id {
+            Some(message) => To::Sender {
+                chat,
+                user: user.id,
+                message,
+            },
+            None => To::chat(chat),
+        };
+        return commands::on_command(context, &reply, user, name, argument).await;
     }
 
     if role(context, user.id).await == Role::Stranger {
-        send(context, chat, &texts::welcome(false, user.id), None).await;
+        send(context, chat, &texts::stranger(user.id), None).await;
         return Ok(());
     }
     if let Some(file) = intake::audio_file(message) {
@@ -241,6 +250,140 @@ pub fn mini_app_url(public_url: &Option<String>, view: &str) -> Option<String> {
 
 // ── Small helpers ───────────────────────────────────────────────────────────
 
+/// Who sees a message.
+#[derive(Clone, Debug)]
+pub enum To {
+    /// Everyone in the chat, optionally as a reply.
+    Chat { chat: i64, reply_to: Option<i32> },
+    /// Only the person who pressed a button (an ephemeral reply). If Telegram
+    /// refuses, it becomes a reply to the button's message.
+    Presser {
+        chat: i64,
+        query: String,
+        message: i32,
+    },
+    /// Only the person who sent an ephemeral command (`is_ephemeral`).
+    Sender { chat: i64, user: i64, message: i32 },
+}
+
+impl To {
+    pub fn chat(chat: i64) -> Self {
+        Self::Chat {
+            chat,
+            reply_to: None,
+        }
+    }
+
+    /// The same message for the whole chat.
+    fn visible(&self) -> Self {
+        match self {
+            Self::Chat { .. } => self.clone(),
+            Self::Presser { chat, message, .. } => Self::Chat {
+                chat: *chat,
+                reply_to: Some(*message),
+            },
+            Self::Sender { chat, .. } => Self::chat(*chat),
+        }
+    }
+
+    fn params(&self) -> Value {
+        match self {
+            Self::Chat { chat, reply_to } => {
+                let mut params = json!({ "chat_id": chat });
+                if let Some(reply_to) = reply_to {
+                    params["reply_parameters"] =
+                        json!({"message_id": reply_to, "allow_sending_without_reply": true});
+                }
+                params
+            }
+            Self::Presser { chat, query, .. } => json!({
+                "chat_id": chat,
+                "ephemeral_message_parameters": {"callback_query_id": query},
+            }),
+            Self::Sender {
+                chat,
+                user,
+                message,
+            } => json!({
+                "chat_id": chat,
+                "ephemeral_message_parameters": {"receiver_user_id": user},
+                "reply_parameters": {"ephemeral_message_id": message},
+            }),
+        }
+    }
+}
+
+/// Sends a message. Nothing is lost when Telegram refuses a newer kind of
+/// message: an ephemeral one goes to the whole chat instead, and a rich one is
+/// sent as plain text. Only a clear refusal falls back; a network error does
+/// not, because the first message may have arrived after all.
+pub async fn say(
+    context: &Context,
+    to: &To,
+    text: &texts::Rich,
+    keyboard: Option<Value>,
+) -> Option<Message> {
+    if !matches!(to, To::Chat { .. }) {
+        match deliver(context, to, text, keyboard.clone()).await {
+            Delivery::Sent(message) => return Some(*message),
+            Delivery::Lost => return None,
+            Delivery::Refused => {}
+        }
+    }
+    match deliver(context, &to.visible(), text, keyboard).await {
+        Delivery::Sent(message) => Some(*message),
+        Delivery::Lost | Delivery::Refused => None,
+    }
+}
+
+enum Delivery {
+    Sent(Box<Message>),
+    /// Telegram said no.
+    Refused,
+    /// Unknown: it may have arrived.
+    Lost,
+}
+
+async fn deliver(
+    context: &Context,
+    to: &To,
+    text: &texts::Rich,
+    keyboard: Option<Value>,
+) -> Delivery {
+    let mut params = to.params();
+    if let Some(keyboard) = keyboard {
+        params["reply_markup"] = keyboard;
+    }
+    if let Some(html) = &text.html {
+        let mut rich = params.clone();
+        rich["rich_message"] = json!({ "html": html });
+        match context.bot.call("sendRichMessage", &rich).await {
+            Ok(message) => return Delivery::Sent(Box::new(message)),
+            Err(error) if api::is_refusal(&error) => {
+                tracing::info!(%error, "Telegram refused a rich message; sending plain text");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "sending a Telegram message failed");
+                return Delivery::Lost;
+            }
+        }
+    }
+    params["text"] = json!(text.plain);
+    params["parse_mode"] = json!("HTML");
+    params["link_preview_options"] = json!({"is_disabled": true});
+    match context.bot.call("sendMessage", &params).await {
+        Ok(message) => Delivery::Sent(Box::new(message)),
+        Err(error) => {
+            tracing::warn!(%error, "sending a Telegram message failed");
+            if api::is_refusal(&error) {
+                Delivery::Refused
+            } else {
+                Delivery::Lost
+            }
+        }
+    }
+}
+
 pub async fn send(
     context: &Context,
     chat: i64,
@@ -257,20 +400,8 @@ pub async fn send_with(
     reply_to: Option<i32>,
     keyboard: Option<Value>,
 ) -> Option<Message> {
-    let mut params = json!({
-        "chat_id": chat,
-        "text": text,
-        "parse_mode": "HTML",
-        "link_preview_options": {"is_disabled": true},
-    });
-    if let Some(reply_to) = reply_to {
-        params["reply_parameters"] =
-            json!({"message_id": reply_to, "allow_sending_without_reply": true});
-    }
-    if let Some(keyboard) = keyboard {
-        params["reply_markup"] = keyboard;
-    }
-    context.bot.try_call("sendMessage", &params).await
+    let to = To::Chat { chat, reply_to };
+    say(context, &to, &texts::Rich::plain(text), keyboard).await
 }
 
 pub async fn edit(context: &Context, chat: i64, message: i32, text: &str, keyboard: Option<Value>) {
@@ -281,6 +412,39 @@ pub async fn edit(context: &Context, chat: i64, message: i32, text: &str, keyboa
             &edit_params(chat, message, text, keyboard),
         )
         .await;
+}
+
+/// Edits a message into a rich message, or into plain text if Telegram refuses.
+pub async fn edit_rich(
+    context: &Context,
+    chat: i64,
+    message: i32,
+    text: &texts::Rich,
+    keyboard: Option<Value>,
+) {
+    if let Some(html) = &text.html {
+        let mut params =
+            json!({"chat_id": chat, "message_id": message, "rich_message": {"html": html}});
+        if let Some(keyboard) = &keyboard {
+            params["reply_markup"] = keyboard.clone();
+        }
+        match context
+            .bot
+            .call::<_, Value>("editMessageText", &params)
+            .await
+        {
+            Ok(_) => return,
+            Err(error) if api::is_not_modified(&error) => return,
+            Err(error) if api::is_refusal(&error) => {
+                tracing::info!(%error, "Telegram refused a rich edit; using plain text");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "editing a Telegram message failed");
+                return;
+            }
+        }
+    }
+    edit(context, chat, message, &text.plain, keyboard).await;
 }
 
 /// `editMessageText` parameters for an HTML message without link previews.
@@ -355,6 +519,10 @@ mod tests {
         updates: StdMutex<Vec<Value>>,
         calls: StdMutex<Vec<(String, Value)>>,
         next_message: StdMutex<i32>,
+        /// Refuse rich messages, as a Telegram that doesn't know them would.
+        refuse_rich: std::sync::atomic::AtomicBool,
+        /// Refuse ephemeral messages (they can be refused or lost).
+        refuse_ephemeral: std::sync::atomic::AtomicBool,
     }
 
     impl FakeTelegram {
@@ -381,6 +549,17 @@ mod tests {
             .lock()
             .unwrap()
             .push((method.clone(), params.clone()));
+        let refused = (method == "sendRichMessage"
+            && fake.refuse_rich.load(std::sync::atomic::Ordering::SeqCst))
+            || (params.get("ephemeral_message_parameters").is_some()
+                && fake
+                    .refuse_ephemeral
+                    .load(std::sync::atomic::Ordering::SeqCst));
+        if refused {
+            return Json(
+                json!({"ok": false, "error_code": 400, "description": "Bad Request: not here"}),
+            );
+        }
         let result = match method.as_str() {
             "getMe" => {
                 json!({"id": 1, "is_bot": true, "first_name": "magpie-fi", "username": "magpie_fi_test_bot"})
@@ -395,7 +574,7 @@ mod tests {
             "getFile" => {
                 json!({"file_id": params["file_id"], "file_unique_id": "u", "file_path": "music/a.mp3"})
             }
-            "sendMessage" | "editMessageText" => {
+            "sendMessage" | "sendRichMessage" | "editMessageText" => {
                 let mut next = fake.next_message.lock().unwrap();
                 *next += 1;
                 json!({"message_id": 1000 + *next, "date": 0, "chat": {"id": params["chat_id"], "type": "private"}, "text": params["text"]})
@@ -490,7 +669,7 @@ mod tests {
         );
 
         fake.push(message(1, OWNER, "/start"));
-        let welcome = wait_for(&fake, "sendMessage", "Open magpie-fi").await;
+        let welcome = wait_for(&fake, "sendRichMessage", "Open magpie-fi").await;
         assert_eq!(
             welcome["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"],
             "https://music.example/"
@@ -525,7 +704,7 @@ mod tests {
     async fn without_https_there_is_no_mini_app_button() {
         let (_directory, fake, _state) = start().await;
         fake.push(message(1, OWNER, "/start"));
-        let welcome = wait_for(&fake, "sendMessage", "/help shows").await;
+        let welcome = wait_for(&fake, "sendRichMessage", "/help shows").await;
         assert!(welcome.get("reply_markup").is_none());
         assert!(fake.calls("setChatMenuButton").is_empty());
         fake.push(message(2, OWNER, "/health"));
@@ -544,9 +723,13 @@ mod tests {
 
         // The owner gets help and creates an invite.
         fake.push(message(2, OWNER, "/help"));
-        wait_for(&fake, "sendMessage", "/guests").await;
+        wait_for(&fake, "sendRichMessage", "/guests").await;
         fake.push(message(3, OWNER, "/guests"));
-        wait_for(&fake, "sendMessage", "Create an invite link").await;
+        let guests = wait_for(&fake, "sendRichMessage", "Create an invite link").await;
+        assert_eq!(
+            guests["reply_markup"]["inline_keyboard"][0][0]["style"],
+            "success"
+        );
         fake.push(button(4, OWNER, "invite"));
         let invite = wait_for(&fake, "sendMessage", "start=invite_").await;
         let link = invite["text"].as_str().unwrap();
@@ -560,7 +743,7 @@ mod tests {
 
         // The friend redeems it once and becomes a guest; the link then stops working.
         fake.push(message(5, FRIEND, &format!("/start invite_{token}")));
-        wait_for(&fake, "sendMessage", "Welcome, User200").await;
+        wait_for(&fake, "sendRichMessage", "Welcome, User200").await;
         fake.push(message(6, 300, &format!("/start invite_{token}")));
         wait_for(&fake, "sendMessage", "already used").await;
 
@@ -796,10 +979,29 @@ mod tests {
         fake.push(button(2, FRIEND, &format!("stop:{friends}")));
         wait_for(&fake, "answerCallbackQuery", "Stopped 2 songs").await;
 
-        // Details lists the stopped songs as a reply to the status message.
+        // Details lists the stopped songs, seen only by the person who pressed.
         fake.push(button(3, OWNER, &format!("details:{friends}")));
-        let details = wait_for(&fake, "sendMessage", "failed: Stopped").await;
+        let details = wait_for(&fake, "sendRichMessage", "Failed: Stopped").await;
+        assert_eq!(
+            details["ephemeral_message_parameters"]["callback_query_id"],
+            "q3"
+        );
+        // When Telegram refuses that, it becomes a plain reply to the status message.
+        fake.refuse_rich
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.refuse_ephemeral
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.push(button(7, OWNER, &format!("details:{friends}")));
+        // (The refused tries are recorded too; the reply is the one that counts.)
+        let details = wait_for(&fake, "sendMessage", "allow_sending_without_reply").await;
+        assert!(
+            details["text"]
+                .as_str()
+                .unwrap()
+                .contains("failed: Stopped")
+        );
         assert_eq!(details["reply_parameters"]["message_id"], 900);
+        assert!(details.get("ephemeral_message_parameters").is_none());
 
         // Songs that are gone get a clear answer instead of an error.
         fake.push(button(4, OWNER, "pick:999:1"));
@@ -818,18 +1020,25 @@ mod tests {
         assert_eq!(refused, 1);
     }
 
-    #[tokio::test]
-    async fn review_questions_offer_candidates_in_chat() {
-        let (directory, fake, state) = start().await;
+    /// A song sent by `chat` that waits in Review with one candidate.
+    async fn song_in_review(
+        directory: &tempfile::TempDir,
+        state: &AppState,
+        chat: u64,
+    ) -> (i64, i64) {
         let pool = &state.pool;
-        let request = store::create_upload_request(pool, "100").await.unwrap();
-        store::attach_telegram(pool, request, OWNER as i64, 5, 900)
+        let request = store::create_upload_request(pool, &chat.to_string())
+            .await
+            .unwrap();
+        store::attach_telegram(pool, request, chat as i64, 5, 900)
             .await
             .unwrap();
         let wanted = store::add_upload(pool, request, "Song", Some("Artist"), None)
             .await
             .unwrap();
-        let staging = directory.path().join("Artist - Song (u1).mp3");
+        let staging = directory
+            .path()
+            .join(format!("Artist - Song (u{wanted}).mp3"));
         store::mark_identifying(pool, wanted, &staging, None)
             .await
             .unwrap();
@@ -852,6 +1061,13 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid();
+        (track, candidate)
+    }
+
+    #[tokio::test]
+    async fn review_questions_offer_candidates_in_chat() {
+        let (directory, fake, state) = start().await;
+        let (track, candidate) = song_in_review(&directory, &state, OWNER).await;
 
         let question = wait_for(&fake, "sendMessage", "Not sure which song").await;
         assert!(
@@ -867,6 +1083,7 @@ mod tests {
         );
         assert!(rows.contains(&format!("drop:{track}")));
         assert!(rows.contains("Artist – Song · Album"));
+        assert!(rows.contains(r#""style":"success""#) && rows.contains(r#""style":"danger""#));
         // Asked once only.
         tokio::time::sleep(Duration::from_secs(4)).await;
         let asked = fake
@@ -875,5 +1092,74 @@ mod tests {
             .filter(|params| params.to_string().contains("Not sure which song"))
             .count();
         assert_eq!(asked, 1);
+    }
+
+    #[tokio::test]
+    async fn only_owners_are_sent_to_the_app() {
+        let (directory, fake, state) = start_with(Some("https://music.example")).await;
+        let (owner_track, _) = song_in_review(&directory, &state, OWNER).await;
+        let (guest_track, _) = song_in_review(&directory, &state, FRIEND).await;
+
+        let owner = wait_for(&fake, "sendMessage", &format!("track={owner_track}")).await;
+        assert_eq!(owner["chat_id"], json!(OWNER));
+        // Guests can't open the web page, so they choose in the chat.
+        let guest = wait_for(&fake, "sendMessage", &format!("drop:{guest_track}")).await;
+        assert_eq!(guest["chat_id"], json!(FRIEND));
+        assert!(!guest.to_string().contains("web_app"));
+    }
+
+    #[tokio::test]
+    async fn rich_messages_fall_back_to_plain_text() {
+        let (_directory, fake, _state) = start().await;
+        fake.refuse_rich
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.push(message(1, OWNER, "/help"));
+        let help = wait_for(&fake, "sendMessage", "/guests · invite people").await;
+        assert_eq!(help["parse_mode"], "HTML");
+        assert_eq!(fake.calls("sendRichMessage").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_commands_get_ephemeral_answers() {
+        let (_directory, fake, _state) = start().await;
+        let menu = wait_for(&fake, "setMyCommands", "queue").await;
+        let commands = menu["commands"].as_array().unwrap();
+        let ephemeral = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command["command"] == name)
+                .unwrap()
+                .get("is_ephemeral")
+                .is_some()
+        };
+        assert!(ephemeral("id") && ephemeral("queue") && !ephemeral("guests"));
+
+        // An ephemeral /id: message_id is 0 and the answer replies to the ephemeral ID.
+        let mut command = message(1, OWNER, "/id");
+        command["message"]["message_id"] = json!(0);
+        command["message"]["ephemeral_message_id"] = json!(55);
+        fake.push(command.clone());
+        let answer = wait_for(&fake, "sendMessage", "Your Telegram ID").await;
+        assert_eq!(
+            answer["ephemeral_message_parameters"]["receiver_user_id"],
+            json!(OWNER)
+        );
+        assert_eq!(answer["reply_parameters"]["ephemeral_message_id"], 55);
+
+        // If Telegram refuses, the answer goes to the chat as usual.
+        fake.refuse_ephemeral
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        command["update_id"] = json!(2);
+        fake.push(command);
+        for _ in 0..100 {
+            if fake.calls("sendMessage").len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let calls = fake.calls("sendMessage");
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].get("ephemeral_message_parameters").is_none());
+        assert_eq!(calls[2]["chat_id"], json!(OWNER));
     }
 }
